@@ -261,15 +261,21 @@ fn estimate_prior_var_kl_divergence(log_residuals: &[f64], df: f64) -> f64 {
     let kl_divs: Vec<f64> = obs_var_grid
         .iter()
         .map(|&prior_var| {
-            // Simulate: log(chi-squared(df)) + Normal(0, sqrt(prior_var)) - log(df)
-            let prior_sd = prior_var.sqrt().max(1e-10);
+            // R: log(rchisq(1e4, df)) + rnorm(1e4, 0, sqrt(x)) - log(m - p)
+            // The arguments are evaluated left to right, so all 1e4 chi-squared draws
+            // come before the normals, and rnorm with sd = 0 consumes no random numbers.
+            let prior_sd = prior_var.sqrt();
+            let chi: Vec<f64> = (0..n_sim).map(|_| rng.rchisq(df)).collect();
+            let norm: Vec<f64> = if prior_sd == 0.0 {
+                vec![0.0; n_sim]
+            } else {
+                (0..n_sim).map(|_| prior_sd * rng.rnorm()).collect()
+            };
 
-            let rand_dist: Vec<f64> = (0..n_sim)
-                .map(|_| {
-                    let chi_val = rng.rchisq(df);
-                    let norm_val = rng.rnorm() * prior_sd;
-                    chi_val.ln() + norm_val - df.ln()
-                })
+            let rand_dist: Vec<f64> = chi
+                .iter()
+                .zip(&norm)
+                .map(|(c, z)| c.ln() + z - df.ln())
                 .filter(|&x| x > breaks[0] && x < breaks[breaks.len() - 1])
                 .collect();
 
@@ -329,9 +335,10 @@ fn create_histogram(values: &[f64], breaks: &[f64]) -> Vec<usize> {
     let n_bins = breaks.len() - 1;
     let mut counts = vec![0usize; n_bins];
 
+    // R's hist() defaults: right-closed bins (a, b], the first one also closed below
     for &v in values {
         for i in 0..n_bins {
-            if v >= breaks[i] && v < breaks[i + 1] {
+            if (v > breaks[i] || (i == 0 && v == breaks[0])) && v <= breaks[i + 1] {
                 counts[i] += 1;
                 break;
             }

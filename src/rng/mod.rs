@@ -116,25 +116,28 @@ impl RMersenneTwister {
         // But R actually uses: fixup(2.3283064365386963e-10 * (double) genrand_int32())
         // The fixup ensures values are in (0, 1) not [0, 1)
         let u = self.next_u32();
-        let mut result = u as f64 * 2.3283064365386963e-10;
+        let result = u as f64 * 2.3283064365386963e-10;
 
-        // R's fixup: avoid exact 0 and 1
+        // R's fixup(): keep strictly inside (0, 1), using i2_32m1 = 1/(2^32 - 1)
+        const I2_32M1: f64 = 2.328306437080797e-10;
         if result <= 0.0 {
-            result = 0.5 * 2.3283064365386963e-10;
+            return 0.5 * I2_32M1;
         }
-        if result >= 1.0 {
-            result = 1.0 - 0.5 * 2.3283064365386963e-10;
+        if 1.0 - result <= 0.0 {
+            return 1.0 - 0.5 * I2_32M1;
         }
         result
     }
 
-    /// Generate normal random number using R's Inversion method
+    /// Standard normal deviate by R's default "Inversion" method (norm_rand in snorm.c)
     ///
-    /// R's default normal RNG uses the "Inversion" method which uses
-    /// qnorm(runif()) - the inverse normal CDF.
+    /// A single uniform is not precise enough, so R combines two:
+    ///   u = unif_rand(); u = (int)(BIG * u) + unif_rand(); qnorm(u / BIG), BIG = 2^27
     pub fn rnorm(&mut self) -> f64 {
+        const BIG: f64 = 134217728.0;
         let u = self.runif();
-        qnorm(u)
+        let u = (BIG * u).trunc() + self.runif();
+        qnorm(u / BIG)
     }
 
     /// Generate chi-squared random number with given degrees of freedom
@@ -143,11 +146,58 @@ impl RMersenneTwister {
         self.rgamma(df / 2.0, 2.0)
     }
 
-    /// Generate exponential random number
-    ///
-    /// R's exp_rand() uses the standard inversion method: -log(U)
+    /// Standard exponential deviate exactly as R's exp_rand() (sexp.c):
+    /// Ahrens & Dieter (1972), algorithm SA, not -log(U)
     pub fn rexp(&mut self) -> f64 {
-        -self.runif().ln()
+        // q[k-1] = sum(log(2)^k / k!), k = 1..16
+        const Q: [f64; 16] = [
+            0.6931471805599453,
+            0.9333736875190459,
+            0.9888777961838675,
+            0.9984959252914960040,
+            0.9998292811061389,
+            0.9999833164100727,
+            0.9999985508193775,
+            0.9999998906925558,
+            0.9999999924734159,
+            0.9999999995283275,
+            0.9999999999728814,
+            0.9999999999985598,
+            0.9999999999999289,
+            0.9999999999999968,
+            0.9999999999999999,
+            1.0000000000000000,
+        ];
+        let mut a = 0.0;
+        let mut u = self.runif();
+        while u <= 0.0 || u >= 1.0 {
+            u = self.runif();
+        }
+        loop {
+            u += u;
+            if u > 1.0 {
+                break;
+            }
+            a += Q[0];
+        }
+        u -= 1.0;
+        if u <= Q[0] {
+            return a + u;
+        }
+        let mut i = 0;
+        let mut ustar = self.runif();
+        let mut umin = ustar;
+        loop {
+            ustar = self.runif();
+            if umin > ustar {
+                umin = ustar;
+            }
+            i += 1;
+            if u <= Q[i] {
+                break;
+            }
+        }
+        a + umin * Q[0]
     }
 
     /// Generate gamma random number using R's exact algorithm from rgamma.c
@@ -156,7 +206,8 @@ impl RMersenneTwister {
     /// - GS algorithm (Ahrens-Dieter 1974) for shape < 1
     /// - GD algorithm (Ahrens-Dieter 1982) for shape >= 1
     pub fn rgamma(&mut self, a: f64, scale: f64) -> f64 {
-        const SQRT32: f64 = 5.656854249492381;
+        // R's rgamma.c uses this truncated value, which enters the squeeze test
+        const SQRT32: f64 = 5.656854;
         const EXP_M1: f64 = 0.36787944117144232; // exp(-1)
 
         // Coefficients for GD algorithm
@@ -270,118 +321,111 @@ impl RMersenneTwister {
     }
 }
 
-/// Inverse normal CDF (quantile function)
+/// Inverse normal CDF (quantile function), lower tail, non-log p
 ///
-/// Uses Wichura's Algorithm AS 241 (~10^-16 precision), matching R's qnorm.c exactly.
-/// Three-region rational approximation with 8-term polynomials.
+/// A literal translation of R's qnorm5() (src/nmath/qnorm.c, R 4.5), Wichura's
+/// AS 241 with R's coefficients and branch structure: norm_rand() feeds every
+/// uniform through it, so any difference shows up in the simulated draws.
 fn qnorm(p: f64) -> f64 {
+    if p.is_nan() {
+        return f64::NAN;
+    }
     if p <= 0.0 {
         return f64::NEG_INFINITY;
     }
     if p >= 1.0 {
         return f64::INFINITY;
     }
-    if p.is_nan() {
-        return f64::NAN;
-    }
-
-    // Horner's method for polynomial evaluation
-    fn horner(coeffs: &[f64], x: f64) -> f64 {
-        let mut result = coeffs[coeffs.len() - 1];
-        for i in (0..coeffs.len() - 1).rev() {
-            result = result * x + coeffs[i];
-        }
-        result
-    }
-
-    // Central region coefficients (|p - 0.5| <= 0.425)
-    const A: [f64; 8] = [
-        3.3871328727963666080e0,
-        1.3314166789178437745e2,
-        1.9715909503065514427e3,
-        1.3731693765509461125e4,
-        4.5921953931549871457e4,
-        6.7265770927008700853e4,
-        3.3430575583588128105e4,
-        2.5090809287301226727e3,
-    ];
-    const B: [f64; 8] = [
-        1.0,
-        4.2313330701600911252e1,
-        6.8718700749205790830e2,
-        5.3941960214247511077e3,
-        2.1213794301586595867e4,
-        3.9307895800092710610e4,
-        2.8729085735721942674e4,
-        5.2264952788528545610e3,
-    ];
-
-    // Intermediate region coefficients (0.425 < |p-0.5| < ~0.499997)
-    const C: [f64; 8] = [
-        1.42343711074968357734e0,
-        4.63033784615654529590e0,
-        5.76949722146069140550e0,
-        3.64784832476320460504e0,
-        1.27045825245236838258e0,
-        2.41780725177450611770e-1,
-        2.27238260553211220900e-2,
-        7.74545014427727025900e-4,
-    ];
-    const D: [f64; 8] = [
-        1.0,
-        2.05319162663775882187e0,
-        1.67638483018380162246e0,
-        6.89767334985100004550e-1,
-        1.48103976427480074590e-1,
-        1.51986665636164571966e-2,
-        5.47593808499534494600e-4,
-        1.05075007164441684324e-9,
-    ];
-
-    // Tail region coefficients (r > 5, where r = sqrt(-2*ln(min(p,1-p))))
-    const E: [f64; 8] = [
-        6.65790464350110377720e0,
-        5.46378491116411436990e0,
-        1.78482653991729133580e0,
-        2.96560571828504891230e-1,
-        2.65321895265761230930e-2,
-        1.24266094738807843860e-3,
-        2.71155556874348757815e-5,
-        2.01033439929228813265e-7,
-    ];
-    const F: [f64; 8] = [
-        1.0,
-        5.99832206555887937690e-1,
-        1.36929880922735805310e-1,
-        1.48753612908506508198e-2,
-        7.86869131145613259100e-4,
-        1.84631831751005468180e-5,
-        1.42151175831644588870e-7,
-        2.04426310338993978564e-15,
-    ];
 
     let q = p - 0.5;
-
     if q.abs() <= 0.425 {
-        // Central region
+        // |p - 0.5| <= .425  <==> 0.075 <= p <= 0.925
         let r = 0.180625 - q * q;
-        q * horner(&A, r) / horner(&B, r)
+        return q * (((((((r * 2509.0809287301226727 + 33430.575583588128105) * r + 67265.770927008700853) * r
+            + 45921.953931549871457)
+            * r
+            + 13731.693765509461125)
+            * r
+            + 1971.5909503065514427)
+            * r
+            + 133.14166789178437745)
+            * r
+            + 3.387132872796366608)
+            / (((((((r * 5226.495278852854561 + 28729.085735721942674) * r + 39307.89580009271061) * r
+                + 21213.794301586595867)
+                * r
+                + 5394.1960214247511077)
+                * r
+                + 687.1870074920579083)
+                * r
+                + 42.313330701600911252)
+                * r
+                + 1.0);
+    }
+
+    // closer than 0.075 from {0, 1}: lp = log(min(p, 1 - p)), with 1 - p as R_DT_CIv(p)
+    let lp = if q > 0.0 { (0.5 - p + 0.5).ln() } else { p.ln() };
+    let mut r = (-lp).sqrt();
+    let val = if r <= 5.0 {
+        r += -1.6;
+        (((((((r * 7.7454501427834140764e-4 + 0.0227238449892691845833) * r + 0.24178072517745061177) * r
+            + 1.27045825245236838258)
+            * r
+            + 3.64784832476320460504)
+            * r
+            + 5.7694972214606914055)
+            * r
+            + 4.6303378461565452959)
+            * r
+            + 1.42343711074968357734)
+            / (((((((r * 1.05075007164441684324e-9 + 5.475938084995344946e-4) * r + 0.0151986665636164571966)
+                * r
+                + 0.14810397642748007459)
+                * r
+                + 0.68976733498510000455)
+                * r
+                + 1.6763848301838038494)
+                * r
+                + 2.05319162663775882187)
+                * r
+                + 1.0)
+    } else if r <= 27.0 {
+        r += -5.0;
+        (((((((r * 2.01033439929228813265e-7 + 2.71155556874348757815e-5) * r + 0.0012426609473880784386) * r
+            + 0.026532189526576123093)
+            * r
+            + 0.29656057182850489123)
+            * r
+            + 1.7848265399172913358)
+            * r
+            + 5.4637849111641143699)
+            * r
+            + 6.6579046435011037772)
+            / (((((((r * 2.04426310338993978564e-15 + 1.4215117583164458887e-7) * r + 1.8463183175100546818e-5)
+                * r
+                + 7.868691311456132591e-4)
+                * r
+                + 0.0148753612908506148525)
+                * r
+                + 0.13692988092273580531)
+                * r
+                + 0.59983220655588793769)
+                * r
+                + 1.0)
     } else {
-        // Tail region
-        let r = if q < 0.0 { p } else { 1.0 - p };
-        let r = (-r.ln()).sqrt();
-
-        let val = if r <= 5.0 {
-            // Intermediate tail
-            let r = r - 1.6;
-            horner(&C, r) / horner(&D, r)
-        } else {
-            // Far tail
-            let r = r - 5.0;
-            horner(&E, r) / horner(&F, r)
-        };
-
-        if q < 0.0 { -val } else { val }
+        // r > 27 needs min(p, 1 - p) < exp(-729), below the smallest uniform R can return
+        let s2 = -2.0 * lp;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut x2 = s2 - (two_pi * s2).ln();
+        if r < 36000.0 {
+            x2 = s2 - (two_pi * x2).ln() - 2.0 / (2.0 + x2);
+        }
+        x2.sqrt()
+    };
+    if q < 0.0 {
+        -val
+    } else {
+        val
     }
 }
 
@@ -389,33 +433,57 @@ fn qnorm(p: f64) -> f64 {
 mod tests {
     use super::*;
 
+    /// Reference values from R 4.5 (set.seed(2), default RNG kinds), printed with %.17g
+    fn assert_close(got: f64, want: f64) {
+        assert!((got - want).abs() <= 1e-15 * want.abs().max(1.0), "got {:.17}, want {:.17}", got, want);
+    }
+
     #[test]
     fn test_r_rng_runif() {
         let mut rng = RMersenneTwister::new(2);
+        for want in [0.18488225992769003, 0.70237403595820069, 0.57332633482292295] {
+            assert_close(rng.runif(), want);
+        }
+    }
 
-        // Compare with R's output:
-        // set.seed(2); runif(10)
-        // [1] 0.1848822599 0.7023740360 0.5733263348 0.1680519204 0.9438393388
-        // [6] 0.9434749587 0.1291589767 0.8334488156 0.4680185155 0.5499837417
-        let expected = [
-            0.1848822599, 0.7023740360, 0.5733263348, 0.1680519204, 0.9438393388,
-            0.9434749587, 0.1291589767, 0.8334488156, 0.4680185155, 0.5499837417,
-        ];
+    #[test]
+    fn test_r_rng_rnorm() {
+        let mut rng = RMersenneTwister::new(2);
+        for want in [-0.89691454662498138, 0.18484918464674249, 1.5878453312088232] {
+            assert_close(rng.rnorm(), want);
+        }
+    }
 
-        for (i, &exp) in expected.iter().enumerate() {
-            let got = rng.runif();
-            println!("runif[{}] = {:.10}, expected = {:.10}, diff = {:.2e}",
-                     i, got, exp, (got - exp).abs());
+    #[test]
+    fn test_r_rng_rexp() {
+        let mut rng = RMersenneTwister::new(2);
+        for want in [1.8653524405414108, 0.40474807191640139, 0.14665266964584589] {
+            assert_close(rng.rexp(), want);
         }
     }
 
     #[test]
     fn test_r_rng_rchisq() {
-        let mut rng = RMersenneTwister::new(2);
+        let cases: [(f64, [f64; 4]); 3] = [
+            (1.0, [0.095825183658292332, 0.92149495036514861, 0.85630277508525954, 0.5546726566079011]),
+            (2.0, [0.13379913584698364, 0.10229738282570668, 0.040281973368143688, 1.1855441251226946]),
+            (3.0, [0.60839875872378502, 0.53883407524968197, 0.37812323397130138, 2.2591307791793858]),
+        ];
+        for (df, wants) in cases {
+            let mut rng = RMersenneTwister::new(2);
+            for want in wants {
+                assert_close(rng.rchisq(df), want);
+            }
+        }
+    }
 
-        // R's set.seed(2); rchisq(5, df=2)
-        // [1] 0.13379913585 0.10229738283 0.04028197337 1.18554412512 0.24805533529
-        let chi1 = rng.rchisq(2.0);
-        println!("rchisq(1, df=2) = {:.10}", chi1);
+    #[test]
+    fn test_r_rng_long_sequence() {
+        // set.seed(2); a <- rchisq(1e4, 2); b <- rnorm(1e4, 0, 0.5); c(a[1e4], b[1e4])
+        let mut rng = RMersenneTwister::new(2);
+        let a: Vec<f64> = (0..10_000).map(|_| rng.rchisq(2.0)).collect();
+        let b: Vec<f64> = (0..10_000).map(|_| 0.5 * rng.rnorm()).collect();
+        assert_close(a[9_999], 1.830613728945319);
+        assert_close(b[9_999], -0.67501397818342734);
     }
 }
