@@ -1,6 +1,5 @@
 //! Wald test for differential expression
 
-
 use super::fdr::benjamini_hochberg;
 use super::pvalue::calculate_pvalue;
 use crate::data::DESeqDataSet;
@@ -178,11 +177,11 @@ pub fn wald_test_extended(
 
     // Calculate log2 fold changes using contrast vector
     // LFC = sum(contrast_vec[j] * beta[j]) for j in coefficients
-    // R sets LFC=0 for allZero genes (baseMean == 0)
-    let log2_fold_changes: Vec<f64> = (0..n_genes)
+    // R reports NA for every statistic of an allZero gene (baseMean == 0)
+    let mut log2_fold_changes: Vec<f64> = (0..n_genes)
         .map(|i| {
             if base_means[i] == 0.0 {
-                return 0.0;
+                return f64::NAN;
             }
             let lfc: f64 = (0..n_coefs)
                 .map(|j| contrast_vec[j] * coefficients[[i, j]])
@@ -195,11 +194,10 @@ pub fn wald_test_extended(
     // Calculate standard errors using contrast vector
     // If covariance matrix is available: SE = sqrt(contrast' * Cov * contrast)
     // Otherwise, fallback to diagonal approximation: SE = sqrt(sum(contrast^2 * se^2))
-    // R sets SE=0 for allZero genes (baseMean == 0)
     let lfc_se: Vec<f64> = (0..n_genes)
         .map(|i| {
             if base_means[i] == 0.0 {
-                return 0.0;
+                return f64::NAN;
             }
             let var = if let Some(covs) = covariances {
                 // covs is Array3 (n_genes x n_coefs x n_coefs)
@@ -233,7 +231,7 @@ pub fn wald_test_extended(
     // Calculate Wald statistics
     // R computes stat/pvalue for non-converged genes too (just flags betaConv=FALSE).
     // Only allZero genes (baseMean == 0) get NA.
-    let stat: Vec<f64> = (0..n_genes)
+    let mut stat: Vec<f64> = (0..n_genes)
         .map(|i| {
             // R sets pvalue/padj to NA for allZero genes (baseMean == 0)
             if base_means[i] == 0.0 {
@@ -283,8 +281,28 @@ pub fn wald_test_extended(
         })
         .collect();
 
+    // R (results.R, contrastAllZero): when every count in the samples being
+    // compared is zero but the gene is not zero everywhere, the fitted LFC is
+    // meaningless, so it reports LFC = 0, stat = 0 and pvalue = 1.
+    let contrast_all_zero: Vec<bool> = match contrast_samples(dds, &contrast, &contrast_vec) {
+        Some(samples) => {
+            let counts = dds.counts().counts();
+            (0..n_genes)
+                .map(|i| {
+                    base_means[i] != 0.0
+                        && samples.iter().enumerate().all(|(j, &used)| !used || counts[[i, j]] == 0.0)
+                })
+                .collect()
+        }
+        None => vec![false; n_genes],
+    };
+    for i in (0..n_genes).filter(|&i| contrast_all_zero[i]) {
+        log2_fold_changes[i] = 0.0;
+        stat[i] = 0.0;
+    }
+
     // Calculate p-values
-    let pvalues: Vec<f64> = if use_t {
+    let mut pvalues: Vec<f64> = if use_t {
         let df = dds.n_samples() as f64 - design_info.coef_names.len() as f64;
         stat.iter()
             .map(|&z| super::pvalue::calculate_pvalue_t(z, df))
@@ -292,6 +310,10 @@ pub fn wald_test_extended(
     } else {
         stat.iter().map(|&z| calculate_pvalue(z)).collect()
     };
+
+    for i in (0..n_genes).filter(|&i| contrast_all_zero[i]) {
+        pvalues[i] = 1.0;
+    }
 
     // Apply BH correction
     let padj = benjamini_hochberg(&pvalues);
@@ -336,6 +358,38 @@ pub fn wald_test_extended(
         trended_dispersions,
         contrast: legacy_contrast,
     })
+}
+
+/// Samples entering a contrast, for R's contrastAllZero check, or `None` when R
+/// does not apply the check to this kind of contrast.
+/// R equivalent: contrastAllZeroCharacter() / contrastAllZeroNumeric() in results.R
+fn contrast_samples(
+    dds: &DESeqDataSet,
+    contrast: &crate::io::ContrastSpec,
+    contrast_vec: &[f64],
+) -> Option<Vec<bool>> {
+    use crate::io::ContrastSpec;
+
+    match contrast {
+        ContrastSpec::Simple { variable, numerator, denominator } => {
+            let values = dds.sample_metadata().condition(variable)?;
+            Some(values.iter().map(|v| v == numerator || v == denominator).collect())
+        }
+        ContrastSpec::Numeric(_) | ContrastSpec::List { .. } => {
+            // Only contrasts with both positive and negative weights compare two
+            // groups; the groups are the samples the non-zero coefficients touch.
+            if contrast_vec.iter().all(|&c| c >= 0.0) || contrast_vec.iter().all(|&c| c <= 0.0) {
+                return None;
+            }
+            let design = dds.design_matrix()?;
+            Some(
+                (0..design.nrows())
+                    .map(|j| (0..design.ncols()).any(|k| contrast_vec[k] != 0.0 && design[[j, k]] != 0.0))
+                    .collect(),
+            )
+        }
+        ContrastSpec::Name(_) => None,
+    }
 }
 
 #[cfg(test)]
