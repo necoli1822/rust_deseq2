@@ -348,7 +348,8 @@ pub fn default_cooks_cutoff(n_samples: usize, n_coefs: usize) -> f64 {
 /// Sets p-values to NA for genes where any sample exceeds the Cook's distance cutoff.
 /// Matches DESeq2's behavior including the "dontFilter" heuristic for two-level designs.
 pub fn filter_by_cooks(results: &mut DESeqResults, cooks: &Array2<f64>, cutoff: f64) {
-    filter_by_cooks_with_counts(results, cooks, cutoff, None, false)
+    let all_samples = vec![true; cooks.ncols()];
+    filter_by_cooks_with_counts(results, cooks, cutoff, None, false, &all_samples)
 }
 
 /// Filter results by Cook's distance with optional DESeq2 dontFilter heuristic
@@ -365,25 +366,36 @@ pub fn filter_by_cooks(results: &mut DESeqResults, cooks: &Array2<f64>, cutoff: 
 /// - cutoff: Cook's distance cutoff
 /// - counts: Optional raw count matrix for dontFilter heuristic
 /// - is_two_level_design: If true and counts provided, apply dontFilter heuristic
+///
+/// `max_cooks_samples` selects the samples whose Cook's distance counts towards a
+/// gene's maximum (R: recordMaxCooks uses samples in cells with 3+ replicates, with
+/// replaceable samples zeroed after outlier replacement). The low-count heuristic
+/// still locates the outlier over all samples, as R's which.max over the cooks assay.
 pub fn filter_by_cooks_with_counts(
     results: &mut DESeqResults,
     cooks: &Array2<f64>,
     cutoff: f64,
     counts: Option<&Array2<f64>>,
     is_two_level_design: bool,
+    max_cooks_samples: &[bool],
 ) {
     let n_genes = results.gene_ids.len();
     let n_samples = cooks.ncols();
 
     for i in 0..n_genes {
-        // Find if there's an outlier and which sample it is
-        let mut max_cooks = 0.0_f64;
-        let mut max_cooks_sample = 0;
+        let max_cooks = (0..n_samples)
+            .filter(|&j| max_cooks_samples[j])
+            .map(|j| cooks[[i, j]])
+            .filter(|c| c.is_finite())
+            .fold(0.0_f64, f64::max);
 
+        // R: which.max(assays(object)[["cooks"]][ii, ]), first maximum, NA ignored
+        let mut max_cooks_sample = 0;
+        let mut overall_max = f64::NEG_INFINITY;
         for j in 0..n_samples {
             let c = cooks[[i, j]];
-            if c.is_finite() && c > max_cooks {
-                max_cooks = c;
+            if c.is_finite() && c > overall_max {
+                overall_max = c;
                 max_cooks_sample = j;
             }
         }
@@ -423,6 +435,22 @@ pub fn filter_by_cooks_with_counts(
             }
         }
     }
+}
+
+/// For each sample, whether its model-matrix cell (identical design row) has at
+/// least `n` samples, counting the sample itself.
+/// R equivalent: nOrMoreInCell() in core.R
+pub fn n_or_more_in_cell(design: &Array2<f64>, n: usize) -> Vec<bool> {
+    let rows: Vec<Vec<u64>> = design
+        .rows()
+        .into_iter()
+        .map(|row| row.iter().map(|v| v.to_bits()).collect())
+        .collect();
+    let mut cell_sizes: std::collections::HashMap<&Vec<u64>, usize> = std::collections::HashMap::new();
+    for row in &rows {
+        *cell_sizes.entry(row).or_insert(0) += 1;
+    }
+    rows.iter().map(|row| cell_sizes[row] >= n).collect()
 }
 
 /// Get maximum Cook's distance for each gene
@@ -495,26 +523,16 @@ pub fn replace_outliers(
         }
     };
 
-    // Check which samples are replaceable (have minReplicatesForReplace in their condition)
-    let design_var = dds.design_variable().to_string();
-    let conditions: Vec<String> = dds
-        .sample_metadata()
-        .condition(&design_var)
-        .cloned()
-        .unwrap_or_else(|| vec!["unknown".to_string(); n_samples]);
-
-    // Count samples per condition
-    let mut condition_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for cond in &conditions {
-        *condition_counts.entry(cond.clone()).or_insert(0) += 1;
+    // Samples are replaceable if their model-matrix cell has >= minReplicatesForReplace
+    // samples. R: whichSamples <- nOrMoreInCell(attr(object,"modelMatrix"), minReplicates)
+    // A label of the main variable is not a cell once covariates are in the design.
+    let replaceable: Vec<bool> = match dds.design_matrix() {
+        Some(design) => n_or_more_in_cell(design, min_replicates_for_replace),
+        None => vec![false; n_samples],
+    };
+    if !replaceable.iter().any(|&r| r) {
+        return Ok((Vec::new(), Vec::new()));
     }
-
-    // Samples are replaceable if their condition has >= minReplicatesForReplace samples
-    let replaceable: Vec<bool> = conditions
-        .iter()
-        .map(|c| condition_counts.get(c).copied().unwrap_or(0) >= min_replicates_for_replace)
-        .collect();
 
     // Calculate trimmed base mean for each gene
     // DESeq2: trimBaseMean = apply(counts(object, normalized=TRUE), 1, mean, trim=0.2)

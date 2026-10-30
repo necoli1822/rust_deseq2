@@ -4,7 +4,7 @@ use clap::Parser;
 use log::{info, LevelFilter};
 
 use rust_deseq2::cli::{Cli, Commands};
-use rust_deseq2::filter::{calculate_cooks_distance, default_cooks_cutoff, filter_by_cooks_with_counts, replace_outliers};
+use rust_deseq2::filter::{calculate_cooks_distance, default_cooks_cutoff, filter_by_cooks_with_counts, n_or_more_in_cell, replace_outliers};
 use rust_deseq2::prelude::*;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -451,6 +451,11 @@ fn run_analysis(
     // -----------------------------------------------------------------------
     let min_replicates = min_replicates_for_replace;
     let mut replaceable_samples: Vec<bool> = vec![false; dds.n_samples()];
+    // Genes whose counts are all zero once outliers are replaced (R: "nowZero")
+    let mut now_zero: Vec<usize> = Vec::new();
+    // Whether any gene was refit after replacement (R: nrefit > 0)
+    let mut refit_done = false;
+    let mut original_counts: Option<ndarray::Array2<f64>> = None;
 
     // Save ORIGINAL Cook's distances BEFORE any replacement (Bug 2 fix)
     // These will be used for maxCooks filtering later.
@@ -465,33 +470,14 @@ fn run_analysis(
         let n_coefs = dds.design_matrix().map(|m| m.ncols()).unwrap_or(2);
         let cutoff = cooks_cutoff_override.unwrap_or_else(|| default_cooks_cutoff(dds.n_samples(), n_coefs));
 
-        // Determine which samples are "replaceable" (in cells with >= minReplicates)
-        let cells: Vec<String> = if let Some(design_matrix) = dds.design_matrix() {
-            (0..dds.n_samples())
-                .map(|j| {
-                    let row: Vec<String> = (0..design_matrix.ncols())
-                        .map(|k| format!("{:.6}", design_matrix[[j, k]]))
-                        .collect();
-                    row.join("_")
-                })
-                .collect()
-        } else {
-            dds.sample_metadata()
-                .condition(design)
-                .cloned()
-                .unwrap_or_else(|| vec!["unknown".to_string(); dds.n_samples()])
-        };
-
-        let mut cell_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for cell in &cells {
-            *cell_counts.entry(cell.clone()).or_insert(0) += 1;
+        // Samples in model-matrix cells with >= minReplicates are "replaceable"
+        if let Some(design_matrix) = dds.design_matrix() {
+            replaceable_samples = n_or_more_in_cell(design_matrix, min_replicates);
         }
 
-        for (i, cell) in cells.iter().enumerate() {
-            if cell_counts.get(cell).copied().unwrap_or(0) >= min_replicates {
-                replaceable_samples[i] = true;
-            }
-        }
+        // R's low-count heuristic for Cook's filtering compares against the original
+        // counts (refitWithoutOutliers restores them), so keep a copy.
+        original_counts = Some(dds.counts().counts().to_owned());
 
         let (modified_genes, flagged_genes) = replace_outliers(&mut dds, cooks, cutoff, min_replicates, trim)?;
 
@@ -506,12 +492,13 @@ fn run_analysis(
             // Bug 5: Check for genes that became all-zero after replacement
             let counts_matrix = dds.counts().counts();
             let n_samples = dds.n_samples();
-            let new_all_zero: Vec<usize> = flagged_genes.iter().copied().filter(|&gene_idx| {
+            now_zero = flagged_genes.iter().copied().filter(|&gene_idx| {
                 (0..n_samples).all(|j| counts_matrix[[gene_idx, j]] == 0.0)
             }).collect();
 
             // Refit dispersions + GLM for replaced genes
             rust_deseq2::dispersion::refit_without_outliers(&mut dds, &flagged_genes)?;
+            refit_done = true;
 
             // Bug 4: Re-run Wald/LRT test after refit
             info!("Re-running {} test after outlier replacement...", test_type);
@@ -532,58 +519,29 @@ fn run_analysis(
                 wald_test(&dds, &design_info, contrast, alpha, use_t, lfc_threshold)?
             };
 
-            // Bug 5: Set results to NA for genes that became all-zero after replacement
-            if !new_all_zero.is_empty() {
-                info!("{} genes became all-zero after outlier replacement, setting results to NA", new_all_zero.len());
-                for &gene_idx in &new_all_zero {
-                    results.log2_fold_changes[gene_idx] = f64::NAN;
-                    results.lfc_se[gene_idx] = f64::NAN;
-                    results.stat[gene_idx] = f64::NAN;
-                    results.pvalues[gene_idx] = f64::NAN;
-                    results.padj[gene_idx] = f64::NAN;
-                }
-            }
         }
     }
 
     // -----------------------------------------------------------------------
     // Step 5: Cook's filtering on results using ORIGINAL (pre-replacement) Cook's distances
     // -----------------------------------------------------------------------
-    // Check if any cell has 3+ samples for Cook's filtering
-    let apply_cooks_filtering = if let Some(design_matrix) = dds.design_matrix() {
-        let cells: Vec<String> = (0..dds.n_samples())
-            .map(|j| {
-                let row: Vec<String> = (0..design_matrix.ncols())
-                    .map(|k| format!("{:.6}", design_matrix[[j, k]]))
-                    .collect();
-                row.join("_")
-            })
-            .collect();
-
-        let mut cell_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for cell in &cells {
-            *cell_counts.entry(cell.clone()).or_insert(0) += 1;
-        }
-
-        cell_counts.values().any(|&count| count >= 3)
-    } else {
-        let cells = dds.sample_metadata()
-            .condition(design)
-            .cloned()
-            .unwrap_or_else(|| vec!["unknown".to_string(); dds.n_samples()]);
-
-        let mut cell_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for cell in &cells {
-            *cell_counts.entry(cell.clone()).or_insert(0) += 1;
-        }
-
-        cell_counts.values().any(|&count| count >= 3)
+    // R: recordMaxCooks takes the maximum over samples in cells with 3+ replicates
+    // (none -> maxCooks NA -> no filtering); after a refit, replaceable samples are
+    // zeroed because their outliers were already replaced.
+    let mut max_cooks_samples = match dds.design_matrix() {
+        Some(design_matrix) => n_or_more_in_cell(design_matrix, 3),
+        None => vec![false; dds.n_samples()],
     };
+    if refit_done {
+        for (eligible, &replaceable) in max_cooks_samples.iter_mut().zip(&replaceable_samples) {
+            *eligible &= !replaceable;
+        }
+    }
 
-    if apply_cooks_filtering {
-        // Bug 2 fix: Use ORIGINAL Cook's distances (pre-replacement) for filtering.
+    if max_cooks_samples.iter().any(|&s| s) {
+        // Use ORIGINAL Cook's distances (pre-replacement) for filtering.
         // If outlier replacement was done, use saved original_cooks; otherwise calculate fresh.
-        let mut cooks = if let Some(ref orig) = original_cooks {
+        let cooks = if let Some(ref orig) = original_cooks {
             orig.clone()
         } else {
             calculate_cooks_distance(&dds)?
@@ -591,23 +549,32 @@ fn run_analysis(
         let n_coefs = dds.design_matrix().map(|m| m.ncols()).unwrap_or(2);
         let cooks_cutoff = cooks_cutoff_override.unwrap_or_else(|| default_cooks_cutoff(dds.n_samples(), n_coefs));
 
-        if do_replace_outliers && replaceable_samples.iter().any(|&r| r) {
-            let n_genes = cooks.nrows();
-            for gene_idx in 0..n_genes {
-                for (sample_idx, &is_replaceable) in replaceable_samples.iter().enumerate() {
-                    if is_replaceable {
-                        cooks[[gene_idx, sample_idx]] = 0.0;
-                    }
-                }
-            }
-        }
-
         let n_levels = dds.sample_metadata().levels(design)
             .map(|levels| levels.len())
             .unwrap_or(0);
         let is_two_level_design = covariates.is_empty() && continuous_vars.is_empty() && n_levels == 2;
-        let counts = dds.counts().counts().to_owned();
-        filter_by_cooks_with_counts(&mut results, &cooks, cooks_cutoff, Some(&counts), is_two_level_design);
+        let counts = original_counts.unwrap_or_else(|| dds.counts().counts().to_owned());
+        filter_by_cooks_with_counts(
+            &mut results,
+            &cooks,
+            cooks_cutoff,
+            Some(&counts),
+            is_two_level_design,
+            &max_cooks_samples,
+        );
+    }
+
+    // R results(): genes that are all zero after outlier replacement report
+    // LFC = 0, lfcSE = 0, stat = 0, pvalue = 1. This comes after Cook's filtering,
+    // so it overrides an NA set there.
+    if !now_zero.is_empty() {
+        info!("{} genes became all-zero after outlier replacement", now_zero.len());
+        for &gene_idx in &now_zero {
+            results.log2_fold_changes[gene_idx] = 0.0;
+            results.lfc_se[gene_idx] = 0.0;
+            results.stat[gene_idx] = 0.0;
+            results.pvalues[gene_idx] = 1.0;
+        }
     }
 
     // Apply independent filtering (or skip if --no-independent-filtering)
