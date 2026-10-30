@@ -64,7 +64,7 @@ pub fn shrink_lfc_normal(dds: &DESeqDataSet, design_info: &DesignInfo, results: 
     };
 
     // Determine which coefficient index corresponds to the contrast
-    let (coef_idx, _contrast_sign) = match get_contrast_index(
+    let (coef_idx, contrast_sign) = match get_contrast_index(
         design_info,
         &results.contrast.numerator,
         &results.contrast.denominator,
@@ -189,7 +189,8 @@ pub fn shrink_lfc_normal(dds: &DESeqDataSet, design_info: &DesignInfo, results: 
             // new_coefficients and new_standard_errors are on log2 scale
             for i in 0..n_genes {
                 if !all_zero[i] {
-                    results.log2_fold_changes[i] = new_coefficients[[i, coef_idx]];
+                    // The refit estimates the coefficient; a reversed contrast is its negation.
+                    results.log2_fold_changes[i] = contrast_sign * new_coefficients[[i, coef_idx]];
                     results.lfc_se[i] = new_standard_errors[[i, coef_idx]];
                 }
             }

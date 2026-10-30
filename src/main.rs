@@ -607,7 +607,19 @@ fn run_analysis(
                 info!("Applying apeglm LFC shrinkage...");
                 use rust_deseq2::shrinkage::{shrink_lfc_apeglm, ApeglmParams};
                 let params = ApeglmParams::default();
-                shrink_lfc_apeglm(&dds, &mut results, 1, &params)?;
+                // apeglm shrinks one coefficient (R: lfcShrink(coef=...)), so it must be
+                // the coefficient the Wald contrast reported. A reversed contrast
+                // (numerator = reference) is that coefficient negated; the Cauchy prior
+                // is symmetric, so negating the shrunken estimate is exact.
+                let (coef_idx, sign) = rust_deseq2::glm::get_contrast_index(
+                    &design_info,
+                    numerator.unwrap(),
+                    denominator.unwrap(),
+                )?;
+                shrink_lfc_apeglm(&dds, &mut results, coef_idx, &params)?;
+                if sign < 0.0 {
+                    results.log2_fold_changes.iter_mut().for_each(|lfc| *lfc = -*lfc);
+                }
             }
             "ashr" => {
                 info!("Applying ashr LFC shrinkage...");
@@ -617,6 +629,10 @@ fn run_analysis(
             }
             _ => {
                 info!("Applying normal LFC shrinkage...");
+                // shrink_lfc_normal only logs a warning when the contrast is not a single
+                // coefficient and leaves the MLE in place, which would be written out as if
+                // it were shrunken. Fail here instead.
+                rust_deseq2::glm::get_contrast_index(&design_info, numerator.unwrap(), denominator.unwrap())?;
                 shrink_lfc_normal(&dds, &design_info, &mut results, upper_quantile);
             }
         }
