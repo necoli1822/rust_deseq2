@@ -25,9 +25,42 @@ pub fn calculate_pvalue_t(stat: f64, df: f64) -> f64 {
     2.0 * t_dist.cdf(-stat.abs())
 }
 
+/// P-value for H0: |LFC| <= threshold (altHypothesis = "greaterAbs")
+/// R equivalent: results(..., lfcThreshold=T, altHypothesis="greaterAbs") in results.R
+///   pnorm(-|lfc| + T, sd=se) + pnorm(-|lfc| - T, sd=se)
+/// or, with `df` (useT=TRUE), pt((-|lfc| + T)/se, df) + pt((-|lfc| - T)/se, df).
+/// This is the sum of both tails beyond +-T, not the older "greaterAbs2014" test.
+pub fn calculate_pvalue_greater_abs(lfc: f64, se: f64, threshold: f64, df: Option<f64>) -> f64 {
+    if !lfc.is_finite() || !se.is_finite() || se <= 0.0 {
+        return f64::NAN;
+    }
+    let upper = (-lfc.abs() + threshold) / se;
+    let lower = (-lfc.abs() - threshold) / se;
+    match df {
+        Some(df) if df > 0.0 => {
+            let t_dist = StudentsT::new(0.0, 1.0, df).unwrap();
+            t_dist.cdf(upper) + t_dist.cdf(lower)
+        }
+        Some(_) => f64::NAN,
+        None => {
+            let normal = Normal::new(0.0, 1.0).unwrap();
+            normal.cdf(upper) + normal.cdf(lower)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pvalue_greater_abs_matches_r() {
+        // R: pnorm(-1.5 + 1, sd = 0.3) + pnorm(-1.5 - 1, sd = 0.3) = 0.04779035
+        let p = calculate_pvalue_greater_abs(1.5, 0.3, 1.0, None);
+        assert!((p - 0.04779035).abs() < 1e-7, "p = {}", p);
+        // symmetric in the sign of the LFC
+        assert_eq!(p, calculate_pvalue_greater_abs(-1.5, 0.3, 1.0, None));
+    }
 
     #[test]
     fn test_pvalue_symmetric() {

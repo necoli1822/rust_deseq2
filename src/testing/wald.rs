@@ -13,8 +13,8 @@ use crate::io::{Contrast, DESeqResults};
 /// When `lfc_threshold > 0`, performs a test of H0: |LFC| <= threshold
 /// using the "greaterAbs" alternative hypothesis (R's default when lfcThreshold > 0).
 /// R equivalent: results(dds, lfcThreshold=..., altHypothesis="greaterAbs")
-///   stat = sign(log2FC) * max(0, (|log2FC| - threshold) / lfcSE)
-///   pvalue = min(1, 2 * pnorm(-|stat|))
+///   stat = log2FC / lfcSE
+///   pvalue = pnorm(-|log2FC| + T, sd=lfcSE) + pnorm(-|log2FC| - T, sd=lfcSE)
 pub fn wald_test(
     dds: &DESeqDataSet,
     design_info: &DesignInfo,
@@ -40,7 +40,7 @@ pub fn wald_test(
 /// R equivalent: nbinomWaldTest() with numeric/list contrast in core.R
 /// Supports DESeq2-style contrast types
 ///
-/// When `lfc_threshold > 0`, performs greaterAbs test (see `wald_test` docs).
+/// When `lfc_threshold > 0`, performs the greaterAbs test (see `wald_test` docs).
 pub fn wald_test_extended(
     dds: &DESeqDataSet,
     design_info: &DesignInfo,
@@ -261,20 +261,10 @@ pub fn wald_test_extended(
 
             let se_nat = if var_nat > 0.0 { var_nat.sqrt() } else { 0.0 };
 
+            // The statistic is LFC/SE with or without an LFC threshold; R's
+            // greaterAbs test changes only the p-value (below).
             if se_nat > 0.0 && se_nat.is_finite() {
-                if lfc_threshold > 0.0 {
-                    // greaterAbs: test H0: |log2FC| <= threshold
-                    let lfc_log2 = lfc_nat / 2.0_f64.ln();
-                    let se_log2 = se_nat / 2.0_f64.ln();
-                    let abs_lfc = lfc_log2.abs();
-                    if abs_lfc < lfc_threshold {
-                        0.0
-                    } else {
-                        lfc_log2.signum() * (abs_lfc - lfc_threshold) / se_log2
-                    }
-                } else {
-                    lfc_nat / se_nat
-                }
+                lfc_nat / se_nat
             } else {
                 f64::NAN
             }
@@ -302,8 +292,22 @@ pub fn wald_test_extended(
     }
 
     // Calculate p-values
-    let mut pvalues: Vec<f64> = if use_t {
-        let df = dds.n_samples() as f64 - design_info.coef_names.len() as f64;
+    let df = dds.n_samples() as f64 - design_info.coef_names.len() as f64;
+    let mut pvalues: Vec<f64> = if lfc_threshold > 0.0 {
+        (0..n_genes)
+            .map(|i| {
+                if !stat[i].is_finite() {
+                    return f64::NAN;
+                }
+                super::pvalue::calculate_pvalue_greater_abs(
+                    log2_fold_changes[i],
+                    lfc_se[i],
+                    lfc_threshold,
+                    use_t.then_some(df),
+                )
+            })
+            .collect()
+    } else if use_t {
         stat.iter()
             .map(|&z| super::pvalue::calculate_pvalue_t(z, df))
             .collect()
