@@ -282,7 +282,25 @@ fn run_analysis(
     info!("  {} genes, {} samples", counts.n_genes(), counts.n_samples());
 
     info!("Loading metadata from: {}", metadata_path);
-    let metadata = read_metadata(metadata_path)?;
+    let mut metadata = read_metadata(metadata_path)?;
+
+    // read_metadata keeps every column as a categorical factor. Columns named by
+    // --continuous are numeric covariates (R: a numeric colData column), so
+    // register them as such or the design builder cannot find them.
+    for name in continuous_vars {
+        let raw = metadata.condition(name).cloned().ok_or_else(|| DeseqError::InvalidMetadata {
+            reason: format!("Continuous variable '{}' not found in metadata", name),
+        })?;
+        let values = raw
+            .iter()
+            .map(|v| {
+                v.trim().parse::<f64>().ok().filter(|x| x.is_finite()).ok_or_else(|| DeseqError::InvalidMetadata {
+                    reason: format!("Continuous variable '{}' has non-numeric value '{}'", name, v),
+                })
+            })
+            .collect::<Result<Vec<f64>>>()?;
+        metadata.add_continuous(name, values)?;
+    }
 
     // Cross-validate sample IDs between counts and metadata
     {
@@ -688,9 +706,15 @@ fn build_reduced_design(
     info!("Reduced model: ~ {}", variables.join(" + "));
 
     let mut n_cols = 1; // intercept
-    let mut var_info: Vec<(&str, Vec<String>)> = Vec::new();
+    // None marks a continuous variable, which contributes its values as one column
+    let mut var_info: Vec<(&str, Option<Vec<String>>)> = Vec::new();
 
     for &var in &variables {
+        if metadata.has_continuous(var) {
+            n_cols += 1;
+            var_info.push((var, None));
+            continue;
+        }
         let levels = metadata.get_levels(var).map_err(|_| DeseqError::InvalidInput {
             reason: format!(
                 "Variable '{}' in reduced formula not found in metadata",
@@ -699,7 +723,7 @@ fn build_reduced_design(
         })?;
         let non_ref_levels: Vec<String> = levels.into_iter().skip(1).collect();
         n_cols += non_ref_levels.len();
-        var_info.push((var, non_ref_levels));
+        var_info.push((var, Some(non_ref_levels)));
     }
 
     let mut design = Array2::zeros((n_samples, n_cols));
@@ -708,10 +732,18 @@ fn build_reduced_design(
 
         let mut col = 1;
         for (var, non_ref_levels) in &var_info {
-            let sample_value = metadata.get_value(var, i)?;
-            for level in non_ref_levels {
-                design[[i, col]] = if sample_value == *level { 1.0 } else { 0.0 };
-                col += 1;
+            match non_ref_levels {
+                None => {
+                    design[[i, col]] = metadata.get_continuous_value(var, i)?;
+                    col += 1;
+                }
+                Some(levels) => {
+                    let sample_value = metadata.get_value(var, i)?;
+                    for level in levels {
+                        design[[i, col]] = if sample_value == *level { 1.0 } else { 0.0 };
+                        col += 1;
+                    }
+                }
             }
         }
     }

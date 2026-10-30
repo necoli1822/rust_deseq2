@@ -144,8 +144,8 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
     // Store reference levels for naming
     let mut factor_ref_levels: HashMap<String, String> = HashMap::new();
 
-    // Process additional factors (covariates) first, then main design variable
-    // This matches formula order: ~ covariate1 + covariate2 + design_variable
+    // Process additional factors (covariates) first, then continuous covariates, then
+    // the main design variable: ~ covariate1 + covariate2 + continuous + design_variable
     let main_var = dds.design_variable();
 
     // First process covariates/factors
@@ -175,6 +175,15 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
         factor_levels.insert(factor.clone(), non_ref_levels);
     }
 
+    // Then continuous covariates, so the main design variable stays last as in
+    // the formula ~ covariates + continuous + design. The last column is what an
+    // LRT reports as log2FoldChange (R: lastCoefName), so this order matters.
+    for cont in continuous {
+        coef_names.push(cont.clone());
+        continuous_columns.insert(cont.clone(), n_cols);
+        n_cols += 1;
+    }
+
     // Then process the main design variable (comes last in formula order)
     {
         let levels = metadata.get_levels(main_var)?;
@@ -199,13 +208,6 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
         }
         factor_columns.insert(main_var.to_string(), col_indices);
         factor_levels.insert(main_var.to_string(), non_ref_levels);
-    }
-
-    // Process continuous covariates
-    for cont in continuous {
-        coef_names.push(cont.clone());
-        continuous_columns.insert(cont.clone(), n_cols);
-        n_cols += 1;
     }
 
     // Process interactions
@@ -245,6 +247,12 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
             }
         }
 
+        // Continuous columns
+        for cont in continuous {
+            design[[i, col]] = metadata.get_continuous_value(cont, i)?;
+            col += 1;
+        }
+
         // Main design variable columns
         {
             let sample_value = metadata.get_value(main_var, i)?;
@@ -254,12 +262,6 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
                 design[[i, col]] = if sample_value == *level { 1.0 } else { 0.0 };
                 col += 1;
             }
-        }
-
-        // Continuous columns
-        for cont in continuous {
-            design[[i, col]] = metadata.get_continuous_value(cont, i)?;
-            col += 1;
         }
 
         // Interaction columns
