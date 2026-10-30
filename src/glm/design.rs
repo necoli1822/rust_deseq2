@@ -12,8 +12,12 @@ use crate::error::{DeseqError, Result};
 pub struct DesignInfo {
     /// Names of the coefficients
     pub coef_names: Vec<String>,
+    /// Name of the main design variable (the factor tested by default)
+    pub design_variable: String,
     /// Reference level for the design variable
     pub reference_level: String,
+    /// Reference level of every factor in the design, keyed by factor name
+    pub reference_levels: HashMap<String, String>,
     /// All levels of the design variable
     pub levels: Vec<String>,
     /// Factor to column indices mapping
@@ -61,7 +65,9 @@ pub fn create_design_matrix(
         }
         let info = DesignInfo {
             coef_names: vec!["Intercept".to_string()],
+            design_variable: design_variable.to_string(),
             reference_level: levels[0].clone(),
+            reference_levels: HashMap::new(),
             levels,
             factor_columns: HashMap::new(),
             continuous_columns: HashMap::new(),
@@ -104,7 +110,9 @@ pub fn create_design_matrix(
 
     let info = DesignInfo {
         coef_names,
+        design_variable: design_variable.to_string(),
         reference_level: reference_level.clone(),
+        reference_levels: HashMap::from([(design_variable.to_string(), reference_level.clone())]),
         levels,
         factor_columns,
         continuous_columns: HashMap::new(),
@@ -280,7 +288,9 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
 
     let info = DesignInfo {
         coef_names,
+        design_variable: main_var.to_string(),
         reference_level,
+        reference_levels: factor_ref_levels,
         levels: main_levels,
         factor_columns,
         continuous_columns,
@@ -291,7 +301,59 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
     Ok((design, info))
 }
 
-/// Get the coefficient index and sign for a specific contrast
+/// Build the coefficient-space contrast vector for `variable`: numerator vs denominator
+/// R equivalent: getContrast() / cleanContrast() in results.R for a character contrast
+///
+/// Coefficients are matched by their exact name `{variable}_{level}_vs_{reference}`.
+/// The reference level has no column, so:
+/// - denominator is the reference: `+1` on the numerator column
+/// - numerator is the reference: `-1` on the denominator column
+/// - neither is the reference: `+1` on the numerator and `-1` on the denominator column,
+///   whose standard error then requires the full coefficient covariance (as in R).
+pub fn contrast_vector(
+    info: &DesignInfo,
+    variable: &str,
+    numerator: &str,
+    denominator: &str,
+) -> Result<Vec<f64>> {
+    if numerator == denominator {
+        return Err(DeseqError::InvalidContrast {
+            reason: format!("Numerator and denominator are the same level '{}'", numerator),
+        });
+    }
+    let reference = info.reference_levels.get(variable).ok_or_else(|| DeseqError::InvalidContrast {
+        reason: format!(
+            "Variable '{}' is not a factor in the design (factors: {:?})",
+            variable,
+            info.reference_levels.keys().collect::<Vec<_>>()
+        ),
+    })?;
+
+    let column = |level: &str| -> Result<Option<usize>> {
+        if level == reference {
+            return Ok(None);
+        }
+        let name = format!("{}_{}_vs_{}", variable, level, reference);
+        info.coef_names
+            .iter()
+            .position(|n| *n == name)
+            .map(Some)
+            .ok_or_else(|| DeseqError::InvalidContrast {
+                reason: format!("Level '{}' not found for variable '{}'", level, variable),
+            })
+    };
+
+    let mut contrast = vec![0.0; info.coef_names.len()];
+    if let Some(i) = column(numerator)? {
+        contrast[i] += 1.0;
+    }
+    if let Some(j) = column(denominator)? {
+        contrast[j] -= 1.0;
+    }
+    Ok(contrast)
+}
+
+/// Get the coefficient index and sign for a contrast of the main design variable
 /// R equivalent: getContrast() in results.R
 ///
 /// Returns (coefficient_index, sign) where sign is 1.0 for the standard direction
@@ -299,52 +361,22 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
 ///
 /// In R, `results(dds, contrast=c("treatment", "A", "B"))` when B is the reference
 /// returns the negative of the `treatment_A_vs_B` coefficient (i.e., flipped sign).
-/// We support this by returning sign = -1.0 when the user's numerator is the reference level.
+///
+/// A contrast between two non-reference levels is not a single coefficient; use
+/// [`contrast_vector`] for that case.
 pub fn get_contrast_index(info: &DesignInfo, numerator: &str, denominator: &str) -> Result<(usize, f64)> {
-    // Standard case: denominator is the reference level
-    // Coefficient encodes "numerator vs reference" -> sign = +1
-    if denominator == info.reference_level {
-        let expected_name = format!(
-            "{}_vs_{}",
-            numerator, denominator
-        );
-
-        for (i, name) in info.coef_names.iter().enumerate() {
-            if name.ends_with(&expected_name) {
-                return Ok((i, 1.0));
-            }
-        }
-
-        return Err(DeseqError::InvalidContrast {
-            reason: format!("Contrast '{} vs {}' not found", numerator, denominator),
-        });
+    let contrast = contrast_vector(info, &info.design_variable, numerator, denominator)?;
+    let nonzero: Vec<usize> = (0..contrast.len()).filter(|&i| contrast[i] != 0.0).collect();
+    match nonzero.as_slice() {
+        [i] => Ok((*i, contrast[*i])),
+        _ => Err(DeseqError::InvalidContrast {
+            reason: format!(
+                "Contrast '{} vs {}' is not a single coefficient: neither level is the reference \
+                 level '{}'. Use --reference {}={} to make it one.",
+                numerator, denominator, info.reference_level, info.design_variable, denominator
+            ),
+        }),
     }
-
-    // Reverse case: numerator is the reference level
-    // R handles this by negating the coefficient for denominator_vs_reference
-    if numerator == info.reference_level {
-        let expected_name = format!(
-            "{}_vs_{}",
-            denominator, numerator
-        );
-
-        for (i, name) in info.coef_names.iter().enumerate() {
-            if name.ends_with(&expected_name) {
-                return Ok((i, -1.0));
-            }
-        }
-    }
-
-    // Neither is the reference level -- for multi-level factors, neither numerator
-    // nor denominator is the reference. This requires a contrast vector approach.
-    Err(DeseqError::InvalidContrast {
-        reason: format!(
-            "For contrast '{} vs {}': one of the levels must be the reference level '{}'. \
-             Use --reference FACTOR={} to set the denominator as reference, \
-             or use the extended contrast specification.",
-            numerator, denominator, info.reference_level, denominator
-        ),
-    })
 }
 
 /// Check if a design matrix is full rank using QR decomposition with column pivoting.

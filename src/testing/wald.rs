@@ -1,12 +1,11 @@
 //! Wald test for differential expression
 
-use ndarray::Axis;
 
 use super::fdr::benjamini_hochberg;
 use super::pvalue::calculate_pvalue;
 use crate::data::DESeqDataSet;
 use crate::error::{DeseqError, Result};
-use crate::glm::{get_contrast_index, DesignInfo};
+use crate::glm::{contrast_vector, DesignInfo};
 use crate::io::{Contrast, DESeqResults};
 
 /// Perform Wald test for a specific contrast
@@ -21,153 +20,21 @@ pub fn wald_test(
     dds: &DESeqDataSet,
     design_info: &DesignInfo,
     contrast: Contrast,
-    _alpha: f64,
+    alpha: f64,
     use_t: bool,
     lfc_threshold: f64,
 ) -> Result<DESeqResults> {
-    // Check if GLM has been fitted
-    let coefficients = dds.coefficients().ok_or_else(|| DeseqError::InvalidContrast {
-        reason: "GLM must be fitted before testing".to_string(),
-    })?;
-
-    let standard_errors = dds.standard_errors().ok_or_else(|| DeseqError::InvalidContrast {
-        reason: "Standard errors not available".to_string(),
-    })?;
-
-    // Find the coefficient index and sign for the contrast
-    // sign is -1.0 when the user requested the reverse direction (numerator=reference)
-    let (coef_idx, contrast_sign) = get_contrast_index(design_info, &contrast.numerator, &contrast.denominator)?;
-
-    let n_genes = dds.n_genes();
-    let gene_ids = dds.counts().gene_ids().to_vec();
-
-    // Calculate base means and base vars (mean and variance of normalized counts)
-    let (base_means, base_vars): (Vec<f64>, Vec<f64>) = if let Some(norm_counts) = dds.normalized_counts() {
-        let n_samples_f = dds.n_samples() as f64;
-        let means: Vec<f64> = norm_counts
-            .axis_iter(Axis(0))
-            .map(|row| row.sum() / n_samples_f)
-            .collect();
-        let vars: Vec<f64> = norm_counts
-            .axis_iter(Axis(0))
-            .enumerate()
-            .map(|(i, row)| {
-                let mean = means[i];
-                row.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (n_samples_f - 1.0)
-            })
-            .collect();
-        (means, vars)
-    } else {
-        (vec![f64::NAN; n_genes], vec![f64::NAN; n_genes])
+    // A simple contrast is the special case of a contrast vector with a single
+    // non-zero entry (or two, when neither level is the reference), so share
+    // the extended path rather than duplicating the statistics.
+    let spec = crate::io::ContrastSpec::Simple {
+        variable: contrast.variable.clone(),
+        numerator: contrast.numerator.clone(),
+        denominator: contrast.denominator.clone(),
     };
-
-    // Extract log fold changes and standard errors
-    // Apply contrast_sign to handle reverse contrasts (numerator=reference -> negate)
-    // R sets LFC=0, SE=0 for allZero genes (baseMean == 0)
-    let log2_fold_changes: Vec<f64> = (0..n_genes)
-        .map(|i| {
-            if base_means[i] == 0.0 {
-                return 0.0;
-            }
-            let lfc = coefficients[[i, coef_idx]] * contrast_sign;
-            // Convert from natural log to log2
-            lfc / 2.0_f64.ln()
-        })
-        .collect();
-
-    let lfc_se: Vec<f64> = (0..n_genes)
-        .map(|i| {
-            if base_means[i] == 0.0 {
-                return 0.0;
-            }
-            let se = standard_errors[[i, coef_idx]];
-            // Convert from natural log to log2
-            se / 2.0_f64.ln()
-        })
-        .collect();
-
-    // Calculate Wald statistics
-    // When lfc_threshold > 0 (greaterAbs alternative hypothesis):
-    //   R: stat = sign(log2FC) * max(0, (|log2FC| - threshold) / lfcSE)
-    //   pvalue = min(1, 2 * pnorm(-|stat|))
-    // When lfc_threshold == 0 (standard Wald test):
-    //   stat = beta / se (in natural log scale, same ratio as log2 scale)
-    let stat: Vec<f64> = (0..n_genes)
-        .map(|i| {
-            // R sets pvalue/padj to NA for allZero genes (baseMean == 0)
-            if base_means[i] == 0.0 {
-                return f64::NAN;
-            }
-            let beta = coefficients[[i, coef_idx]] * contrast_sign;
-            let se = standard_errors[[i, coef_idx]];
-            if se > 0.0 && se.is_finite() {
-                if lfc_threshold > 0.0 {
-                    // greaterAbs: test H0: |log2FC| <= threshold
-                    let lfc_log2 = beta / 2.0_f64.ln();
-                    let se_log2 = se / 2.0_f64.ln();
-                    let abs_lfc = lfc_log2.abs();
-                    if abs_lfc < lfc_threshold {
-                        0.0
-                    } else {
-                        lfc_log2.signum() * (abs_lfc - lfc_threshold) / se_log2
-                    }
-                } else {
-                    beta / se
-                }
-            } else {
-                f64::NAN
-            }
-        })
-        .collect();
-
-    // Calculate p-values
-    let pvalues: Vec<f64> = if use_t {
-        let df = dds.n_samples() as f64 - design_info.coef_names.len() as f64;
-        stat.iter()
-            .map(|&z| super::pvalue::calculate_pvalue_t(z, df))
-            .collect()
-    } else {
-        stat.iter().map(|&z| calculate_pvalue(z)).collect()
-    };
-
-    // Apply BH correction
-    let padj = benjamini_hochberg(&pvalues);
-
-    // Get dispersions (MAP)
-    let dispersions: Vec<f64> = if let Some(disp) = dds.dispersions() {
-        disp.to_vec()
-    } else {
-        vec![f64::NAN; n_genes]
-    };
-
-    // Get gene-wise dispersions
-    let gene_wise_dispersions: Vec<f64> = if let Some(disp) = dds.gene_dispersions() {
-        disp.to_vec()
-    } else {
-        vec![f64::NAN; n_genes]
-    };
-
-    // Get trended dispersions
-    let trended_dispersions: Vec<f64> = if let Some(disp) = dds.trended_dispersions() {
-        disp.to_vec()
-    } else {
-        vec![f64::NAN; n_genes]
-    };
-
-    Ok(DESeqResults {
-        gene_ids,
-        base_means,
-        base_vars,
-        log2_fold_changes,
-        lfc_se,
-        stat,
-        pvalues,
-        padj,
-        dispersions,
-        gene_wise_dispersions,
-        trended_dispersions,
-        contrast,
-    })
+    let mut results = wald_test_extended(dds, design_info, spec, alpha, use_t, lfc_threshold)?;
+    results.contrast = contrast;
+    Ok(results)
 }
 
 /// Perform Wald test with extended contrast specification
@@ -208,11 +75,7 @@ pub fn wald_test_extended(
             numerator,
             denominator,
         } => {
-            // Find coefficient index and sign for simple contrast
-            let (coef_idx, sign) =
-                get_contrast_index(design_info, numerator, denominator)?;
-            let mut vec = vec![0.0; n_coefs];
-            vec[coef_idx] = sign;
+            let vec = contrast_vector(design_info, variable, numerator, denominator)?;
             let desc = format!("{} {} vs {}", variable, numerator, denominator);
             (vec, desc)
         }
@@ -289,6 +152,10 @@ pub fn wald_test_extended(
         }
     };
 
+    // Only coefficients with non-zero weight enter c'Σc; skipping the rest keeps a
+    // non-finite entry elsewhere in Σ from poisoning an otherwise valid SE.
+    let nonzero: Vec<usize> = (0..n_coefs).filter(|&j| contrast_vec[j] != 0.0).collect();
+
     // Calculate base means and base vars
     let (base_means, base_vars): (Vec<f64>, Vec<f64>) = if let Some(norm_counts) = dds.normalized_counts() {
         let n_samples_f = dds.n_samples() as f64;
@@ -338,8 +205,8 @@ pub fn wald_test_extended(
                 // covs is Array3 (n_genes x n_coefs x n_coefs)
                 // c' * Cov * c = sum_j sum_k c_j * Cov_jk * c_k
                 let mut sum = 0.0;
-                for j in 0..n_coefs {
-                    for k in 0..n_coefs {
+                for j in nonzero.iter().copied() {
+                    for k in nonzero.iter().copied() {
                         sum += contrast_vec[j] * covs[[i, j, k]] * contrast_vec[k];
                     }
                 }
@@ -379,8 +246,8 @@ pub fn wald_test_extended(
 
             let var_nat = if let Some(covs) = covariances {
                 let mut sum = 0.0;
-                for j in 0..n_coefs {
-                    for k in 0..n_coefs {
+                for j in nonzero.iter().copied() {
+                    for k in nonzero.iter().copied() {
                         sum += contrast_vec[j] * covs[[i, j, k]] * contrast_vec[k];
                     }
                 }
