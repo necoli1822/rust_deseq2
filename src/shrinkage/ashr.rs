@@ -48,6 +48,9 @@ pub struct AshrParams {
     pub tol: f64,
     /// Include point mass at zero (pi_0)
     pub pointmass: bool,
+    /// Grid multiplier between adjacent mixture standard deviations
+    /// R: ash(gridmult = sqrt(2))
+    pub grid_mult: f64,
 }
 
 impl Default for AshrParams {
@@ -57,8 +60,11 @@ impl Default for AshrParams {
             sigma_max: 10.0,
             sigma_min: 0.001,
             max_iter: 1000,
-            tol: 1e-6,
-            pointmass: true,
+            tol: 1e-9,
+            // lfcShrink calls ash(..., method = "shrink"), which sets
+            // pointmass = FALSE and prior = "uniform" (ashr R/ash.R)
+            pointmass: false,
+            grid_mult: std::f64::consts::SQRT_2,
         }
     }
 }
@@ -122,34 +128,16 @@ pub fn shrink_lfc_ashr(results: &DESeqResults, params: &AshrParams) -> AshrFit {
     }
 
     // Set up data-adaptive mixture grid (matches R's autoselect.mixsd)
-    let sigma = create_sigma_grid_adaptive(params, &sebetahat);
+    let sigma = create_sigma_grid_adaptive(params, &betahat, &sebetahat);
     let k = sigma.len();
 
-    // Initialize mixture proportions uniformly
-    let mut pi = vec![1.0 / k as f64; k];
+    // The component likelihoods do not depend on pi, so compute them once.
+    let log_lik = compute_log_likelihood_matrix(&betahat, &sebetahat, &sigma);
 
-    // EM algorithm
-    for _iter in 0..params.max_iter {
-        // E-step: compute posterior membership probabilities
-        let log_lik = compute_log_likelihood_matrix(&betahat, &sebetahat, &sigma);
-        let (membership, _ll) = compute_membership(&log_lik, &pi);
-
-        // M-step: update mixture proportions
-        let new_pi = update_pi(&membership);
-
-        // Check convergence
-        let max_change: f64 = pi
-            .iter()
-            .zip(new_pi.iter())
-            .map(|(&p1, &p2)| (p1 - p2).abs())
-            .fold(0.0, f64::max);
-
-        pi = new_pi;
-
-        if max_change < params.tol {
-            break;
-        }
-    }
+    // Mixture weights under a uniform prior: plain maximum likelihood. R solves the
+    // same concave problem with mixSQP to high precision, so iterate to a tight
+    // tolerance (with SQUAREM acceleration, as ashr's own mixEM does).
+    let pi = fit_mixture_weights(&log_lik, k, params.max_iter, params.tol);
 
     // Compute posterior statistics
     let (posterior_mean_valid, posterior_sd_valid, lfsr_valid) =
@@ -209,61 +197,40 @@ fn create_sigma_grid(params: &AshrParams) -> Vec<f64> {
 
 /// Create data-adaptive sigma grid for mixture components
 ///
-/// Matches R's ashr `autoselect.mixsd(data)`:
-///   sdmin = min(se) / 10
-///   sdmax = 2 * sqrt(max(betahat^2 - se^2, 0))  [approximated by max(se) * 2]
-///   sigmalist = 2^seq(log2(sdmin), log2(sdmax), length.out = npoint)
-///
-/// Falls back to fixed grid if data is insufficient.
-fn create_sigma_grid_adaptive(params: &AshrParams, sebetahat: &[f64]) -> Vec<f64> {
+/// R equivalent: ashr's autoselect.mixsd(data, mult = gridmult) for mode 0:
+///   sigmaamin = min(se) / 10
+///   sigmaamax = 2 * sqrt(max(betahat^2 - se^2))   (8 * sigmaamin if all betahat^2 <= se^2)
+///   npoint    = ceiling(log2(sigmaamax / sigmaamin) / log2(mult))
+///   mixsd     = mult^((-npoint):0) * sigmaamax
+/// with a 0 prepended when the point mass is included.
+fn create_sigma_grid_adaptive(params: &AshrParams, betahat: &[f64], sebetahat: &[f64]) -> Vec<f64> {
     if sebetahat.is_empty() {
         return create_sigma_grid(params);
     }
 
-    // Compute data-adaptive range from observed standard errors
-    let se_min = sebetahat
+    let se_min = sebetahat.iter().cloned().fold(f64::INFINITY, f64::min);
+    let sigma_min = se_min / 10.0;
+    let max_excess = betahat
         .iter()
-        .filter(|&&se| se > 0.0 && se.is_finite())
-        .cloned()
-        .fold(f64::INFINITY, f64::min);
-    let se_max = sebetahat
-        .iter()
-        .filter(|&&se| se.is_finite())
-        .cloned()
-        .fold(0.0_f64, f64::max);
+        .zip(sebetahat)
+        .map(|(&b, &se)| b * b - se * se)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let sigma_max = if max_excess <= 0.0 {
+        8.0 * sigma_min
+    } else {
+        2.0 * max_excess.sqrt()
+    };
 
-    if !se_min.is_finite() || !se_max.is_finite() || se_min <= 0.0 || se_max <= 0.0 {
-        return create_sigma_grid(params);
-    }
+    let mult = params.grid_mult;
+    let npoint = ((sigma_max / sigma_min).log2() / mult.log2()).ceil().max(0.0) as i32;
 
-    // R's autoselect.mixsd: sdmin = min(se)/10, sdmax = 2*max(se)
-    let sd_min = (se_min / 10.0).max(1e-8);
-    let sd_max = (2.0 * se_max).max(sd_min * 2.0);
-
-    let mut sigma = Vec::new();
-
-    // Point mass at 0 (if enabled)
+    let mut sigma = Vec::with_capacity(npoint as usize + 2);
     if params.pointmass {
         sigma.push(0.0);
     }
-
-    // Log2-spaced grid from sd_min to sd_max (matching R's 2^seq(...))
-    let n_grid = if params.pointmass {
-        params.n_components - 1
-    } else {
-        params.n_components
-    };
-
-    if n_grid > 0 {
-        let log2_min = sd_min.log2();
-        let log2_max = sd_max.log2();
-        for i in 0..n_grid {
-            let log2_s =
-                log2_min + (log2_max - log2_min) * i as f64 / (n_grid - 1).max(1) as f64;
-            sigma.push(2.0_f64.powf(log2_s));
-        }
+    for e in -npoint..=0 {
+        sigma.push(mult.powi(e) * sigma_max);
     }
-
     sigma
 }
 
@@ -316,65 +283,180 @@ fn compute_log_likelihood_matrix(
     result
 }
 
-/// Compute membership probabilities (E-step)
-/// Returns (membership matrix, total log-likelihood)
-fn compute_membership(log_lik: &[Vec<f64>], pi: &[f64]) -> (Vec<Vec<f64>>, f64) {
-    let n = log_lik.len();
-    let k = pi.len();
+/// Maximum-likelihood mixture weights on the probability simplex
+/// R equivalent: ashr::ash() with prior = "uniform", which maximises
+/// sum_i log(sum_k L_ik pi_k) with mixsqp (a sequential quadratic programming solver).
+///
+/// The problem is concave in pi with only a handful of components, so this uses the
+/// same idea as mixSQP: Newton steps on the free components (those not at zero)
+/// under the constraint sum(pi) = 1, a backtracking line search that keeps pi >= 0,
+/// and an active set that releases a zero component when its gradient says the
+/// likelihood would increase. Plain EM converges far too slowly to reach R's
+/// solution (posterior means still moved at 1e-4 after 1000 iterations).
+///
+/// Optimality (KKT) for this objective: with g = gradient, g'pi = n always, and at
+/// the optimum g_k = n where pi_k > 0 and g_k <= n where pi_k = 0.
+fn fit_mixture_weights(log_lik: &[Vec<f64>], k: usize, max_iter: usize, tol: f64) -> Vec<f64> {
+    // Row-scaled likelihoods: the scaling only shifts the objective by a constant.
+    let lik: Vec<Vec<f64>> = log_lik
+        .par_iter()
+        .map(|row| {
+            let m = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            row.iter().map(|&l| (l - m).exp()).collect()
+        })
+        .collect();
+    let n = lik.len() as f64;
 
-    let mut membership = vec![vec![0.0; k]; n];
-    let mut total_ll = 0.0;
-
-    for i in 0..n {
-        // Log-sum-exp trick for numerical stability
-        let mut max_log = f64::NEG_INFINITY;
-        for j in 0..k {
-            let log_contrib = pi[j].ln() + log_lik[i][j];
-            if log_contrib > max_log {
-                max_log = log_contrib;
+    let objective = |pi: &[f64]| -> f64 {
+        lik.iter()
+            .map(|row| row.iter().zip(pi).map(|(l, p)| l * p).sum::<f64>().max(1e-300).ln())
+            .sum()
+    };
+    // Gradient and Hessian of the objective
+    let derivatives = |pi: &[f64]| -> (Vec<f64>, Vec<Vec<f64>>) {
+        let mut g = vec![0.0; k];
+        let mut h = vec![vec![0.0; k]; k];
+        for row in &lik {
+            let d: f64 = row.iter().zip(pi).map(|(l, p)| l * p).sum::<f64>().max(1e-300);
+            for a in 0..k {
+                let ra = row[a] / d;
+                g[a] += ra;
+                for b in a..k {
+                    h[a][b] -= ra * row[b] / d;
+                }
             }
         }
+        for a in 0..k {
+            for b in 0..a {
+                h[a][b] = h[b][a];
+            }
+        }
+        (g, h)
+    };
 
-        let mut sum_exp = 0.0;
-        for j in 0..k {
-            let log_contrib = pi[j].ln() + log_lik[i][j];
-            sum_exp += (log_contrib - max_log).exp();
+    let mut pi = vec![1.0 / k as f64; k];
+    let mut obj = objective(&pi);
+    for iter in 0..max_iter {
+        let (g, h) = derivatives(&pi);
+
+        // KKT check, scaled by n so it does not depend on the number of genes
+        let free: Vec<usize> = (0..k).filter(|&j| pi[j] > 0.0).collect();
+        let worst_free = free.iter().map(|&j| (g[j] / n - 1.0).abs()).fold(0.0, f64::max);
+        let (release, worst_bound) = (0..k)
+            .filter(|&j| pi[j] == 0.0)
+            .map(|j| (j, g[j] / n - 1.0))
+            .fold((None, 0.0), |acc, (j, v)| if v > acc.1 { (Some(j), v) } else { acc });
+        if worst_free < tol && worst_bound < tol {
+            log::debug!("ashr mixture weights converged after {} iterations", iter);
+            break;
         }
 
-        let log_marginal = max_log + sum_exp.ln();
-        total_ll += log_marginal;
+        let mut d = vec![0.0; k];
+        if worst_free >= tol {
+            // Newton step on the free components: maximise g'd + d'Hd/2 subject to
+            // 1'd = 0, via the KKT system [-H 1; 1' 0] [d; mu] = [g; 0]. Every free
+            // component is positive, so some positive step is always feasible.
+            let m = free.len();
+            let ridge = 1e-10 * (0..k).map(|j| -h[j][j]).sum::<f64>().max(1e-300) / k as f64;
+            let mut a = vec![vec![0.0; m + 1]; m + 1];
+            let mut rhs = vec![0.0; m + 1];
+            for (r, &jr) in free.iter().enumerate() {
+                for (c, &jc) in free.iter().enumerate() {
+                    a[r][c] = -h[jr][jc];
+                }
+                a[r][r] += ridge;
+                a[r][m] = 1.0;
+                a[m][r] = 1.0;
+                rhs[r] = g[jr];
+            }
+            match solve_dense(a, rhs) {
+                Some(step) => {
+                    for (r, &j) in free.iter().enumerate() {
+                        d[j] = step[r];
+                    }
+                }
+                None => break,
+            }
+        } else if let Some(j) = release {
+            // The free components are optimal but a zero component would increase
+            // the likelihood (g_j > n): move towards that vertex (a Frank-Wolfe step,
+            // slope g_j - g'pi = g_j - n > 0), with the 1-D Newton length.
+            for (l, dl) in d.iter_mut().enumerate() {
+                *dl = if l == j { 1.0 } else { 0.0 } - pi[l];
+            }
+            let slope: f64 = (0..k).map(|l| g[l] * d[l]).sum();
+            let curv: f64 = (0..k).map(|a| (0..k).map(|b| d[a] * h[a][b] * d[b]).sum::<f64>()).sum();
+            let len = if curv < 0.0 { (slope / -curv).min(1.0) } else { 1.0 };
+            d.iter_mut().for_each(|v| *v *= len);
+        }
 
-        // Normalize to get membership
+        // Longest step keeping pi >= 0; the component that blocks it is set to zero
+        // exactly so it leaves the free set. Then backtrack (Armijo).
+        let mut t_max: f64 = 1.0;
+        let mut blocking = None;
         for j in 0..k {
-            let log_contrib = pi[j].ln() + log_lik[i][j];
-            membership[i][j] = (log_contrib - log_marginal).exp();
+            if d[j] < 0.0 && -pi[j] / d[j] < t_max {
+                t_max = -pi[j] / d[j];
+                blocking = Some(j);
+            }
+        }
+        let slope: f64 = (0..k).map(|j| g[j] * d[j]).sum();
+        let mut t = t_max;
+        let mut accepted = None;
+        for _ in 0..60 {
+            let mut cand: Vec<f64> = (0..k).map(|j| (pi[j] + t * d[j]).max(0.0)).collect();
+            if t == t_max {
+                if let Some(j) = blocking {
+                    cand[j] = 0.0;
+                }
+            }
+            let total: f64 = cand.iter().sum();
+            cand.iter_mut().for_each(|v| *v /= total);
+            let cand_obj = objective(&cand);
+            if cand_obj >= obj + 1e-4 * t * slope {
+                accepted = Some((cand, cand_obj));
+                break;
+            }
+            t *= 0.5;
+        }
+        match accepted {
+            Some((cand, cand_obj)) => {
+                pi = cand;
+                obj = cand_obj;
+            }
+            // No ascent possible at floating-point resolution
+            None => break,
         }
     }
-
-    (membership, total_ll)
+    pi
 }
 
-/// Update mixture proportions (M-step)
-fn update_pi(membership: &[Vec<f64>]) -> Vec<f64> {
-    let n = membership.len();
-    let k = membership[0].len();
-
-    let mut new_pi = vec![0.0; k];
-
-    for j in 0..k {
-        let sum: f64 = membership.iter().map(|m| m[j]).sum();
-        new_pi[j] = sum / n as f64;
-    }
-
-    // Ensure pi sums to 1
-    let total: f64 = new_pi.iter().sum();
-    if total > 0.0 {
-        for p in &mut new_pi {
-            *p /= total;
+/// Solve a small dense linear system by Gaussian elimination with partial pivoting
+fn solve_dense(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = b.len();
+    for col in 0..n {
+        let piv = (col..n).max_by(|&x, &y| a[x][col].abs().partial_cmp(&a[y][col].abs()).unwrap())?;
+        if a[piv][col].abs() < 1e-300 {
+            return None;
+        }
+        a.swap(col, piv);
+        b.swap(col, piv);
+        for row in (col + 1)..n {
+            let f = a[row][col] / a[col][col];
+            if f != 0.0 {
+                for c in col..n {
+                    a[row][c] -= f * a[col][c];
+                }
+                b[row] -= f * b[col];
+            }
         }
     }
-
-    new_pi
+    let mut x = vec![0.0; n];
+    for row in (0..n).rev() {
+        let s: f64 = ((row + 1)..n).map(|c| a[row][c] * x[c]).sum();
+        x[row] = (b[row] - s) / a[row][row];
+    }
+    x.iter().all(|v| v.is_finite()).then_some(x)
 }
 
 /// Compute posterior statistics
@@ -537,15 +619,24 @@ mod tests {
     }
 
     #[test]
-    fn test_update_pi() {
-        let membership = vec![
-            vec![0.8, 0.2],
-            vec![0.6, 0.4],
-            vec![0.5, 0.5],
-        ];
-
-        let pi = update_pi(&membership);
+    fn test_fit_mixture_weights_recovers_mixture() {
+        // Two components; data generated mostly from the second one.
+        let sigma = vec![0.1, 2.0];
+        let betahat: Vec<f64> = (0..200).map(|i| if i % 4 == 0 { 0.05 } else { 3.0 }).collect();
+        let sebetahat = vec![0.1; 200];
+        let log_lik = compute_log_likelihood_matrix(&betahat, &sebetahat, &sigma);
+        let pi = fit_mixture_weights(&log_lik, 2, 10_000, 1e-12);
         assert!((pi.iter().sum::<f64>() - 1.0).abs() < 1e-10);
+
+        // Compare with a brute-force search of the (one-dimensional) likelihood
+        let loglik = |w: f64| -> f64 {
+            log_lik.iter().map(|row| ((1.0 - w) * row[0].exp() + w * row[1].exp()).ln()).sum()
+        };
+        let best = (0..=10_000)
+            .map(|i| i as f64 / 10_000.0)
+            .max_by(|a, b| loglik(*a).partial_cmp(&loglik(*b)).unwrap())
+            .unwrap();
+        assert!((pi[1] - best).abs() < 2e-4, "pi = {:?}, grid optimum = {}", pi, best);
     }
 
     #[test]
