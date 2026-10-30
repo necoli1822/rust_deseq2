@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Fidelity fixes found by comparing against R DESeq2 1.50.2 (apeglm 1.32.0, ashr 2.2-63,
+RcppNumerical 0.7-0, R 4.5.3) on simulated data sets covering each code path. Each item
+names the R function it now follows.
+
+### Fixed
+- **Wrong coefficient for contrasts.** Coefficients were found by suffix match, so with
+  levels WT/KO/DKO a `KO vs WT` contrast returned the DKO result, and a covariate sharing level
+  names with the main factor could be picked instead. Contrasts now use exact coefficient
+  names, and a contrast between two non-reference levels is computed from the coefficient
+  covariance (`results()`/`getContrast`) instead of being rejected.
+- **apeglm shrank the wrong coefficient.** The CLI always shrank design column 1 (the batch
+  coefficient with `--covariate batch`), and reversed contrasts got the wrong sign in both
+  apeglm and normal shrinkage.
+- **apeglm optimiser path.** The C++ MAP search now uses the Nocedal-Wright line search of the
+  LBFGSpp bundled with RcppNumerical 0.7-0, the likelihood constant of `nbinomFn`, `uniroot`
+  for the prior variance, and `optim(method = "BFGS")` refits for rows that do not converge.
+- **ashr shrinkage** used a point mass at zero and a different mixture grid; `lfcShrink` uses
+  `method = "shrink"` (no point mass, uniform prior) and `autoselect.mixsd`. Mixture weights
+  are now solved to optimality (EM stopped far from R's mixSQP solution).
+- **`--continuous` always failed** ("continuous variable not found"), the LRT reported the
+  covariate's slope as log2FoldChange when continuous covariates were present, and the
+  reduced model treated continuous variables as factors.
+- **Outlier refit aborted** with `--fit-type local`/`mean` (or a parametric fit that fell back
+  to local) whenever a 7+ replicate cell had a Cook's outlier; the refit also recomputed
+  `varLogDispEsts` instead of reusing R's.
+- **Outlier replacement and Cook's filtering used the wrong samples**: replaceable samples are
+  now model-matrix cells with `minReplicatesForReplace` samples (`nOrMoreInCell`), and maxCooks
+  only uses cells with 3+ replicates (`recordMaxCooks`).
+- **MAP dispersion dropped the Cox-Reid term** whenever pivoting swapped rows of X'WX (e.g. an
+  unscaled continuous covariate), shifting every gene's dispersion by ~13%.
+- **Small designs (residual df 1-3)**: the simulated prior-variance estimate now reproduces R's
+  `set.seed(2)` draws (`norm_rand` inversion, `exp_rand`, `rgamma`, `qnorm`, draw order).
+- **`--lfc-threshold`** used the pre-2023 test; it now uses R's current `greaterAbs`.
+- **poscounts size factors** were not rescaled to geometric mean 1.
+- **Cook's distances for zero-heavy genes**: hat diagonals of optim-refit genes now come from
+  the IRLS fit and stored mu is unclamped, as in `fitNbinomGLMs`.
+- **Gene-wise dispersions for multi-factor designs** now take mu from the same GLM fit R uses.
+- **VST**: `vst --method` now changes the dispersion fit, `mean` uses the mean dispersion, and
+  `local` is a port of R's numerical integration (it produced values up to 1.8e8 before).
+- **All-zero genes** report NA, and genes with no counts in the compared groups report
+  LFC 0 / p 1 (`contrastAllZero`), as do genes that become all zero after replacement.
+- **CLI**: the `normalize` subcommand failed on every input; subcommand `--help`/`-h` was
+  rejected; `--replace-outliers false` was rejected (the flag could not be turned off).
+
+### Changed
+- `--replace-outliers` now takes a value: `--replace-outliers false`.
+- apeglm's prior-scale message is logged at info level instead of printed to stderr.
+
 ## [0.1.0] - 2025-01-31
 
 ### Added

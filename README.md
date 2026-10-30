@@ -87,7 +87,7 @@ rust_deseq2 normalize -c counts.csv -o normalized.tsv
 | `--use-t` | Use t-distribution for Wald test p-values | `false` |
 | `--shrinkage` | Apply LFC shrinkage | `false` |
 | `--shrinkage-method` | Shrinkage: `normal`, `apeglm`, `ashr` | `normal` |
-| `--replace-outliers` | Replace Cook's distance outliers | `true` |
+| `--replace-outliers <BOOL>` | Replace Cook's distance outliers (`true`/`false`) | `true` |
 | `-o, --output` | Output file path | `deseq2_results.csv` |
 | `-a, --alpha` | Significance threshold | `0.1` |
 | `--maxit` | Max IRLS iterations (GLM + dispersion) | `100` |
@@ -116,8 +116,12 @@ rust_deseq2 normalize -c counts.csv -o normalized.tsv
 | `-m, --metadata` | Sample metadata CSV file | *required* |
 | `-d, --design` | Design variable | *required* |
 | `-o, --output` | Output file path | `vst_transformed.tsv` |
-| `--method` | Fit method: `parametric`, `mean`, `local` | `parametric` |
+| `--method` | Dispersion fitType: `parametric`, `mean`, `local` | `parametric` |
 | `--blind` | Blind to experimental design | `false` |
+
+This is R's `varianceStabilizingTransformation(dds, blind, fitType)`: the dispersion trend is
+fitted on all genes. R's faster `vst()`, which fits it on a subset of `nsub = 1000` genes, is not
+implemented, so values can differ slightly from `vst(dds)`.
 
 ### `rlog` — Regularized Log Transformation
 
@@ -216,12 +220,12 @@ Key equivalences between R DESeq2 and RustDESeq2:
 
 | R DESeq2 | RustDESeq2 | Description |
 |----------|------------|-------------|
-| `DESeq()` | `run_deseq()` | Full pipeline |
+| `DESeq()` | `run_deseq()` | Size factors, parametric dispersions and GLM fit only: no Cook's outlier replacement. The CLI `run` command performs the full `DESeq()` + `results()` sequence (outlier replacement, Cook's filtering, independent filtering) |
 | `estimateSizeFactors()` | `estimate_size_factors()` | Normalization |
 | `estimateDispersions()` | `estimate_dispersions()` | Dispersion estimation |
 | `nbinomWaldTest()` | `wald_test()` | Wald test |
 | `nbinomLRT()` | `likelihood_ratio_test()` | LRT |
-| `results()` | `results()` / `results_extended()` | Extract results |
+| `results()` | `results()` / `results_extended()` | Extract results (BH adjustment only; Cook's and independent filtering are applied by the CLI, or via `filter_by_cooks_with_counts` / `independent_filtering`) |
 | `resultsNames()` | `results_names()` | Coefficient names |
 | `lfcShrink(type="normal")` | `shrink_lfc_normal()` | Normal shrinkage |
 | `lfcShrink(type="apeglm")` | `shrink_lfc_apeglm()` | Apeglm shrinkage |
