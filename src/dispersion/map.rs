@@ -1043,20 +1043,22 @@ fn log_determinant(m: &[Vec<f64>]) -> f64 {
         }
     }
 
-    // Log determinant is sum of log of diagonal elements
-    // For positive definite matrices (X'WX should be), sign should always be positive
-    if sign < 0.0 {
-        return f64::NAN; // Negative determinant (shouldn't happen for X'WX)
-    }
-
+    // det = (-1)^swaps * prod(pivots). With partial pivoting the pivots of a positive
+    // definite X'WX can be negative while the determinant is positive, so the sign
+    // must combine both; checking either alone wrongly rejected every matrix that
+    // needed an odd number of swaps (e.g. an unscaled continuous covariate).
     let mut log_det = 0.0_f64;
-    for i in 0..n {
-        if lu[i][i] <= 0.0 {
-            return f64::NEG_INFINITY;
+    for pivot in (0..n).map(|i| lu[i][i]) {
+        if pivot < 0.0 {
+            sign = -sign;
         }
-        log_det += lu[i][i].ln();
+        log_det += pivot.abs().ln();
     }
 
+    // R: log(det(b)) is NaN for a negative determinant (not expected for X'WX)
+    if sign < 0.0 {
+        return f64::NAN;
+    }
     log_det
 }
 
