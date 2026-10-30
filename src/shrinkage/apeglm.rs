@@ -153,7 +153,7 @@ pub fn shrink_lfc_apeglm(
         .collect();
     let prior_var = prior_var(&nonzero_mle_lfc, &nonzero_mle_se);
     let prior_scale = (params.multiplier * prior_var.sqrt()).min(params.max_prior_scale);
-    eprintln!(
+    log::info!(
         "[apeglm] prior_var={:.6}, prior_scale={:.7}, n_nonzero={}",
         prior_var,
         prior_scale,
