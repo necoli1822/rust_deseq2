@@ -230,7 +230,7 @@ pub fn shrink_lfc_apeglm(
             let mut init2: Vec<f64> = (0..n_coefs)
                 .map(|k| if k % 2 == 0 { -0.1 } else { 0.1 })
                 .collect();
-            let result2 = lbfgs_minimize(
+            let _result2 = lbfgs_minimize(
                 |x, g| nb_neg_log_posterior_and_grad(x, g, &gd, cnst),
                 &mut init2,
                 params.lbfgs_max_iter,
@@ -238,55 +238,44 @@ pub fn shrink_lfc_apeglm(
                 params.lbfgs_m,
             );
 
-            // Check convergence: max |beta1 - beta2| <= threshold
+            // R (nbinomCppRoutine): the MAP is run 1; the row counts as not converged
+            // when the C++ optimiser failed (status -1) or the two runs differ by more
+            // than 0.01 in any coefficient.
             let max_delta = init1
                 .iter()
                 .zip(init2.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max);
-            let prefit_converged =
-                result1.converged && max_delta <= params.convergence_threshold;
+            let prefit_converged = !result1.failed && max_delta <= params.convergence_threshold;
 
-            // Use result from run 1 as MAP
-            let map = if prefit_converged {
-                init1
+            // R (optimNbinomHess): for a converged row, use optimHess at the C++ MAP;
+            // if the row did not converge or that gives a non-positive variance,
+            // re-optimise with optim(method = "BFGS") from the C++ MAP (optimNbinom),
+            // with the Hessian from optim(hessian = TRUE) at its solution.
+            let converged_fit = if prefit_converged {
+                let hessian = optim_hessian(&init1, &gd, params.hessian_step);
+                let (sd, valid) = laplace_sd_from_hessian(&hessian, n_coefs);
+                valid.then_some((init1.clone(), sd))
             } else {
-                // Fallback: use the run with lower objective value
-                if result1.value <= result2.value {
-                    init1
-                } else {
-                    init2
-                }
+                None
             };
-
-            // Step 4: Compute Hessian at MAP for Laplace approximation
-            // R: optimHess(par, fn=nbinomFn, gr=nbinomGr) with ndeps=1e-3 (central differences of gradient)
-            let hessian = finite_difference_hessian(&map, &gd, params.hessian_step);
-
-            // Posterior covariance = inv(Hessian of neg_log_post) at MAP
-            // R: cov.mat = -solve(o$hessian) where o$hessian = Hessian(log_post)
-            //    = inv(-Hessian(log_post)) = inv(Hessian(neg_log_post))
-            let (sd, cov_valid) = laplace_sd_from_hessian(&hessian, n_coefs);
-
-            let final_sd = if cov_valid {
-                sd
-            } else if prefit_converged {
-                // Fallback: rerun optimization with tighter tolerance
-                // (matching R's fallback to optimNbinom)
-                let mut beta_rerun = map.clone();
-                let _rerun_result = lbfgs_minimize(
-                    |x, g| nb_neg_log_posterior_and_grad(x, g, &gd, cnst),
-                    &mut beta_rerun,
-                    params.lbfgs_max_iter * 2,
-                    params.lbfgs_epsilon * 0.1,
-                    params.lbfgs_m,
+            let (map, final_sd) = converged_fit.unwrap_or_else(|| {
+                let mut beta = init1.clone();
+                // optimNbinom: cnst <- -nbinomFn(init, ..., cnst=0) - 1
+                let shift = -nb_neg_log_posterior(&beta, &gd) - 1.0;
+                r_vmmin(
+                    |b| nb_neg_log_posterior(b, &gd) + shift,
+                    |b, g| nb_gradient(b, g, &gd),
+                    &mut beta,
+                    100,
+                    f64::NEG_INFINITY,
+                    f64::EPSILON.sqrt(),
                 );
-                let h2 = finite_difference_hessian(&beta_rerun, &gd, params.hessian_step);
-                let (sd2, _) = laplace_sd_from_hessian(&h2, n_coefs);
-                sd2
-            } else {
-                sd
-            };
+                let hessian = optim_hessian(&beta, &gd, params.hessian_step);
+                // R: if any(diag(cov.mat) <= 0), sd is NA but the map is kept
+                let (sd, _) = laplace_sd_from_hessian(&hessian, n_coefs);
+                (beta, sd)
+            });
 
             // Step 5: Compute FSR (false sign rate)
             // R: fsr = pnorm(-|map[coef]|, 0, sd[coef])
@@ -390,33 +379,91 @@ fn prior_var(mle_lfc: &[f64], mle_se: &[f64]) -> f64 {
         return min_var;
     }
 
-    // Bisection to find root of objective(A) = 0 in [min_var, max_var]
-    // R uses uniroot which is Brent's method; bisection is sufficient for our needs
-    let mut lo = min_var;
-    let mut hi = max_var;
-    let f_lo = objective(lo);
-    let f_hi = objective(hi);
-
-    // If no sign change, return boundary
+    // R: uniroot(objective, interval = c(min.var, max.var))$root, with uniroot's
+    // default tol = .Machine$double.eps^0.25. The root is only that precise, and
+    // the prior scale it sets changes every MAP estimate, so reproduce R's solver
+    // (and its stopping point) rather than solving more accurately.
+    let f_lo = objective(min_var);
+    let f_hi = objective(max_var);
     if f_lo * f_hi > 0.0 {
-        return if f_lo.abs() < f_hi.abs() { lo } else { hi };
+        // uniroot stops with "f() values at end points not of opposite sign"
+        return if f_lo.abs() < f_hi.abs() { min_var } else { max_var };
+    }
+    r_zeroin(objective, min_var, max_var, f_lo, f_hi, f64::EPSILON.powf(0.25), 1000)
+}
+
+/// Brent's root finder exactly as R's R_zeroin2 (src/library/stats/src/zeroin.c),
+/// which uniroot() calls. `fa`, `fb` are f(ax), f(bx), which must differ in sign.
+fn r_zeroin<F: Fn(f64) -> f64>(f: F, ax: f64, bx: f64, fa: f64, fb: f64, tol: f64, maxit: usize) -> f64 {
+    let (mut a, mut b) = (ax, bx);
+    let (mut fa, mut fb) = (fa, fb);
+    let (mut c, mut fc) = (a, fa);
+
+    if fa == 0.0 {
+        return a;
+    }
+    if fb == 0.0 {
+        return b;
     }
 
-    for _ in 0..100 {
-        let mid = (lo + hi) / 2.0;
-        let f_mid = objective(mid);
-        if f_mid.abs() < 1e-12 || (hi - lo) < 1e-12 {
-            return mid;
+    for _ in 0..=maxit {
+        let prev_step = b - a;
+        if fc.abs() < fb.abs() {
+            // swap so that b is the best approximation
+            a = b;
+            b = c;
+            c = a;
+            fa = fb;
+            fb = fc;
+            fc = fa;
         }
-        if f_mid * f_lo < 0.0 {
-            hi = mid;
-        } else {
-            lo = mid;
-            // f_lo = f_mid; // not needed for bisection correctness
+        let tol_act = 2.0 * f64::EPSILON * b.abs() + tol / 2.0;
+        let mut new_step = (c - b) / 2.0;
+
+        if new_step.abs() <= tol_act || fb == 0.0 {
+            return b;
+        }
+
+        // Try interpolation if the previous step was large enough and in the right direction
+        if prev_step.abs() >= tol_act && fa.abs() > fb.abs() {
+            let cb = c - b;
+            let (mut p, mut q);
+            if a == c {
+                // linear interpolation
+                let t1 = fb / fa;
+                p = cb * t1;
+                q = 1.0 - t1;
+            } else {
+                // inverse quadratic interpolation
+                let qq = fa / fc;
+                let t1 = fb / fc;
+                let t2 = fb / fa;
+                p = t2 * (cb * qq * (qq - t1) - (b - a) * (t1 - 1.0));
+                q = (qq - 1.0) * (t1 - 1.0) * (t2 - 1.0);
+            }
+            if p > 0.0 {
+                q = -q;
+            } else {
+                p = -p;
+            }
+            if p < (0.75 * cb * q - (tol_act * q).abs() / 2.0) && p < (prev_step * q / 2.0).abs() {
+                new_step = p / q;
+            }
+        }
+
+        if new_step.abs() < tol_act {
+            new_step = if new_step > 0.0 { tol_act } else { -tol_act };
+        }
+        a = b;
+        fa = fb;
+        b += new_step;
+        fb = f(b);
+        if (fb > 0.0 && fc > 0.0) || (fb < 0.0 && fc < 0.0) {
+            c = a;
+            fc = fa;
         }
     }
-
-    (lo + hi) / 2.0
+    b
 }
 
 // ============================================================================
@@ -451,11 +498,12 @@ fn nb_neg_log_posterior(beta: &[f64], gd: &GeneData) -> f64 {
         let xbeta_off = xbeta + gd.offsets[j];
         let exp_xbeta_off = xbeta_off.exp();
 
-        // d = y * (xbeta + offset) - (y + size) * log(exp(xbeta + offset) + size)
-        // R: y * log(mu) where mu = exp(xbeta + offset), so log(mu) = xbeta_off
+        // d = y * xbeta - (y + size) * log(exp(xbeta + offset) + size)
+        // (y * xbeta, not y * (xbeta + offset), exactly as apeglm's nbinomFn and C++
+        // f_grad: the constant changes cnst and the LBFGS relative stopping test)
         let a = gd.y[j] + gd.size;
         let b = exp_xbeta_off + gd.size;
-        let d = gd.y[j] * xbeta_off - a * b.ln();
+        let d = gd.y[j] * xbeta - a * b.ln();
 
         // weights = 1.0 (all weights are 1 in default DESeq2 usage)
         neg_log_lik -= d;
@@ -547,7 +595,7 @@ fn nb_neg_log_posterior_and_grad(
 
         // Negative log-likelihood contribution
         // R: y * log(mu) where mu = exp(xbeta + offset), so log(mu) = xbeta_off
-        let d = gd.y[j] * xbeta_off - a * b.ln();
+        let d = gd.y[j] * xbeta - a * b.ln();
         neg_log_lik -= d; // weights = 1.0
 
         // Gradient of negative log-likelihood
@@ -585,14 +633,19 @@ fn nb_neg_log_posterior_and_grad(
 }
 
 // ============================================================================
-// L-BFGS Optimizer (exact match of LBFGSpp via RcppNumerical 0.6.0)
+// L-BFGS Optimizer (exact match of LBFGSpp via RcppNumerical 0.7-0)
 // ============================================================================
 
 /// Result of L-BFGS optimization
 struct LbfgsResult {
-    value: f64,
+    _value: f64,
     _iterations: usize,
+    /// A convergence test was met (diagnostic; R only distinguishes `failed`)
+    #[allow(dead_code)]
     converged: bool,
+    /// The line search failed, where LBFGSpp throws and RcppNumerical's optim_lbfgs
+    /// reports status -1. Reaching the iteration limit is still status 0.
+    failed: bool,
 }
 
 /// L-BFGS minimization — exact match of LBFGSpp::LBFGSSolver::minimize()
@@ -605,6 +658,10 @@ struct LbfgsResult {
 ///   max_iterations = 300, max_linesearch = 100
 ///   linesearch = BACKTRACKING_STRONG_WOLFE
 ///   m = 6, ftol = 1e-4, wolfe = 0.9
+///
+/// `linesearch` only names the condition: the solver's line search algorithm is
+/// the LBFGSSolver template default, which in the LBFGSpp bundled with
+/// RcppNumerical 0.7-0 is LineSearchNocedalWright, not LineSearchBacktracking.
 fn lbfgs_minimize<F>(
     f_grad: F,
     x: &mut [f64],
@@ -622,8 +679,6 @@ where
     // Line search parameters (LBFGSpp defaults)
     let ftol = 1e-4;
     let wolfe_param = 0.9;
-    let ls_dec = 0.5;
-    let ls_inc = 2.1;
     let max_linesearch = 100;
     let sy_eps = f64::EPSILON; // ~2.2e-16, LBFGSpp: std::numeric_limits<double>::epsilon()
 
@@ -647,9 +702,10 @@ where
         let xnorm = x.iter().map(|xi| xi * xi).sum::<f64>().sqrt();
         if gnorm <= epsilon || gnorm <= epsilon * xnorm {
             return LbfgsResult {
-                value: fx,
+                _value: fx,
                 _iterations: 1,
                 converged: true,
+                failed: false,
             };
         }
     }
@@ -668,53 +724,19 @@ where
         // Save current x and gradient
         xp.copy_from_slice(x);
         gradp.copy_from_slice(&grad);
-        let dginit: f64 = grad.iter().zip(drt.iter()).map(|(gi, di)| gi * di).sum();
-        let test_decr = ftol * dginit;
-
-        // ---- Line search (BACKTRACKING_STRONG_WOLFE) ----
-        // LBFGSpp: LineSearchBacktracking.h
-        // Note: x, fx, grad are updated in-place at every trial
-        let fx_init = fx;
-        let mut ls_converged = false;
-
-        for _ls_iter in 0..max_linesearch {
-            // x = xp + step * drt
-            for i in 0..n {
-                x[i] = xp[i] + step * drt[i];
-            }
-            fx = f_grad(x, &mut grad);
-
-            let width;
-            if fx > fx_init + step * test_decr || fx.is_nan() {
-                // Armijo violated or NaN → decrease
-                width = ls_dec;
-            } else {
-                // Armijo satisfied → check Wolfe conditions
-                let dg: f64 = grad.iter().zip(drt.iter()).map(|(gi, di)| gi * di).sum();
-
-                if dg < wolfe_param * dginit {
-                    // Curvature too negative → step too small → increase
-                    width = ls_inc;
-                } else if dg > -wolfe_param * dginit {
-                    // Curvature too positive → step too large → decrease
-                    width = ls_dec;
-                } else {
-                    // Strong Wolfe satisfied → accept
-                    ls_converged = true;
-                    break;
-                }
-            }
-
-            step *= width;
-        }
-
-        if !ls_converged {
-            // LBFGSpp throws exception; RcppNumerical catches it and returns x as-is
-            // x is at the last trial point (may not satisfy conditions)
+        // ---- Line search (LBFGSpp LineSearchNocedalWright) ----
+        // On failure LBFGSpp throws; RcppNumerical catches it, keeps x at the last
+        // trial point and reports status -1.
+        if line_search_nocedal_wright(
+            &f_grad, &xp, &drt, &mut step, &mut fx, &mut grad, x, ftol, wolfe_param, max_linesearch,
+        )
+        .is_err()
+        {
             return LbfgsResult {
-                value: fx,
+                _value: fx,
                 _iterations: k,
                 converged: false,
+                failed: true,
             };
         }
 
@@ -727,9 +749,10 @@ where
             let xnorm = x.iter().map(|xi| xi * xi).sum::<f64>().sqrt();
             if gnorm <= epsilon || gnorm <= epsilon * xnorm {
                 return LbfgsResult {
-                    value: fx,
+                    _value: fx,
                     _iterations: k,
                     converged: true,
+                    failed: false,
                 };
             }
         }
@@ -741,9 +764,10 @@ where
             let denom = fx.abs().max(fxd.abs()).max(1.0);
             if (fxd - fx).abs() <= delta * denom {
                 return LbfgsResult {
-                    value: fx,
+                    _value: fx,
                     _iterations: k,
                     converged: true,
+                    failed: false,
                 };
             }
         }
@@ -752,9 +776,10 @@ where
         // ---- Maximum iterations check ----
         if k >= max_iter {
             return LbfgsResult {
-                value: fx,
+                _value: fx,
                 _iterations: k,
                 converged: false,
+                failed: false,
             };
         }
 
@@ -783,6 +808,147 @@ where
         // Reset step = 1.0 for next iteration (LBFGSpp does this)
         step = 1.0;
         k += 1;
+    }
+}
+
+/// Strong-Wolfe line search of Nocedal & Wright (2006), Algorithms 3.5 and 3.6:
+/// a bracketing phase that doubles the step, then a zoom phase with a quadratic
+/// interpolation (bisection when the interpolant is unusable).
+/// Port of LBFGSpp's LineSearchNocedalWright as bundled with RcppNumerical 0.7-0.
+/// `x`, `fx` and `grad` end at the accepted point; `Err` is where LBFGSpp throws.
+#[allow(clippy::too_many_arguments)]
+fn line_search_nocedal_wright<F>(
+    f_grad: &F,
+    xp: &[f64],
+    drt: &[f64],
+    step: &mut f64,
+    fx: &mut f64,
+    grad: &mut [f64],
+    x: &mut [f64],
+    ftol: f64,
+    wolfe: f64,
+    max_linesearch: usize,
+) -> std::result::Result<(), ()>
+where
+    F: Fn(&[f64], &mut [f64]) -> f64,
+{
+    if *step <= 0.0 {
+        return Err(());
+    }
+    let expansion = 2.0;
+    let fx_init = *fx;
+    let dg_init = dot(grad, drt);
+    if dg_init > 0.0 {
+        return Err(());
+    }
+    let test_decr = ftol * dg_init;
+    let test_curv = -wolfe * dg_init;
+
+    let evaluate = |step: f64, x: &mut [f64], grad: &mut [f64]| -> (f64, f64) {
+        for i in 0..x.len() {
+            x[i] = xp[i] + step * drt[i];
+        }
+        let f = f_grad(x, grad);
+        (f, dot(grad, drt))
+    };
+
+    let (mut step_hi, mut fx_hi);
+    let (mut step_lo, mut fx_lo, mut dg_lo) = (0.0, fx_init, dg_init);
+    let mut x_lo = xp.to_vec();
+    let mut grad_lo = grad.to_vec();
+
+    // Bracketing phase
+    let mut iter = 0;
+    loop {
+        let (f, dg) = evaluate(*step, x, grad);
+        *fx = f;
+        if f - fx_init > *step * test_decr || (0.0 < step_lo && f >= fx_lo) {
+            step_hi = *step;
+            fx_hi = f;
+            break;
+        }
+        if dg.abs() <= test_curv {
+            return Ok(());
+        }
+        step_hi = step_lo;
+        fx_hi = fx_lo;
+        step_lo = *step;
+        fx_lo = f;
+        dg_lo = dg;
+        x.swap_with_slice(&mut x_lo);
+        grad.swap_with_slice(&mut grad_lo);
+        if dg >= 0.0 {
+            break;
+        }
+        iter += 1;
+        if iter >= max_linesearch {
+            // Every step decreased f: return the latest (= the _lo state)
+            x.swap_with_slice(&mut x_lo);
+            grad.swap_with_slice(&mut grad_lo);
+            return Ok(());
+        }
+        *step *= expansion;
+    }
+
+    // Zoom phase
+    loop {
+        *step = quad_interp(step_lo, step_hi, fx_lo, fx_hi, dg_lo);
+        let (f, dg) = evaluate(*step, x, grad);
+        *fx = f;
+        if f - fx_init > *step * test_decr || f >= fx_lo {
+            if *step == step_hi {
+                return Err(());
+            }
+            step_hi = *step;
+            fx_hi = f;
+        } else {
+            if dg.abs() <= test_curv {
+                return Ok(());
+            }
+            if dg * (step_hi - step_lo) >= 0.0 {
+                step_hi = step_lo;
+                fx_hi = fx_lo;
+            }
+            if *step == step_lo {
+                return Err(());
+            }
+            step_lo = *step;
+            fx_lo = f;
+            dg_lo = dg;
+            x.swap_with_slice(&mut x_lo);
+            grad.swap_with_slice(&mut grad_lo);
+        }
+        iter += 1;
+        if iter >= max_linesearch {
+            if step_lo <= 0.0 {
+                return Err(());
+            }
+            *step = step_lo;
+            *fx = fx_lo;
+            x.swap_with_slice(&mut x_lo);
+            grad.swap_with_slice(&mut grad_lo);
+            return Ok(());
+        }
+    }
+}
+
+/// Minimiser of the quadratic through (step_lo, fx_lo) with slope dg_lo and
+/// (step_hi, fx_hi); bisection when that is non-finite, outside the interval or
+/// within 1% of its width from an end. LBFGSpp LineSearchNocedalWright::quad_interp.
+fn quad_interp(step_lo: f64, step_hi: f64, fx_lo: f64, fx_hi: f64, dg_lo: f64) -> f64 {
+    let fdiff = fx_hi - fx_lo;
+    let sdiff = step_hi - step_lo;
+    let smid = (step_hi + step_lo) / 2.0;
+    let candid = (fdiff * step_lo - smid * sdiff * dg_lo) / (fdiff - sdiff * dg_lo);
+    let end_dist = (candid - step_lo).abs().min((candid - step_hi).abs());
+    let bisect = !candid.is_finite()
+        || candid <= step_lo.min(step_hi)
+        || candid >= step_lo.max(step_hi)
+        || end_dist < 0.01 * sdiff.abs();
+    if bisect {
+        smid
+    } else {
+        candid
     }
 }
 
@@ -845,41 +1011,180 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 // Hessian Computation (matches R's optimHess with gr=nbinomGr)
 // ============================================================================
 
-/// Compute Hessian of negative log-posterior using central differences of the gradient
-///
-/// Matches R's `optimHess(par, fn=nbinomFn, gr=nbinomGr, ...)`:
-///   H[i,j] = (gr_j(x + h*e_i) - gr_j(x - h*e_i)) / (2 * h)
-///
-/// This is more accurate than function-based finite differences because:
-/// - Gradient-based: all elements have O(h^2) error
-/// - Function-based: off-diagonal elements have O(h) error
-fn finite_difference_hessian(x: &[f64], gd: &GeneData, step: f64) -> Vec<Vec<f64>> {
+/// Hessian of the negative log-posterior from central differences of the gradient,
+/// exactly as R's optimHess (C optimhess): par + eps, then - 2 eps, then + eps back,
+/// with eps = ndeps = 1e-3, followed by symmetrisation (H + H')/2.
+fn optim_hessian(x: &[f64], gd: &GeneData, step: f64) -> Vec<Vec<f64>> {
     let n = x.len();
     let mut hess = vec![vec![0.0; n]; n];
-    let mut x_pert = x.to_vec();
-    let mut grad_plus = vec![0.0; n];
-    let mut grad_minus = vec![0.0; n];
+    let mut dpar = x.to_vec();
+    let mut df1 = vec![0.0; n];
+    let mut df2 = vec![0.0; n];
 
     for i in 0..n {
-        let saved = x_pert[i];
-
-        // Evaluate gradient at x + h*e_i
-        x_pert[i] = saved + step;
-        nb_gradient(&x_pert, &mut grad_plus, gd);
-
-        // Evaluate gradient at x - h*e_i
-        x_pert[i] = saved - step;
-        nb_gradient(&x_pert, &mut grad_minus, gd);
-
-        // H[i, j] = (grad_plus[j] - grad_minus[j]) / (2 * step)
+        dpar[i] += step;
+        nb_gradient(&dpar, &mut df1, gd);
+        dpar[i] -= 2.0 * step;
+        nb_gradient(&dpar, &mut df2, gd);
         for j in 0..n {
-            hess[i][j] = (grad_plus[j] - grad_minus[j]) / (2.0 * step);
+            hess[i][j] = (df1[j] - df2[j]) / (2.0 * step);
+        }
+        dpar[i] += step;
+    }
+    for i in 0..n {
+        for j in 0..i {
+            let tmp = 0.5 * (hess[i][j] + hess[j][i]);
+            hess[i][j] = tmp;
+            hess[j][i] = tmp;
+        }
+    }
+    hess
+}
+
+/// Variable-metric (BFGS) minimiser exactly as R's vmmin (src/appl/optim.c),
+/// which optim(method = "BFGS") uses; `fn`/`gr` evaluations follow R's order.
+/// Returns true when it stopped before `maxit` (R: fail = 0).
+fn r_vmmin<F, G>(f: F, gr: G, b: &mut [f64], maxit: usize, abstol: f64, reltol: f64) -> bool
+where
+    F: Fn(&[f64]) -> f64,
+    G: Fn(&[f64], &mut [f64]),
+{
+    const STEPREDN: f64 = 0.2;
+    const ACCTOL: f64 = 0.0001;
+    const RELTEST: f64 = 10.0;
+
+    let n = b.len();
+    let mut g = vec![0.0; n];
+    let mut t = vec![0.0; n];
+    let mut xv = vec![0.0; n];
+    let mut c = vec![0.0; n];
+    let mut bm = vec![vec![0.0; n]; n];
+
+    let mut fval = f(b);
+    if !fval.is_finite() {
+        return false;
+    }
+    let mut fmin = fval;
+    gr(b, &mut g);
+    let mut gradcount = 1usize;
+    let mut iter = 1usize;
+    let mut ilast = gradcount;
+    let mut count;
+
+    loop {
+        if ilast == gradcount {
+            for i in 0..n {
+                for j in 0..i {
+                    bm[i][j] = 0.0;
+                }
+                bm[i][i] = 1.0;
+            }
+        }
+        for i in 0..n {
+            xv[i] = b[i];
+            c[i] = g[i];
+        }
+        let mut gradproj = 0.0;
+        for i in 0..n {
+            let mut s = 0.0;
+            for j in 0..=i {
+                s -= bm[i][j] * g[j];
+            }
+            for j in (i + 1)..n {
+                s -= bm[j][i] * g[j];
+            }
+            t[i] = s;
+            gradproj += s * g[i];
         }
 
-        x_pert[i] = saved;
+        if gradproj < 0.0 {
+            // search direction is downhill
+            let mut steplength = 1.0;
+            let mut accpoint = false;
+            loop {
+                count = 0;
+                for i in 0..n {
+                    b[i] = xv[i] + steplength * t[i];
+                    if RELTEST + xv[i] == RELTEST + b[i] {
+                        count += 1;
+                    }
+                }
+                if count < n {
+                    fval = f(b);
+                    accpoint = fval.is_finite() && fval <= fmin + gradproj * steplength * ACCTOL;
+                    if !accpoint {
+                        steplength *= STEPREDN;
+                    }
+                }
+                if count == n || accpoint {
+                    break;
+                }
+            }
+            let enough = fval > abstol && (fval - fmin).abs() > reltol * (fmin.abs() + reltol);
+            // stop if the value is small or the relative change is low
+            if !enough {
+                count = n;
+                fmin = fval;
+            }
+            if count < n {
+                // making progress
+                fmin = fval;
+                gr(b, &mut g);
+                gradcount += 1;
+                iter += 1;
+                let mut d1 = 0.0;
+                for i in 0..n {
+                    t[i] *= steplength;
+                    c[i] = g[i] - c[i];
+                    d1 += t[i] * c[i];
+                }
+                if d1 > 0.0 {
+                    let mut d2 = 0.0;
+                    for i in 0..n {
+                        let mut s = 0.0;
+                        for j in 0..=i {
+                            s += bm[i][j] * c[j];
+                        }
+                        for j in (i + 1)..n {
+                            s += bm[j][i] * c[j];
+                        }
+                        xv[i] = s;
+                        d2 += s * c[i];
+                    }
+                    d2 = 1.0 + d2 / d1;
+                    for i in 0..n {
+                        for j in 0..=i {
+                            bm[i][j] += (d2 * t[i] * t[j] - xv[i] * t[j] - t[i] * xv[j]) / d1;
+                        }
+                    }
+                } else {
+                    ilast = gradcount;
+                }
+            } else if ilast < gradcount {
+                // no progress
+                count = 0;
+                ilast = gradcount;
+            }
+        } else {
+            // uphill search: reset unless it has just been reset
+            count = 0;
+            if ilast == gradcount {
+                count = n;
+            } else {
+                ilast = gradcount;
+            }
+        }
+        if iter >= maxit {
+            break;
+        }
+        if gradcount - ilast > 2 * n {
+            ilast = gradcount; // periodic restart
+        }
+        if count == n && ilast == gradcount {
+            break;
+        }
     }
-
-    hess
+    iter < maxit
 }
 
 /// Compute Laplace posterior SDs from Hessian of negative log-posterior
