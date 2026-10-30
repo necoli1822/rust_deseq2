@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand};
 #[command(author = "SunJu Kim")]
 #[command(version)]
 #[command(about = "DESeq2 differential expression analysis in Rust")]
-#[command(disable_help_flag = true)]
+// Top-level -h/--help/--version are printed by main.rs before parsing. The help
+// flag must stay enabled here: disable_help_flag propagates to every subcommand,
+// which made `rust_deseq2 run --help` an "unexpected argument" error.
 #[command(disable_version_flag = true)]
 pub struct Cli {
     #[command(subcommand)]
@@ -155,8 +157,10 @@ Examples:
         min_replicates: usize,
 
         /// Replace outliers via Cook's distance [default: true]
-        #[arg(long, default_value_t = true,
-            long_help = "Replace outlier counts detected by Cook's distance.\n\
+        // ArgAction::Set: a bool defaulting to true is otherwise a SetTrue flag that
+        // can never be turned off.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL",
+            long_help = "Replace outlier counts detected by Cook's distance (true/false).\n\
                 Enabled by default, matching R DESeq2 behavior.\n\
                 Only applies when a condition group has >= min-replicates replicates.")]
         replace_outliers: bool,
