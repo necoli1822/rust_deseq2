@@ -17,6 +17,49 @@ pub enum TrendFitMethod {
     Mean, // R: fitType="mean"
 }
 
+/// The fitted dispersion-mean trend, kept so trended dispersions can be evaluated
+/// at new means after the fit (e.g. when refitting genes without outliers).
+/// R equivalent: dispersionFunction(object)
+#[derive(Debug, Clone)]
+pub enum DispersionTrend {
+    /// asymptDisp + extraPois / mean
+    Parametric { asympt_disp: f64, extra_pois: f64 },
+    /// Local regression of log dispersion on log mean
+    Local(LocalTrend),
+    /// A single dispersion for every gene
+    Mean(f64),
+}
+
+impl DispersionTrend {
+    /// Trended dispersion at a given mean of normalized counts
+    pub fn eval(&self, mean: f64) -> f64 {
+        match self {
+            DispersionTrend::Parametric { asympt_disp, extra_pois } => {
+                if mean > 0.0 {
+                    asympt_disp + extra_pois / mean
+                } else {
+                    *asympt_disp
+                }
+            }
+            DispersionTrend::Local(trend) => trend.eval(mean),
+            DispersionTrend::Mean(disp) => *disp,
+        }
+    }
+}
+
+/// A fitted local dispersion trend (see [`DispersionTrend::Local`])
+#[derive(Debug, Clone)]
+pub struct LocalTrend(LocfitTree);
+
+impl LocalTrend {
+    fn eval(&self, mean: f64) -> f64 {
+        if mean <= 0.0 {
+            return 0.1;
+        }
+        self.0.predict(mean.ln()).exp().max(1e-8)
+    }
+}
+
 /// Fit a trend to the gene-wise dispersions as a function of mean expression
 /// R equivalent: estimateDispersionsFit() in core.R
 pub fn fit_dispersion_trend(dds: &mut DESeqDataSet, method: TrendFitMethod) -> Result<()> {
@@ -36,7 +79,7 @@ pub fn fit_dispersion_trend(dds: &mut DESeqDataSet, method: TrendFitMethod) -> R
         .map(|row| row.sum() / n_samples)
         .collect();
 
-    let trended = match method {
+    let (trended, trend) = match method {
         TrendFitMethod::Parametric => {
             // DESeq2 behavior: try parametric first, fall back to local if:
             // 1. Gamma GLM fails to converge
@@ -45,7 +88,8 @@ pub fn fit_dispersion_trend(dds: &mut DESeqDataSet, method: TrendFitMethod) -> R
                 Ok((parametric_fit, coefs)) => {
                     // Store dispersion function coefficients for VST
                     dds.set_dispersion_function(coefs.0, coefs.1);
-                    parametric_fit
+                    let trend = DispersionTrend::Parametric { asympt_disp: coefs.0, extra_pois: coefs.1 };
+                    (parametric_fit, trend)
                 }
                 Err(e) => {
                     log::info!("Parametric fit failed ({}), using local regression", e);
@@ -79,11 +123,12 @@ pub fn fit_dispersion_trend(dds: &mut DESeqDataSet, method: TrendFitMethod) -> R
                     trimmed.iter().sum::<f64>() / trimmed.len() as f64
                 }
             };
-            Array1::from_elem(gene_dispersions.len(), mean_disp)
+            (Array1::from_elem(gene_dispersions.len(), mean_disp), DispersionTrend::Mean(mean_disp))
         }
     };
 
     dds.set_trended_dispersions(trended)?;
+    dds.set_dispersion_trend(trend);
     Ok(())
 }
 
@@ -293,7 +338,7 @@ fn fit_gamma_glm_identity_with_start(data: &[(f64, f64)], start: (f64, f64)) -> 
 /// - Default parameters: deg=2 (local quadratic), nn=0.7, cut=0.8
 /// - Tree-based adaptive evaluation
 /// - Hermite cubic interpolation between evaluation points
-fn fit_local_trend(means: &[f64], dispersions: &[f64]) -> Result<Array1<f64>> {
+fn fit_local_trend(means: &[f64], dispersions: &[f64]) -> Result<(Array1<f64>, DispersionTrend)> {
     let n = means.len();
     let min_disp = 1e-8;
 
@@ -315,7 +360,7 @@ fn fit_local_trend(means: &[f64], dispersions: &[f64]) -> Result<Array1<f64>> {
     if valid_data.len() < 5 {
         let mean_disp = dispersions.iter().filter(|d| d.is_finite()).sum::<f64>()
             / dispersions.iter().filter(|d| d.is_finite()).count() as f64;
-        return Ok(Array1::from_elem(n, mean_disp));
+        return Ok((Array1::from_elem(n, mean_disp), DispersionTrend::Mean(mean_disp)));
     }
 
     // Sort by log_mean
@@ -329,21 +374,10 @@ fn fit_local_trend(means: &[f64], dispersions: &[f64]) -> Result<Array1<f64>> {
     let locfit = LocfitTree::build(&xd, &yd, &obs_weights, 0.7, 0.8);
 
     // Predict for all genes
-    let mut trended = Vec::with_capacity(n);
+    let trend = LocalTrend(locfit);
+    let trended: Vec<f64> = means.iter().map(|&mean| trend.eval(mean)).collect();
 
-    for i in 0..n {
-        let mean = means[i];
-        if mean <= 0.0 {
-            trended.push(0.1);
-            continue;
-        }
-
-        let x = mean.ln();
-        let log_disp_pred = locfit.predict(x);
-        trended.push(log_disp_pred.exp().max(1e-8));
-    }
-
-    Ok(Array1::from_vec(trended))
+    Ok((Array1::from_vec(trended), DispersionTrend::Local(trend)))
 }
 
 /// Evaluation point in the locfit tree
@@ -357,6 +391,7 @@ struct EvalPoint {
 }
 
 /// Locfit tree structure for 1D local regression with interpolation
+#[derive(Debug, Clone)]
 struct LocfitTree {
     eval_points: Vec<EvalPoint>,
     xd: Vec<f64>,
@@ -663,7 +698,7 @@ mod tests {
         let result = fit_local_trend(&means, &disps);
         assert!(result.is_ok(), "Local trend should succeed");
 
-        let trended = result.unwrap();
+        let (trended, _) = result.unwrap();
         assert_eq!(trended.len(), means.len());
         assert!(trended.iter().all(|&v| v > 0.0), "All trended values should be positive");
     }

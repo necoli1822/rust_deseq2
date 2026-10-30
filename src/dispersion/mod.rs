@@ -6,7 +6,7 @@ mod trend;
 
 pub use gene_wise::{estimate_gene_dispersions, debug_gene_dispersion, estimate_dispersion_gene};
 pub use map::{estimate_map_dispersions, fit_map_dispersion, estimate_prior_variance_with_var};
-pub use trend::{fit_dispersion_trend, TrendFitMethod};
+pub use trend::{fit_dispersion_trend, DispersionTrend, LocalTrend, TrendFitMethod};
 
 use crate::data::DESeqDataSet;
 use crate::error::{DeseqError, Result};
@@ -96,10 +96,11 @@ pub fn refit_without_outliers(
         reason: "Design matrix required for refit".to_string(),
     })?.clone();
 
-    // Get ORIGINAL dispersion function (trend coefficients) - DO NOT re-estimate
-    let disp_fn = dds.dispersion_function().ok_or_else(|| DeseqError::DispersionEstimationFailed {
+    // Get ORIGINAL dispersion function (whichever fitType produced it) - DO NOT re-estimate
+    // R: dispFn <- dispersionFunction(object); dispFit <- dispFn(baseMean)
+    let disp_fn = dds.dispersion_trend().cloned().ok_or_else(|| DeseqError::DispersionEstimationFailed {
         gene_id: "N/A".to_string(),
-        reason: "Dispersion function required for refit".to_string(),
+        reason: "Dispersion trend required for refit".to_string(),
     })?;
 
     // Get ORIGINAL prior variance - DO NOT re-estimate
@@ -153,8 +154,6 @@ pub fn refit_without_outliers(
     dds.set_mu(mu_matrix)?;
 
     // Step 2: Compute trended dispersions using ORIGINAL dispersion function
-    // disp(mean) = asymptDisp + extraPois / mean
-    let (asympt_disp, extra_pois) = disp_fn;
     let base_means: Vec<f64> = flagged_gene_indices.iter().map(|&gene_idx| {
         let norm_counts: Vec<f64> = (0..n_samples)
             .map(|j| if sf_slice[j] > 0.0 { counts[[gene_idx, j]] / sf_slice[j] } else { 0.0 })
@@ -164,8 +163,7 @@ pub fn refit_without_outliers(
 
     let mut trended = dds.trended_dispersions().unwrap().to_owned();
     for (idx, &gene_idx) in flagged_gene_indices.iter().enumerate() {
-        let mean = base_means[idx].max(1e-10);
-        trended[gene_idx] = asympt_disp + extra_pois / mean;
+        trended[gene_idx] = disp_fn.eval(base_means[idx]);
     }
     dds.set_trended_dispersions(trended)?;
 
@@ -190,14 +188,14 @@ pub fn refit_without_outliers(
         })
         .collect();
 
-    // Apply outlier detection for flagged genes using varLogDispEsts from full dataset
-    let n_coef = design.ncols();
-    let (_, var_log_disp_ests) = estimate_prior_variance_with_var(
-        gene_dispersions.as_slice().unwrap(),
-        trended_dispersions.as_slice().unwrap(),
-        n_samples,
-        n_coef,
-    );
+    // Apply outlier detection for flagged genes using varLogDispEsts from the ORIGINAL
+    // fit. R's estimateDispersionsMAP reads it from attr(dispersionFunction(object)),
+    // which the subset keeps; recomputing it from the partly refitted estimates
+    // shifts the threshold and flips genes near it.
+    let var_log_disp_ests = dds.var_log_disp_ests().ok_or_else(|| DeseqError::DispersionEstimationFailed {
+        gene_id: "N/A".to_string(),
+        reason: "varLogDispEsts required for refit. Run full estimate_dispersions first.".to_string(),
+    })?;
     let outlier_threshold = 2.0 * var_log_disp_ests.sqrt();
 
     let mut map_dispersions = dds.map_dispersions().unwrap().to_owned();

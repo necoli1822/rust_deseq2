@@ -52,6 +52,9 @@ pub struct DESeqDataSet {
     /// Dispersion function coefficients from parametric fit: (asymptDisp, extraPois)
     /// Formula: dispersion(mean) = asymptDisp + extraPois / mean
     dispersion_function: Option<(f64, f64)>,
+    /// Fitted dispersion-mean trend of any fitType
+    /// R equivalent: dispersionFunction(object)
+    dispersion_trend: Option<crate::dispersion::DispersionTrend>,
     /// Cached dispersion prior variance (R's dispPriorVar) for refit after outlier replacement
     dispersion_prior_var: Option<f64>,
     /// Which genes were flagged as dispersion outliers during MAP estimation
@@ -137,6 +140,7 @@ impl DESeqDataSet {
             map_dispersions: None,
             mu: None,
             dispersion_function: None,
+            dispersion_trend: None,
             dispersion_prior_var: None,
             dispersion_outliers: None,
             var_log_disp_ests: None,
@@ -438,6 +442,16 @@ impl DESeqDataSet {
     }
 
     /// Set dispersion function coefficients from parametric trend fit
+    /// Get the fitted dispersion-mean trend
+    pub fn dispersion_trend(&self) -> Option<&crate::dispersion::DispersionTrend> {
+        self.dispersion_trend.as_ref()
+    }
+
+    /// Set the fitted dispersion-mean trend
+    pub fn set_dispersion_trend(&mut self, trend: crate::dispersion::DispersionTrend) {
+        self.dispersion_trend = Some(trend);
+    }
+
     pub fn set_dispersion_function(&mut self, asympt_disp: f64, extra_pois: f64) {
         self.dispersion_function = Some((asympt_disp, extra_pois));
     }
