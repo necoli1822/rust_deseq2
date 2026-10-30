@@ -142,35 +142,44 @@ fn estimate_size_factors_poscounts(counts: ArrayView2<f64>) -> Result<Array1<f64
     // Calculate size factors
     let mut size_factors = Array1::zeros(n_samples);
 
+    // R: exp(median((log(cnts) - loggeomeans)[is.finite(loggeomeans) & cnts > 0]))
+    // The median is taken on the log scale, which differs from the linear-scale
+    // median when the number of ratios is even.
     for j in 0..n_samples {
-        let mut ratios: Vec<f64> = valid_genes
+        let mut log_ratios: Vec<f64> = valid_genes
             .iter()
             .zip(geo_means.iter())
             .filter_map(|(&i, &geo_mean)| {
                 let count = counts[[i, j]];
                 if count > 0.0 && geo_mean > 0.0 {
-                    Some(count / geo_mean)
+                    Some(count.ln() - geo_mean.ln())
                 } else {
                     None
                 }
             })
             .collect();
 
-        if ratios.is_empty() {
-            // Use 1.0 as default for samples with no valid ratios
-            size_factors[j] = 1.0;
-            continue;
+        if log_ratios.is_empty() {
+            return Err(DeseqError::SizeFactorFailed {
+                reason: format!("Sample {} has no positive counts in genes with a positive geometric mean", j),
+            });
         }
 
-        ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = if ratios.len() % 2 == 0 {
-            (ratios[ratios.len() / 2 - 1] + ratios[ratios.len() / 2]) / 2.0
+        log_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let m = log_ratios.len();
+        let median = if m % 2 == 0 {
+            (log_ratios[m / 2 - 1] + log_ratios[m / 2]) / 2.0
         } else {
-            ratios[ratios.len() / 2]
+            log_ratios[m / 2]
         };
 
-        size_factors[j] = median;
+        size_factors[j] = median.exp();
     }
+
+    // R passes the poscounts geometric means in as `geoMeans`, and incoming geoMeans
+    // trigger: sf <- sf / exp(mean(log(sf))), i.e. size factors with geometric mean 1.
+    let log_geo_mean_sf = size_factors.iter().map(|s: &f64| s.ln()).sum::<f64>() / n_samples as f64;
+    size_factors.mapv_inplace(|s| s / log_geo_mean_sf.exp());
 
     Ok(size_factors)
 }
