@@ -546,132 +546,22 @@ fn linear_model_mu_for_gene_dispersion(counts: &[f64], size_factors: &[f64], des
     }).collect()
 }
 
-/// Compute NB log-density: log P(Y=y | size=1/alpha, mu)
-/// This matches R's dnbinom_mu(y, size=1/alpha, mu, log=TRUE)
-fn nb_log_density(y: f64, alpha: f64, mu: f64) -> f64 {
-    let size = 1.0 / alpha;
-    lgamma(y + size) - lgamma(y + 1.0) - lgamma(size)
-        + size * (size / (mu + size)).ln()
-        + y * (mu / (mu + size)).ln()
-}
-
-/// Fit NB GLM using IRLS to get mu values for dispersion optimization
-/// Uses log link: log(mu) = X * beta, ensuring mu > 0
-/// This matches DESeq2's C++ fitBeta implementation (non-QR path):
-/// - Deviance-based convergence: |dev - dev_old| / (|dev| + 0.1) < 1e-6
-/// - Ridge penalty: lambda=1e-6 on diagonal of X'WX
-/// - Max iterations: 100
-/// - Beta cap: |beta[j]| > 30 triggers early exit
+/// Fitted means for gene-wise dispersion estimation when the design is not a
+/// simple group model.
+/// R (estimateDispersionsGeneEst): fit <- fitNbinomGLMs(object, alpha_hat, modelMatrix)
+/// with its defaults (betaTol 1e-8, maxit 100, optim fallback), then
+/// fitMu[fitMu < minmu] <- minmu. Reuse the GLM fit rather than a separate IRLS, so
+/// the convergence rule, ridge and fallback are the same ones R uses.
 fn fit_nb_glm_mu(counts: &[f64], size_factors: &[f64], design: &Array2<f64>, alpha: f64) -> Vec<f64> {
-    let n = counts.len();
-    let p = design.ncols();
-    const MAXIT: usize = 100;
-    const TOL: f64 = 1e-6;
     const MINMU: f64 = 0.5;
-    const LAMBDA: f64 = 1e-6; // Ridge penalty
-
-    // Initialize eta (log(mu)) from normalized counts
-    let normalized: Vec<f64> = counts.iter().zip(size_factors)
-        .map(|(&c, &s)| (c / s).max(MINMU / s))
-        .collect();
-
-    // Initial beta from log of group means
-    let mean_norm = normalized.iter().sum::<f64>() / n as f64;
-    let mut beta = vec![0.0; p];
-    beta[0] = mean_norm.max(0.1).ln();
-
-    // nfrow = size_factors for each sample (normalization factors)
-    let mut mu: Vec<f64> = (0..n).map(|i| {
-        let mut eta = 0.0;
-        for j in 0..p {
-            eta += design[[i, j]] * beta[j];
-        }
-        (eta.exp() * size_factors[i]).max(MINMU)
-    }).collect();
-
-    // Initial deviance (dev_old)
-    let mut dev_old = 0.0_f64;
-    for i in 0..n {
-        dev_old += -2.0 * nb_log_density(counts[i], alpha, mu[i]);
-    }
-
-    // IRLS iterations matching DESeq2's C++ fitBeta
-    for t in 0..MAXIT {
-        // Working weights and response
-        // w_vec = mu_hat / (1 + alpha * mu_hat)
-        // z = log(mu_hat / nfrow) + (y - mu_hat) / mu_hat
-        let mut xtwx = vec![vec![0.0; p]; p];
-        let mut xtwz = vec![0.0; p];
-
-        for i in 0..n {
-            let mu_i = mu[i];
-            let y = counts[i];
-
-            // Working weight and response for NB GLM
-            let w = mu_i / (1.0 + alpha * mu_i);
-            let z = (mu_i / size_factors[i]).ln() + (y - mu_i) / mu_i;
-
-            for j in 0..p {
-                xtwz[j] += w * design[[i, j]] * z;
-                for k in 0..p {
-                    xtwx[j][k] += w * design[[i, j]] * design[[i, k]];
-                }
-            }
-        }
-
-        // Add ridge penalty: lambda on diagonal of X'WX
-        for j in 0..p {
-            xtwx[j][j] += LAMBDA;
-        }
-
-        // Solve (X'WX + lambda*I) * beta = X'Wz
-        let new_beta = if p == 2 {
-            let det = xtwx[0][0] * xtwx[1][1] - xtwx[0][1] * xtwx[1][0];
-            if det.abs() > 1e-10 {
-                vec![
-                    (xtwx[1][1] * xtwz[0] - xtwx[0][1] * xtwz[1]) / det,
-                    (xtwx[0][0] * xtwz[1] - xtwx[1][0] * xtwz[0]) / det,
-                ]
-            } else {
-                beta.clone()
-            }
-        } else {
-            solve_linear_system(&xtwx, &xtwz).unwrap_or_else(|| beta.clone())
-        };
-
-        // Beta cap: if any |beta[j]| > 30, break (set iter = maxit equivalent)
-        if new_beta.iter().any(|&b| b.abs() > 30.0) {
-            break;
-        }
-
-        beta = new_beta;
-
-        // Update mu = nfrow * exp(X * beta), clamped to MINMU
-        for i in 0..n {
-            let mut eta = 0.0;
-            for j in 0..p {
-                eta += design[[i, j]] * beta[j];
-            }
-            mu[i] = (eta.exp() * size_factors[i]).max(MINMU);
-        }
-
-        // Deviance-based convergence (matching R's DESeq2 C++)
-        let mut dev = 0.0_f64;
-        for i in 0..n {
-            dev += -2.0 * nb_log_density(counts[i], alpha, mu[i]);
-        }
-
-        let conv_test = (dev - dev_old).abs() / (dev.abs() + 0.1);
-        if conv_test.is_nan() {
-            break;
-        }
-        if t > 0 && conv_test < TOL {
-            break;
-        }
-        dev_old = dev;
-    }
-
-    mu
+    let fit = crate::glm::fit_single_gene(
+        ndarray::ArrayView1::from(counts),
+        design,
+        ndarray::ArrayView1::from(size_factors),
+        alpha,
+        &crate::glm::GlmFitParams::default(),
+    );
+    fit.mu.iter().map(|&m| m.max(MINMU)).collect()
 }
 
 /// DESeq2's momentsDispEstimate: variance-based dispersion estimator
