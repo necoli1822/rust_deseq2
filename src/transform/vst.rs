@@ -10,6 +10,7 @@ use ndarray::{Array1, Array2};
 use rayon::prelude::*;
 
 use crate::data::DESeqDataSet;
+use crate::dispersion::DispersionTrend;
 use crate::error::{DeseqError, Result};
 
 /// VST computation method
@@ -51,16 +52,26 @@ pub struct VstResult {
 }
 
 /// Apply Variance Stabilizing Transformation
-/// R equivalent: varianceStabilizingTransformation() / vst() in vst.R
+/// R equivalent: varianceStabilizingTransformation() / getVarianceStabilizedData() in vst.R
 ///
 /// This function transforms count data to the log2 scale in a way that
 /// normalizes with respect to library size and yields approximately
 /// homoskedastic data (constant variance across the range of mean values).
 ///
+/// The transformation is determined by the fitted dispersion trend stored in `dds`
+/// (R: the "fitType" attribute of dispersionFunction(object)), so dispersions must
+/// be estimated first, with an intercept-only design for a blind transformation.
+/// As in R, a parametric fit that fell back to a local fit gives the local VST.
+///
+/// This is the full-data VST; R's faster vst() estimates the trend on a subset of
+/// `nsub` genes and is not implemented here.
+///
 /// # Arguments
-/// * `dds` - DESeqDataSet with size factors estimated
-/// * `method` - VST method to use (Parametric, Local, or Mean)
-/// * `blind` - If true, ignore design and use ~1 for dispersion estimation
+/// * `dds` - DESeqDataSet with size factors and dispersions estimated
+/// * `method` - the fitType the dispersions were estimated with (reported back; a
+///   mismatch with the stored trend is logged and the stored trend is used)
+/// * `_blind` - kept for API compatibility; blindness is decided by the design the
+///   dispersions were estimated with
 ///
 /// # Returns
 /// * `VstResult` containing transformed data
@@ -69,13 +80,16 @@ pub struct VstResult {
 /// ```ignore
 /// let vst_data = vst(&dds, VstMethod::Parametric, true)?;
 /// ```
-pub fn vst(dds: &DESeqDataSet, method: VstMethod, blind: bool) -> Result<VstResult> {
+pub fn vst(dds: &DESeqDataSet, method: VstMethod, _blind: bool) -> Result<VstResult> {
     // Check prerequisites
     if !dds.has_size_factors() {
         return Err(DeseqError::InvalidInput {
             reason: "Size factors must be estimated before VST".to_string(),
         });
     }
+    let trend = dds.dispersion_trend().ok_or_else(|| DeseqError::InvalidInput {
+        reason: "Dispersions must be estimated before VST (R: call estimateDispersions)".to_string(),
+    })?;
 
     let n_genes = dds.n_genes();
     let n_samples = dds.n_samples();
@@ -90,94 +104,30 @@ pub fn vst(dds: &DESeqDataSet, method: VstMethod, blind: bool) -> Result<VstResu
         }
     }
 
-    // R's vst() uses nsub=1000: subsample genes for dispersion estimation when n_genes > 1000
-    let nsub: usize = 1000;
-    let sub_norm_counts = if n_genes > nsub {
-        // Subsample genes for faster dispersion estimation (R default: nsub=1000)
-        // Use deterministic selection: pick genes with highest row variance for robustness
-        let mut gene_vars: Vec<(usize, f64)> = (0..n_genes)
-            .map(|i| {
-                let mean = (0..n_samples).map(|j| norm_counts[[i, j]]).sum::<f64>() / n_samples as f64;
-                let var = (0..n_samples)
-                    .map(|j| (norm_counts[[i, j]] - mean).powi(2))
-                    .sum::<f64>() / (n_samples as f64 - 1.0).max(1.0);
-                (i, var)
-            })
-            .collect();
-        gene_vars.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let selected: Vec<usize> = gene_vars.iter().take(nsub).map(|&(i, _)| i).collect();
-        let mut sub = Array2::zeros((nsub, n_samples));
-        for (new_i, &orig_i) in selected.iter().enumerate() {
-            for j in 0..n_samples {
-                sub[[new_i, j]] = norm_counts[[orig_i, j]];
-            }
-        }
-        Some(sub)
-    } else {
-        None
+    let (used, transformed, disp_intercept, extra_pois) = match trend {
+        DispersionTrend::Parametric { asympt_disp, extra_pois } => (
+            VstMethod::Parametric,
+            vst_parametric(&norm_counts, *asympt_disp, *extra_pois),
+            *asympt_disp,
+            *extra_pois,
+        ),
+        DispersionTrend::Mean(alpha) => (VstMethod::Mean, vst_mean(&norm_counts, *alpha), *alpha, 0.0),
+        DispersionTrend::Local(_) => (
+            VstMethod::Local,
+            vst_local(&norm_counts, trend, size_factors),
+            f64::NAN,
+            f64::NAN,
+        ),
     };
-    let estimation_counts = sub_norm_counts.as_ref().unwrap_or(&norm_counts);
-
-    // Get dispersion function coefficients
-    // R behavior:
-    //   blind=TRUE  -> re-estimate dispersions using intercept-only design (ignoring existing)
-    //   blind=FALSE -> use existing dispersions from the fitted model
-    let (disp_intercept, extra_pois) = if blind {
-        // blind=TRUE: estimate dispersions from data directly, ignoring any model-based estimates.
-        // When the caller has already re-estimated dispersions with intercept-only design
-        // (as main.rs does), use those. Otherwise fall back to data-driven estimation.
-        if let Some((a0, a1)) = dds.dispersion_function() {
-            (a0, a1)
-        } else if let Some(_trend_disp) = dds.trended_dispersions() {
-            estimate_dispersion_params(dds, estimation_counts)
-        } else {
-            // No dispersions at all - estimate mean dispersion from subsampled data
-            let mean_disp = estimate_mean_dispersion(estimation_counts);
-            (mean_disp, 0.01)
-        }
-    } else {
-        // blind=FALSE: use existing dispersions from the fitted model.
-        // The caller should have already run the full DESeq pipeline.
-        if !dds.has_dispersions() {
-            return Err(DeseqError::InvalidInput {
-                reason: "blind=false requires dispersions to be estimated first (run DESeq)".to_string(),
-            });
-        }
-        if let Some((a0, a1)) = dds.dispersion_function() {
-            (a0, a1)
-        } else if let Some(_trend_disp) = dds.trended_dispersions() {
-            estimate_dispersion_params(dds, estimation_counts)
-        } else {
-            let mean_disp = estimate_mean_dispersion(estimation_counts);
-            (mean_disp, 0.01)
-        }
-    };
-
-    // Apply transformation based on method
-    let transformed = match method {
-        VstMethod::Parametric => {
-            vst_parametric(&norm_counts, disp_intercept, extra_pois)
-        }
-        VstMethod::Mean => {
-            vst_mean(&norm_counts, disp_intercept)
-        }
-        VstMethod::Local => {
-            // Local fit uses numerical integration with the trended dispersions
-            if let Some(trend_disp) = dds.trended_dispersions() {
-                vst_local(&norm_counts, trend_disp.as_slice().unwrap(), size_factors)
-            } else {
-                // No trended dispersions available, fall back to parametric
-                log::warn!("VST local: no trended dispersions available, falling back to parametric");
-                vst_parametric(&norm_counts, disp_intercept, extra_pois)
-            }
-        }
-    };
+    if used != method {
+        log::info!("VST follows the fitted dispersion trend ({:?}) rather than the requested {:?}", used, method);
+    }
 
     Ok(VstResult {
         data: transformed,
         gene_ids: dds.counts().gene_ids().to_vec(),
         sample_ids: dds.counts().sample_ids().to_vec(),
-        method,
+        method: used,
         disp_intercept,
         extra_pois,
     })
@@ -274,173 +224,147 @@ fn vst_mean_single(q: f64, alpha: f64) -> f64 {
     (asinh_term - alpha.ln() - 4.0_f64.ln()) / 2.0_f64.ln()
 }
 
-/// Local-fit VST transformation using numerical integration
-/// R DESeq2: when fitType="local", uses the trended dispersion function
-/// to compute the variance stabilizing transformation via numerical integration.
-/// For each normalized count q, integrates 1/sqrt(variance(q)) from 0 to q
-/// where variance(q) = q + alpha(q) * q^2, and alpha(q) is the trended dispersion
-/// looked up by the gene's mean expression.
-fn vst_local(
-    norm_counts: &Array2<f64>,
-    trended_dispersions: &[f64],
-    _size_factors: &Array1<f64>,
-) -> Array2<f64> {
-    let n_genes = norm_counts.nrows();
-    let n_samples = norm_counts.ncols();
+/// Local-fit VST transformation by numerical integration of the dispersion trend
+/// R equivalent: getVarianceStabilizedData() for fitType = "local":
+///   xg <- sinh(seq(asinh(0), asinh(max(ncounts)), length.out = 1000))[-1]
+///   baseVarsAtGrid <- dispersionFunction(object)(xg) * xg^2 + mean(1/sf) * xg
+///   integrand <- 1 / sqrt(baseVarsAtGrid)
+///   splf <- splinefun(asinh(midpoints of xg), cumsum(trapezoids of integrand))
+///   h1, h2 <- quantile(rowMeans(ncounts), c(.95, .999))
+///   eta <- (log2(h2) - log2(h1)) / (splf(asinh(h2)) - splf(asinh(h1)))
+///   xi  <- log2(h1) - eta * splf(asinh(h1))
+///   result = eta * splf(asinh(ncounts)) + xi
+fn vst_local(norm_counts: &Array2<f64>, trend: &DispersionTrend, size_factors: &Array1<f64>) -> Array2<f64> {
+    let max_count = norm_counts.iter().cloned().fold(0.0_f64, f64::max);
+    let ngrid = 1000;
+    let hi = max_count.asinh();
+    let xg: Vec<f64> = (1..ngrid)
+        .map(|k| (hi * k as f64 / (ngrid - 1) as f64).sinh())
+        .collect();
+    let xim = size_factors.iter().map(|s| 1.0 / s).sum::<f64>() / size_factors.len() as f64;
+    let integrand: Vec<f64> = xg.iter().map(|&x| 1.0 / (trend.eval(x) * x * x + xim * x).sqrt()).collect();
 
-    // For each gene, apply VST via numerical integration using its trended dispersion
-    let mut result = Array2::zeros((n_genes, n_samples));
-
-    let flat_result: Vec<f64> = (0..n_genes)
-        .into_par_iter()
-        .flat_map(|i| {
-            let alpha = trended_dispersions[i].max(1e-8);
-            (0..n_samples)
-                .map(|j| {
-                    let q = norm_counts[[i, j]].max(0.0);
-                    // Numerical integration of 1/sqrt(variance(mu)) dmu from 0 to q
-                    // variance(mu) = mu + alpha * mu^2 (negative binomial)
-                    vst_numerical_integrate(q, alpha)
-                })
-                .collect::<Vec<f64>>()
+    let knots: Vec<f64> = (0..xg.len() - 1).map(|k| ((xg[k + 1] + xg[k]) / 2.0).asinh()).collect();
+    let mut acc = 0.0;
+    let values: Vec<f64> = (0..xg.len() - 1)
+        .map(|k| {
+            acc += (xg[k + 1] - xg[k]) * (integrand[k + 1] + integrand[k]) / 2.0;
+            acc
         })
         .collect();
+    let spline = FmmSpline::new(&knots, &values);
 
-    for i in 0..n_genes {
-        for j in 0..n_samples {
-            result[[i, j]] = flat_result[i * n_samples + j];
-        }
-    }
+    let row_means: Vec<f64> = norm_counts
+        .rows()
+        .into_iter()
+        .map(|r| r.sum() / r.len() as f64)
+        .collect();
+    let h1 = quantile_type7(&row_means, 0.95);
+    let h2 = quantile_type7(&row_means, 0.999);
+    let eta = (h2.log2() - h1.log2()) / (spline.eval(h2.asinh()) - spline.eval(h1.asinh()));
+    let xi = h1.log2() - eta * spline.eval(h1.asinh());
 
-    result
+    norm_counts.mapv(|q| eta * spline.eval(q.asinh()) + xi)
 }
 
-/// Numerically integrate the VST transform: integral of 1/sqrt(mu + alpha*mu^2) dmu
-/// from 0 to q, then convert to log2 scale.
-/// Uses Simpson's rule for numerical integration.
-fn vst_numerical_integrate(q: f64, alpha: f64) -> f64 {
-    if q <= 0.0 {
-        // For zero counts, use the formula value at a small epsilon
-        let eps = 0.5;
-        let val = 1.0 / (eps + alpha * eps * eps).sqrt();
-        return (val * eps) / 2.0_f64.ln();
-    }
-
-    // Number of integration steps (even number for Simpson's rule)
-    let n_steps: usize = 100;
-    let h = q / n_steps as f64;
-
-    // Simpson's rule: integral ~= h/3 * [f(0) + 4*f(h) + 2*f(2h) + 4*f(3h) + ... + f(q)]
-    let integrand = |mu: f64| -> f64 {
-        let mu = mu.max(1e-10);
-        let var = mu + alpha * mu * mu;
-        1.0 / var.sqrt()
-    };
-
-    let mut sum = integrand(1e-10) + integrand(q); // avoid exact 0 at lower bound
-    for k in 1..n_steps {
-        let mu_k = k as f64 * h;
-        if k % 2 == 0 {
-            sum += 2.0 * integrand(mu_k);
-        } else {
-            sum += 4.0 * integrand(mu_k);
-        }
-    }
-
-    let integral = sum * h / 3.0;
-    // Convert to log2 scale
-    integral / 2.0_f64.ln()
+/// R's quantile(x, p) with the default type 7
+fn quantile_type7(x: &[f64], p: f64) -> f64 {
+    let mut v = x.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let h = (v.len() - 1) as f64 * p;
+    let lo = h.floor() as usize;
+    let hi = (lo + 1).min(v.len() - 1);
+    v[lo] + (h - lo as f64) * (v[hi] - v[lo])
 }
 
-/// Estimate dispersion parameters from data
-/// Returns (asymptotic dispersion, extra Poisson variance)
-fn estimate_dispersion_params(dds: &DESeqDataSet, norm_counts: &Array2<f64>) -> (f64, f64) {
-    // If we have dispersion function parameters, use those
-    // Otherwise estimate from trended dispersions
-
-    if let Some(trend_disp) = dds.trended_dispersions() {
-        // Calculate mean expression for each gene
-        let n_genes = norm_counts.nrows();
-        let n_samples = norm_counts.ncols();
-
-        let base_means: Vec<f64> = (0..n_genes)
-            .map(|i| {
-                (0..n_samples).map(|j| norm_counts[[i, j]]).sum::<f64>() / n_samples as f64
-            })
-            .collect();
-
-        // DESeq2: asymptotic dispersion is the dispersion at high expression
-        // Select genes with baseMean > 75th percentile
-        let mut sorted_means: Vec<f64> = base_means.iter().filter(|&&m| m > 0.0).copied().collect();
-        sorted_means.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        let q75_idx = (sorted_means.len() as f64 * 0.75) as usize;
-        let q75_mean = if q75_idx < sorted_means.len() {
-            sorted_means[q75_idx]
-        } else {
-            sorted_means.last().copied().unwrap_or(100.0)
-        };
-
-        // Get dispersions for high-expression genes
-        let high_expr_disps: Vec<f64> = base_means
-            .iter()
-            .zip(trend_disp.iter())
-            .filter(|(&m, _)| m >= q75_mean)
-            .map(|(_, &d)| d)
-            .collect();
-
-        let asympt_disp = if high_expr_disps.is_empty() {
-            // Fallback: use median of all dispersions
-            let mut all_disps = trend_disp.to_vec();
-            all_disps.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            all_disps[all_disps.len() / 2]
-        } else {
-            // Median of high-expression dispersions
-            let mut sorted = high_expr_disps.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            sorted[sorted.len() / 2]
-        };
-
-        // Extra Poisson term - estimate from low expression genes
-        // For simplicity, use a small default
-        let extra_pois = 0.01;
-
-        (asympt_disp.max(0.001), extra_pois)
-    } else {
-        // No trended dispersions - estimate mean dispersion
-        (estimate_mean_dispersion(norm_counts), 0.01)
-    }
+/// Cubic interpolating spline with Forsythe-Malcolm-Moler end conditions
+/// R equivalent: splinefun(x, y) with the default method = "fmm"
+/// (fmm_spline / spline_eval in R's src/library/stats/src/splines.c)
+struct FmmSpline {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    b: Vec<f64>,
+    c: Vec<f64>,
+    d: Vec<f64>,
 }
 
-/// Estimate mean dispersion using method of moments
-fn estimate_mean_dispersion(norm_counts: &Array2<f64>) -> f64 {
-    let n_genes = norm_counts.nrows();
-    let n_samples = norm_counts.ncols();
-
-    // For each gene: estimate dispersion = (var - mean) / mean^2
-    let mut dispersions = Vec::new();
-
-    for i in 0..n_genes {
-        let row: Vec<f64> = (0..n_samples).map(|j| norm_counts[[i, j]]).collect();
-        let mean = row.iter().sum::<f64>() / n_samples as f64;
-
-        if mean > 1.0 {
-            // Only use genes with sufficient expression
-            let var = row.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (n_samples - 1) as f64;
-            let disp = (var - mean) / (mean * mean);
-            if disp > 0.0 && disp.is_finite() {
-                dispersions.push(disp);
+impl FmmSpline {
+    fn new(x: &[f64], y: &[f64]) -> Self {
+        let n = x.len();
+        let mut b = vec![0.0; n];
+        let mut c = vec![0.0; n];
+        let mut d = vec![0.0; n];
+        if n < 3 {
+            if n == 2 {
+                b[0] = (y[1] - y[0]) / (x[1] - x[0]);
+                b[1] = b[0];
             }
+            return Self { x: x.to_vec(), y: y.to_vec(), b, c, d };
         }
+        let nm1 = n - 1;
+        // Tridiagonal system: b = diagonal, d = off-diagonal, c = right-hand side
+        d[0] = x[1] - x[0];
+        c[1] = (y[1] - y[0]) / d[0];
+        for i in 1..nm1 {
+            d[i] = x[i + 1] - x[i];
+            b[i] = 2.0 * (d[i - 1] + d[i]);
+            c[i + 1] = (y[i + 1] - y[i]) / d[i];
+            c[i] = c[i + 1] - c[i];
+        }
+        // End conditions: third derivatives from divided differences
+        b[0] = -d[0];
+        b[nm1] = -d[n - 2];
+        c[0] = 0.0;
+        c[nm1] = 0.0;
+        if n > 3 {
+            c[0] = c[2] / (x[3] - x[1]) - c[1] / (x[2] - x[0]);
+            c[nm1] = c[n - 2] / (x[nm1] - x[n - 3]) - c[n - 3] / (x[n - 2] - x[n - 4]);
+            c[0] = c[0] * d[0] * d[0] / (x[3] - x[0]);
+            c[nm1] = -c[nm1] * d[n - 2] * d[n - 2] / (x[nm1] - x[n - 4]);
+        }
+        // Gaussian elimination
+        for i in 1..n {
+            let t = d[i - 1] / b[i - 1];
+            b[i] -= t * d[i - 1];
+            c[i] -= t * c[i - 1];
+        }
+        // Backward substitution
+        c[nm1] /= b[nm1];
+        for i in (0..nm1).rev() {
+            c[i] = (c[i] - d[i] * c[i + 1]) / b[i];
+        }
+        // Polynomial coefficients
+        b[nm1] = (y[nm1] - y[n - 2]) / d[n - 2] + d[n - 2] * (c[n - 2] + 2.0 * c[nm1]);
+        for i in 0..nm1 {
+            b[i] = (y[i + 1] - y[i]) / d[i] - d[i] * (c[i + 1] + 2.0 * c[i]);
+            d[i] = (c[i + 1] - c[i]) / d[i];
+            c[i] *= 3.0;
+        }
+        c[nm1] *= 3.0;
+        d[nm1] = d[n - 2];
+        Self { x: x.to_vec(), y: y.to_vec(), b, c, d }
     }
 
-    if dispersions.is_empty() {
-        return 0.1; // Default dispersion
+    fn eval(&self, u: f64) -> f64 {
+        let n = self.x.len();
+        // interval i with x[i] <= u < x[i+1]; the end cubics extrapolate
+        let i = if u < self.x[0] {
+            0
+        } else {
+            let (mut lo, mut hi) = (0usize, n);
+            while hi > lo + 1 {
+                let k = (lo + hi) / 2;
+                if u < self.x[k] {
+                    hi = k;
+                } else {
+                    lo = k;
+                }
+            }
+            lo
+        };
+        let dx = u - self.x[i];
+        self.y[i] + dx * (self.b[i] + dx * (self.c[i] + dx * self.d[i]))
     }
-
-    // Use median
-    dispersions.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    dispersions[dispersions.len() / 2].max(0.001)
 }
 
 impl VstResult {

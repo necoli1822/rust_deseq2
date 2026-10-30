@@ -814,7 +814,14 @@ fn run_vst(
         let intercept_design = Array2::from_elem((n_samples, 1), 1.0);
         dds.set_design_matrix(intercept_design)?;
     }
-    estimate_dispersions(&mut dds, TrendFitMethod::Parametric, &DispersionParams::default())?;
+    // R: varianceStabilizingTransformation(dds, fitType=...) estimates the dispersion
+    // trend with that fitType; the transformation then follows the fitted trend.
+    let trend_method = match vst_method {
+        VstMethod::Parametric => TrendFitMethod::Parametric,
+        VstMethod::Mean => TrendFitMethod::Mean,
+        VstMethod::Local => TrendFitMethod::Local,
+    };
+    estimate_dispersions(&mut dds, trend_method, &DispersionParams::default())?;
 
     let vst_result = vst(&dds, vst_method, blind)?;
 
