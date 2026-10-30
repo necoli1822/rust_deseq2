@@ -708,12 +708,13 @@ fn run_normalize(counts_path: &str, output_path: &str, method: &str) -> Result<(
     let counts = read_count_matrix(counts_path)?;
     info!("  {} genes, {} samples", counts.n_genes(), counts.n_samples());
 
-    let metadata = SampleMetadata::new(counts.sample_ids().to_vec());
+    // Size factors do not depend on the design, but DESeqDataSet requires a
+    // design variable that exists in the metadata, so supply a single-level one.
+    let mut metadata = SampleMetadata::new(counts.sample_ids().to_vec());
+    let n = counts.n_samples();
+    metadata.add_condition("_intercept", vec!["1".to_string(); n])?;
 
-    let mut dds = DESeqDataSet::new(counts, metadata, "dummy")
-        .map_err(|_| DeseqError::InvalidMetadata {
-            reason: "Failed to create dataset for normalization".to_string(),
-        })?;
+    let mut dds = DESeqDataSet::new(counts, metadata, "_intercept")?;
 
     let size_method = match method {
         "ratio" => SizeFactorMethod::Ratio,
