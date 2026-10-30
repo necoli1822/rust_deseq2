@@ -300,6 +300,17 @@ pub fn fit_single_gene(
 
     let needs_optim = !converged || !row_stable || !row_var_positive;
 
+    // R keeps the hat diagonals from the IRLS fit even for rows it then refits with
+    // optim (fitNbinomGLMsOptim updates beta, SE and mu but not H), and Cook's
+    // distances are computed from that H. `mus` holds the clamped mu the C++ loop
+    // last computed, so these are the weights fitBeta used for hat_diagonals.
+    let irls_hat = if needs_optim {
+        let irls_weights: Vec<f64> = mus.iter().map(|&mu| nb_weight(mu, alpha)).collect();
+        Some(calculate_standard_errors_and_hat(design, &irls_weights).1)
+    } else {
+        None
+    };
+
     let log_likelihood = if needs_optim {
         let ln2 = std::f64::consts::LN_2;
         // R: betaRow <- if (rowStable[row] & all(abs(betaMatrix[row,]) < large)) {
@@ -341,27 +352,32 @@ pub fn fit_single_gene(
 
         lbfgsb_ll
     } else {
-        // IRLS converged, compute log_likelihood from final mu values
+        // IRLS converged. R: logLike <- nbinomLogLike(counts, mu, ...) with the
+        // unclamped mu <- nf * exp(X beta)
         let size = 1.0 / alpha;
         (0..n_samples)
             .map(|i| {
                 let eta: f64 = (0..n_coefs).map(|j| design[[i, j]] * beta[j]).sum();
-                let mu = nb_mean(eta, size_factors[i]).max(MIN_MU);
+                let mu = nb_mean(eta, size_factors[i]);
                 nb_log_likelihood_for_deviance(counts[i], mu, size)
             })
             .sum()
     };
 
+    // Weights (and so SE) use mu clamped at minmu, but the stored mu is the
+    // unclamped nf * exp(X beta), as in R's fitNbinomGLMs; Cook's distances are
+    // computed from it.
     let mut mus = vec![0.0; n_samples];
     let mut weights = vec![0.0; n_samples];
     for i in 0..n_samples {
         let eta: f64 = (0..n_coefs).map(|j| design[[i, j]] * beta[j]).sum();
-        let mu = nb_mean(eta, size_factors[i]).max(MIN_MU);
+        let mu = nb_mean(eta, size_factors[i]);
         mus[i] = mu;
-        weights[i] = nb_weight(mu, alpha);
+        weights[i] = nb_weight(mu.max(MIN_MU), alpha);
     }
 
-    let (standard_errors, hat_diagonals, covariance) = calculate_standard_errors_and_hat(design, &weights);
+    let (standard_errors, final_hat, covariance) = calculate_standard_errors_and_hat(design, &weights);
+    let hat_diagonals = irls_hat.unwrap_or(final_hat);
 
     GlmFitResult {
         coefficients: beta,
