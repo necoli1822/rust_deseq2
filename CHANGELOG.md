@@ -72,6 +72,10 @@ names the R function it now follows.
   which the VST evaluates (VST local off by up to 1.4e-2; now 5e-7).
 
 ### Added
+- htseq-count input (R's `DESeqDataSetFromHTSeqCount`): `--htseq <SAMPLE_TABLE>` and
+  `--htseq-dir <DIR>` for `run`, `vst`, `rlog` and `normalize`, and `io::read_htseq_count`.
+  Counts come from the last column of each file, gene IDs must agree across files, and
+  htseq-count's counter rows are dropped.
 - `vst --nsub N`: R's `vst()`, which fits the dispersion trend on N genes (R's default 1000)
   spanning the range of mean counts. Without `--nsub`, `vst` remains
   `varianceStabilizingTransformation()`.

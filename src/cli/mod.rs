@@ -1,6 +1,6 @@
 //! Command-line interface for rust_deseq2
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "rust_deseq2")]
@@ -53,19 +53,8 @@ Examples:
     --numerator treated --denominator control --fit-type local --use-t"
     )]
     Run {
-        /// Path to count matrix CSV file
-        #[arg(short, long,
-            long_help = "Path to count matrix CSV file.\n\
-                Format: first column = gene IDs, remaining columns = raw counts per sample.\n\
-                Supports both CSV (comma) and TSV (tab) delimiters (auto-detected).")]
-        counts: String,
-
-        /// Path to sample metadata CSV file
-        #[arg(short, long,
-            long_help = "Path to sample metadata CSV file.\n\
-                Format: first column = sample IDs (matching count matrix columns),\n\
-                remaining columns = experimental variables.")]
-        metadata: String,
+        #[command(flatten)]
+        input: InputArgs,
 
         /// Design variable (variable of interest)
         #[arg(short, long,
@@ -264,8 +253,21 @@ Examples:
     )]
     Normalize {
         /// Path to count matrix CSV file
-        #[arg(short, long)]
-        counts: String,
+        #[arg(short, long, required_unless_present = "htseq", conflicts_with = "htseq")]
+        counts: Option<String>,
+
+        /// HTSeq sample table (sample name, file name, ...); counts are read from the files
+        #[arg(long, value_name = "SAMPLE_TABLE",
+            long_help = "Read counts from htseq-count output files instead of --counts.\n\
+                SAMPLE_TABLE is a CSV/TSV with a header: column 1 = sample name, column 2 =\n\
+                file name (relative to --htseq-dir). Rows of htseq-count counters\n\
+                (__no_feature, __ambiguous, ...) are dropped.\n\
+                R equivalent: DESeqDataSetFromHTSeqCount(sampleTable, directory)")]
+        htseq: Option<String>,
+
+        /// Directory holding the files named in the HTSeq sample table
+        #[arg(long, value_name = "DIR", default_value = ".", requires = "htseq")]
+        htseq_dir: String,
 
         /// Output file path
         #[arg(short, long)]
@@ -291,13 +293,8 @@ Examples:
   rust_deseq2 vst -c counts.csv -m metadata.csv -d condition --blind"
     )]
     Vst {
-        /// Path to count matrix CSV file
-        #[arg(short, long)]
-        counts: String,
-
-        /// Path to sample metadata CSV file
-        #[arg(short, long)]
-        metadata: String,
+        #[command(flatten)]
+        input: InputArgs,
 
         /// Design variable
         #[arg(short, long)]
@@ -341,13 +338,8 @@ Examples:
   rust_deseq2 rlog -c counts.csv -m metadata.csv -d condition --blind"
     )]
     Rlog {
-        /// Path to count matrix CSV file
-        #[arg(short, long)]
-        counts: String,
-
-        /// Path to sample metadata CSV file
-        #[arg(short, long)]
-        metadata: String,
+        #[command(flatten)]
+        input: InputArgs,
 
         /// Design variable
         #[arg(short, long)]
@@ -364,4 +356,38 @@ Examples:
                 Use blind=false when design is expected to explain variance.")]
         blind: bool,
     },
+}
+
+/// Count and sample inputs: a count matrix with a metadata table, or htseq-count files
+#[derive(Args, Clone, Debug)]
+pub struct InputArgs {
+    /// Path to count matrix CSV file
+    #[arg(short, long, required_unless_present = "htseq", conflicts_with = "htseq",
+        requires = "metadata",
+        long_help = "Path to count matrix CSV file.\n\
+            Format: first column = gene IDs, remaining columns = raw counts per sample.\n\
+            Supports both CSV (comma) and TSV (tab) delimiters (auto-detected).")]
+    pub counts: Option<String>,
+
+    /// Path to sample metadata CSV file
+    #[arg(short, long, conflicts_with = "htseq",
+        long_help = "Path to sample metadata CSV file.\n\
+            Format: first column = sample IDs (matching count matrix columns),\n\
+            remaining columns = experimental variables.")]
+    pub metadata: Option<String>,
+
+    /// HTSeq sample table (sample name, file name, variables); replaces -c and -m
+    #[arg(long, value_name = "SAMPLE_TABLE",
+        long_help = "Read counts from htseq-count output files instead of -c/-m.\n\
+            SAMPLE_TABLE is a CSV/TSV with a header: column 1 = sample name, column 2 =\n\
+            file name (relative to --htseq-dir), remaining columns = sample variables\n\
+            used by the design. In each file the first column is the gene ID and the\n\
+            last the count; rows of htseq-count counters (__no_feature, __ambiguous,\n\
+            ...) are dropped, and the gene IDs must be the same in every file.\n\
+            R equivalent: DESeqDataSetFromHTSeqCount(sampleTable, directory, design)")]
+    pub htseq: Option<String>,
+
+    /// Directory holding the files named in the HTSeq sample table
+    #[arg(long, value_name = "DIR", default_value = ".", requires = "htseq")]
+    pub htseq_dir: String,
 }

@@ -3,7 +3,7 @@
 use clap::Parser;
 use log::{info, LevelFilter};
 
-use rust_deseq2::cli::{Cli, Commands};
+use rust_deseq2::cli::{Cli, Commands, InputArgs};
 use rust_deseq2::filter::{calculate_cooks_distance, default_cooks_cutoff, filter_by_cooks_with_counts, n_or_more_in_cell, replace_outliers};
 use rust_deseq2::prelude::*;
 
@@ -57,8 +57,7 @@ fn main() {
 
     let result = match cli.command {
         Some(Commands::Run {
-            counts,
-            metadata,
+            input,
             design,
             covariate,
             continuous,
@@ -90,8 +89,7 @@ fn main() {
             weights,
             cooks_cutoff,
         }) => run_analysis(
-            &counts,
-            &metadata,
+            &input,
             &design,
             &covariate,
             &continuous,
@@ -125,25 +123,25 @@ fn main() {
         ),
         Some(Commands::Normalize {
             counts,
+            htseq,
+            htseq_dir,
             output,
             method,
-        }) => run_normalize(&counts, &output, &method),
+        }) => run_normalize(counts.as_deref(), htseq.as_deref(), &htseq_dir, &output, &method),
         Some(Commands::Vst {
-            counts,
-            metadata,
+            input,
             design,
             output,
             method,
             blind,
             nsub,
-        }) => run_vst(&counts, &metadata, &design, &output, &method, blind, nsub),
+        }) => run_vst(&input, &design, &output, &method, blind, nsub),
         Some(Commands::Rlog {
-            counts,
-            metadata,
+            input,
             design,
             output,
             blind,
-        }) => run_rlog(&counts, &metadata, &design, &output, blind),
+        }) => run_rlog(&input, &design, &output, blind),
         None => {
             // Should not reach here (handled above), but just in case
             print_no_args();
@@ -221,9 +219,33 @@ fn print_long_help() {
 // Subcommand implementations
 // ---------------------------------------------------------------------------
 
+/// Read the counts and sample metadata: a count matrix with a metadata table, or
+/// htseq-count files listed in a sample table (R: DESeqDataSetFromHTSeqCount)
+fn load_input(input: &InputArgs) -> Result<(CountMatrix, SampleMetadata)> {
+    if let Some(table) = &input.htseq {
+        return load_htseq(table, &input.htseq_dir);
+    }
+    let counts_path = input.counts.as_deref().expect("clap requires --counts or --htseq");
+    let metadata_path = input.metadata.as_deref().ok_or_else(|| DeseqError::InvalidInput {
+        reason: "--metadata is required with --counts".to_string(),
+    })?;
+    info!("Loading count matrix from: {}", counts_path);
+    let counts = read_count_matrix(counts_path)?;
+    info!("  {} genes, {} samples", counts.n_genes(), counts.n_samples());
+    info!("Loading metadata from: {}", metadata_path);
+    let metadata = read_metadata(metadata_path)?;
+    Ok((counts, metadata))
+}
+
+fn load_htseq(table: &str, directory: &str) -> Result<(CountMatrix, SampleMetadata)> {
+    info!("Loading htseq-count files listed in {} (directory {})", table, directory);
+    let (counts, metadata) = rust_deseq2::io::read_htseq_count(table, directory)?;
+    info!("  {} genes, {} samples", counts.n_genes(), counts.n_samples());
+    Ok((counts, metadata))
+}
+
 fn run_analysis(
-    counts_path: &str,
-    metadata_path: &str,
+    input: &InputArgs,
     design: &str,
     covariates: &[String],
     continuous_vars: &[String],
@@ -281,12 +303,7 @@ fn run_analysis(
         }
     }
 
-    info!("Loading count matrix from: {}", counts_path);
-    let counts = read_count_matrix(counts_path)?;
-    info!("  {} genes, {} samples", counts.n_genes(), counts.n_samples());
-
-    info!("Loading metadata from: {}", metadata_path);
-    let mut metadata = read_metadata(metadata_path)?;
+    let (counts, mut metadata) = load_input(input)?;
 
     // read_metadata keeps every column as a categorical factor. Columns named by
     // --continuous are numeric covariates (R: a numeric colData column), so
@@ -737,10 +754,23 @@ fn build_reduced_design(
     Ok(design)
 }
 
-fn run_normalize(counts_path: &str, output_path: &str, method: &str) -> Result<()> {
-    info!("Loading count matrix from: {}", counts_path);
-    let counts = read_count_matrix(counts_path)?;
-    info!("  {} genes, {} samples", counts.n_genes(), counts.n_samples());
+fn run_normalize(
+    counts_path: Option<&str>,
+    htseq: Option<&str>,
+    htseq_dir: &str,
+    output_path: &str,
+    method: &str,
+) -> Result<()> {
+    let counts = match (counts_path, htseq) {
+        (_, Some(table)) => load_htseq(table, htseq_dir)?.0,
+        (Some(path), None) => {
+            info!("Loading count matrix from: {}", path);
+            let counts = read_count_matrix(path)?;
+            info!("  {} genes, {} samples", counts.n_genes(), counts.n_samples());
+            counts
+        }
+        (None, None) => unreachable!("clap requires --counts or --htseq"),
+    };
 
     // Size factors do not depend on the design, but DESeqDataSet requires a
     // design variable that exists in the metadata, so supply a single-level one.
@@ -789,8 +819,7 @@ fn run_normalize(counts_path: &str, output_path: &str, method: &str) -> Result<(
 }
 
 fn run_vst(
-    counts_path: &str,
-    metadata_path: &str,
+    input: &InputArgs,
     design: &str,
     output_path: &str,
     method: &str,
@@ -799,12 +828,7 @@ fn run_vst(
 ) -> Result<()> {
     use rust_deseq2::transform::{vst, vst_subsampled, VstMethod};
 
-    info!("Loading count matrix from: {}", counts_path);
-    let counts = read_count_matrix(counts_path)?;
-    info!("  {} genes, {} samples", counts.n_genes(), counts.n_samples());
-
-    info!("Loading metadata from: {}", metadata_path);
-    let metadata = read_metadata(metadata_path)?;
+    let (counts, metadata) = load_input(input)?;
 
     info!("Creating DESeqDataSet with design: ~ {}", design);
     let mut dds = DESeqDataSet::new(counts, metadata, design)?;
@@ -871,20 +895,14 @@ fn run_vst(
 }
 
 fn run_rlog(
-    counts_path: &str,
-    metadata_path: &str,
+    input: &InputArgs,
     design: &str,
     output_path: &str,
     blind: bool,
 ) -> Result<()> {
     use rust_deseq2::transform::rlog;
 
-    info!("Loading count matrix from: {}", counts_path);
-    let counts = read_count_matrix(counts_path)?;
-    info!("  {} genes, {} samples", counts.n_genes(), counts.n_samples());
-
-    info!("Loading metadata from: {}", metadata_path);
-    let metadata = read_metadata(metadata_path)?;
+    let (counts, metadata) = load_input(input)?;
 
     let mut dds = if blind {
         let mut blind_meta = metadata.clone();

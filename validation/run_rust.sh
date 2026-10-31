@@ -32,6 +32,10 @@ run iterate $W --sf-type iterate
 run weights $W --weights $D/weights/weights.csv
 run weights_use_t $W --use-t --weights $D/weights_use_t/weights.csv
 run weights_batch $W --covariate batch --weights $D/weights_batch/weights.csv
+HD=$D/htseq
+"$B" run --htseq $HD/sample_table.csv --htseq-dir $HD/files $W --covariate batch -o $HD/rust_$T.tsv > $HD/rust_$T.log 2>&1 || echo "htseq: FAILED"
+"$B" vst --htseq $HD/sample_table.csv --htseq-dir $HD/files -d condition --blind -o $HD/rust_vst_$T.tsv > /dev/null 2>&1 || echo "htseq vst: FAILED"
+"$B" normalize --htseq $HD/sample_table.csv --htseq-dir $HD/files -o $HD/rust_norm_$T.tsv > /dev/null 2>&1 || echo "htseq normalize: FAILED"
 TD=$D/transform
 "$B" normalize -c $TD/counts.csv -o $TD/rust_norm_$T.tsv >/dev/null 2>&1 || echo "normalize FAILED"
 "$B" vst -c $TD/counts.csv -m $TD/metadata.csv -d condition -o $TD/rust_vst_TRUE_$T.tsv --blind >/dev/null 2>&1 || echo "vst blind FAILED"

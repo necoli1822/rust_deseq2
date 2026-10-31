@@ -65,6 +65,10 @@ rust_deseq2 rlog -c counts.csv -m metadata.csv -d condition -o rlog.tsv
 
 # Normalize counts only
 rust_deseq2 normalize -c counts.csv -o normalized.tsv
+
+# htseq-count output files instead of a count matrix (R: DESeqDataSetFromHTSeqCount)
+rust_deseq2 run --htseq sample_table.csv --htseq-dir counts/ -d condition \
+  --numerator treated --denominator control
 ```
 
 ## CLI Reference
@@ -73,8 +77,10 @@ rust_deseq2 normalize -c counts.csv -o normalized.tsv
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-c, --counts` | Count matrix CSV/TSV file | *required* |
-| `-m, --metadata` | Sample metadata CSV file | *required* |
+| `-c, --counts` | Count matrix CSV/TSV file | *required* ³ |
+| `-m, --metadata` | Sample metadata CSV file | *required* ³ |
+| `--htseq <SAMPLE_TABLE>` | htseq-count files listed in a sample table, instead of `-c`/`-m` (see [Input File Format](#input-file-format)) | — |
+| `--htseq-dir <DIR>` | Directory of the files named in the sample table | `.` |
 | `-d, --design` | Design variable (column in metadata) | *required* |
 | `--covariate` | Categorical covariate for batch correction | — |
 | `--continuous` | Continuous covariate | — |
@@ -101,11 +107,14 @@ rust_deseq2 normalize -c counts.csv -o normalized.tsv
 | `--upper-quantile` | Upper quantile for beta prior variance | `0.05` |
 | `-t, --threads` | Number of threads (0 = auto) | `0` |
 
+³ Unless `--htseq` is given. `vst` and `rlog` take `--htseq`/`--htseq-dir` the same way, and
+`normalize` takes them in place of `-c`.
+
 ### `normalize` — Normalize counts
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-c, --counts` | Count matrix CSV/TSV file | *required* |
+| `-c, --counts` | Count matrix CSV/TSV file | *required* ³ |
 | `-o, --output` | Output file path | *required* |
 | `-m, --method` | Method: `ratio`, `poscounts`, `iterate` | `ratio` |
 
@@ -151,6 +160,21 @@ sample1,control
 sample2,control
 sample3,treated
 ```
+
+### htseq-count files (`--htseq`)
+R's `DESeqDataSetFromHTSeqCount(sampleTable, directory, design)`. The sample table (CSV or TSV)
+names the sample in column 1 and its htseq-count output file (relative to `--htseq-dir`) in
+column 2; the remaining columns are the sample variables used by the design:
+```
+sampleName,fileName,condition
+sample1,sample1.htseq.txt,control
+sample2,sample2.htseq.txt,control
+sample3,sample3.htseq.txt,treated
+```
+In each file the first column is the gene ID and the last the count, so files written with
+`--additional-attr` work. The gene IDs must be the same, in the same order, in every file. The
+counter rows (IDs starting with `_`, such as `__no_feature`, and the pre-0.6 names `no_feature`,
+`ambiguous`, `too_low_aQual`, `not_aligned`, `alignment_not_unique`) are dropped.
 
 ## Benchmark
 
@@ -224,6 +248,7 @@ release 0.1.0; "sig." counts genes called significant (padj < 0.1) by only one o
 | `--sf-type poscounts`, 30% zeros | 2 sig., 75 padj-NA differences | 1.6e-3 ¹ | 0 |
 | `--sf-type iterate`, 30% zeros | different algorithm | 8e-5 | 0 |
 | `--weights` (4 vs 4, `--use-t`, `~batch + condition`) | not supported | 5e-7 | 0 |
+| `--htseq` input (`~batch + condition`, VST, normalize) | not supported | 5e-7 | 0 |
 | shrinkage `normal` / `apeglm` / `ashr` | 5e-7 / 4.2e-2 / 5.9e-2 | 5e-7 / 1.5e-6 / 1.8e-5 | 0 |
 | `apeglm` with `--covariate batch` | 5.84 (wrong coefficient) | 4e-6 | 0 |
 | VST `parametric` / `mean` / `local` | 6e-7 / 2.4 / 1.8e8 | 6e-7 / 6e-7 / 5e-7 | — |
@@ -301,6 +326,7 @@ Key equivalences between R DESeq2 and RustDESeq2:
 | `lfcShrink(type="normal")` | `shrink_lfc_normal()` | Normal shrinkage |
 | `lfcShrink(type="apeglm")` | `shrink_lfc_apeglm()` | Apeglm shrinkage |
 | `lfcShrink(type="ashr")` | `apply_ashr_shrinkage()` | Ashr shrinkage |
+| `DESeqDataSetFromHTSeqCount()` | `io::read_htseq_count()` / CLI `--htseq` | Counts from htseq-count files |
 | `varianceStabilizingTransformation()` | `vst()` | VST |
 | `rlog()` | `rlog()` | Regularized log |
 | `fpkm()` | `fpkm()` | FPKM normalization |

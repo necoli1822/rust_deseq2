@@ -17,6 +17,7 @@ validation/run.sh "pixi run --manifest-path tool/deseq2/pixi.toml Rscript" /tmp/
 | `gen4.R` | Residual df 2-3 with realistic dispersion scatter (simulated prior-variance path) |
 | `gen5.R` | R's subsampling `vst(nsub = 1000)` for each fitType, blind and not |
 | `gen6.R` | Observation weights (4 vs 4, `useT`, `~batch + condition`) and `sfType = "iterate"` |
+| `gen7.R` | `--htseq` input: htseq-count files with counter rows and an `--additional-attr` column, read by `DESeqDataSetFromHTSeqCount` (`~batch + condition`, VST, normalized counts) |
 | `run_rust.sh` | Runs the CLI on every scenario |
 | `compare.py` | Max abs difference per column, NA-pattern and padj < 0.1 mismatches |
 | `worst.py` | Genes with the largest difference in one column of one scenario |
