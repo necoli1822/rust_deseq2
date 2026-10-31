@@ -51,6 +51,19 @@ names the R function it now follows.
 - **CLI**: the `normalize` subcommand failed on every input; subcommand `--help`/`-h` was
   rejected; `--replace-outliers false` was rejected (the flag could not be turned off).
 
+- **GLM optim fallback** is now a port of R's `optim(method = "L-BFGS-B")` (lbfgsb.c and the
+  optim.c driver, including its finite-difference gradient), replacing a hand-written L-BFGS
+  that stopped elsewhere on genes that are zero in one group (e.g. LFC 30.0 vs R's 23.1). Used
+  for Wald and LRT fits.
+- **`--sf-type iterate`** re-applied poscounts; it is now R's `estimateSizeFactorsIterate`
+  (alternating mean-fit dispersions and an L-BFGS-B maximisation of the trimmed likelihood).
+
+### Added
+- `vst --nsub N`: R's `vst()`, which fits the dispersion trend on N genes (R's default 1000)
+  spanning the range of mean counts. Without `--nsub`, `vst` remains
+  `varianceStabilizingTransformation()`.
+- `src/optim`: R's L-BFGS-B, `dnbinom` and long-double `sum()` for use by the above.
+
 ### Changed
 - `--replace-outliers` now takes a value: `--replace-outliers false`.
 - apeglm's prior-scale message is logged at info level instead of printed to stderr.
