@@ -708,9 +708,9 @@ fn log_posterior_with_prior(
                 * (lgamma(y + alpha_inv) - lgamma(alpha_inv) - y * (mu_i + alpha_inv).ln()
                     - alpha_inv * (1.0 + mu_i * alpha).ln());
         } else {
-            ll_part += lgamma(y + alpha_inv) - lgamma(alpha_inv);
-            ll_part -= y * (mu_i + alpha_inv).ln();
-            ll_part -= alpha_inv * (1.0 + mu_i * alpha).ln();
+            // per-sample term first, then add (R's vectorised sum; see gene_wise.rs)
+            ll_part += lgamma(y + alpha_inv) - lgamma(alpha_inv) - y * (mu_i + alpha_inv).ln()
+                - alpha_inv * (1.0 + mu_i * alpha).ln();
         }
 
         // Weight for Cox-Reid adjustment: w = 1 / (1/mu + alpha)
@@ -981,7 +981,8 @@ fn digamma(x: f64) -> f64 {
 
 /// Log-gamma function
 fn lgamma(x: f64) -> f64 {
-    statrs::function::gamma::ln_gamma(x)
+    // R's lgammafn (see gene_wise.rs: statrs's ln_gamma is too coarse at 1/alpha ~ 1e8)
+    crate::optim::nmath::lgammafn(x)
 }
 
 #[cfg(test)]

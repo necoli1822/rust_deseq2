@@ -290,7 +290,7 @@ fn create_design_matrix_for_dispersion(dds: &DESeqDataSet) -> Result<Array2<f64>
 /// Create a simple design matrix for two-group comparison
 fn create_simple_design_matrix(conditions: &[String], n_samples: usize) -> Array2<f64> {
     let mut unique: Vec<String> = conditions.iter().cloned().collect();
-    unique.sort();
+    unique.sort_by(|a, b| crate::data::r_collate(a, b));
     unique.dedup();
 
     // Single level (intercept-only design ~1): return 1-column matrix
@@ -405,61 +405,6 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
     }
 
     Some(x)
-}
-
-/// Calculate determinant of a matrix using LU decomposition
-fn matrix_determinant(a: &[Vec<f64>]) -> f64 {
-    let n = a.len();
-    if n == 0 {
-        return 0.0;
-    }
-    if n == 1 {
-        return a[0][0];
-    }
-    if n == 2 {
-        return a[0][0] * a[1][1] - a[0][1] * a[1][0];
-    }
-
-    // LU decomposition with partial pivoting
-    let mut lu: Vec<Vec<f64>> = a.iter().map(|row| row.clone()).collect();
-    let mut sign = 1.0;
-
-    for col in 0..n {
-        // Find pivot
-        let mut max_row = col;
-        let mut max_val = lu[col][col].abs();
-        for row in (col + 1)..n {
-            if lu[row][col].abs() > max_val {
-                max_val = lu[row][col].abs();
-                max_row = row;
-            }
-        }
-
-        if max_val < 1e-14 {
-            return 0.0; // Singular matrix
-        }
-
-        // Swap rows
-        if max_row != col {
-            lu.swap(col, max_row);
-            sign *= -1.0;
-        }
-
-        // Eliminate
-        for row in (col + 1)..n {
-            let factor = lu[row][col] / lu[col][col];
-            for j in col..n {
-                lu[row][j] -= factor * lu[col][j];
-            }
-        }
-    }
-
-    // Determinant is product of diagonal elements times sign
-    let mut det = sign;
-    for i in 0..n {
-        det *= lu[i][i];
-    }
-    det
 }
 
 /// Fit linear model to get mu values (group means for each sample)
@@ -1041,7 +986,8 @@ fn d_cox_reid_dalpha(design: &Array2<f64>, mu: &[f64], alpha: f64) -> f64 {
             }
         }
         let det_b = b[0][0] * b[1][1] - b[0][1] * b[1][0];
-        if det_b.abs() > 1e-10 {
+        // R: -0.5 * det(b) * trace(b^-1 db) / det(b), no cutoff on det(b)
+        if det_b != 0.0 {
             // tr(B^{-1} dB) = (B[1][1]*dB[0][0] + B[0][0]*dB[1][1]
             //                  - B[0][1]*dB[1][0] - B[1][0]*dB[0][1]) / det(B)
             let tr_binv_db = (b[1][1] * db[0][0] + b[0][0] * db[1][1]
@@ -1121,9 +1067,12 @@ fn log_posterior_deseq2(
 
         // DESeq2's exact log-likelihood formula:
         // ll = lgamma(y + 1/alpha) - lgamma(1/alpha) - y*log(mu + 1/alpha) - (1/alpha)*log(1 + mu*alpha)
-        ll_part += lgamma(y + alpha_inv) - lgamma(alpha_inv);
-        ll_part -= y * (mu_i + alpha_inv).ln();
-        ll_part -= alpha_inv * (1.0 + mu_i * alpha).ln();
+        // Evaluate each sample's term first, then add it, as R's vectorised
+        // sum(lgamma(y + 1/a) - lgamma(1/a) - y*log(mu + 1/a) - 1/a*log(1 + mu*a)) does;
+        // accumulating the pieces separately rounds differently, which matters where
+        // the line search's Armijo test is decided at rounding level (lp ~ 1e5).
+        ll_part += lgamma(y + alpha_inv) - lgamma(alpha_inv) - y * (mu_i + alpha_inv).ln()
+            - alpha_inv * (1.0 + mu_i * alpha).ln();
 
         // Weight for Cox-Reid adjustment: w = 1 / (1/mu + alpha)
         weights[i] = 1.0 / (1.0 / mu_i + alpha);
@@ -1137,9 +1086,12 @@ fn cox_reid_term(design: &Array2<f64>, weights: &[f64]) -> f64 {
     let n = weights.len();
     let p = design.ncols();
 
-    // Cox-Reid adjustment: -0.5 * log|X'WX|
-    // Use optimized 2x2 path for simple designs
-    let det = if p == 2 {
+    // Cox-Reid adjustment: -0.5 * log|X'WX|  (DESeq2.cpp: cr_term = -0.5 * log(det(b)))
+    // R applies no cutoff. Cutting the term off below det = 1e-10 made the
+    // log-posterior jump wherever many samples have small weights, e.g. 11 groups of
+    // 3 at mu = minmu gives det = (3/(2 + alpha))^11 < 1e-10 for alpha > ~22, which
+    // stopped the search there instead of at R's maxDisp.
+    let log_det = if p == 2 {
         let mut xtwx = [[0.0; 2]; 2];
         for i in 0..n {
             for j in 0..2 {
@@ -1148,7 +1100,8 @@ fn cox_reid_term(design: &Array2<f64>, weights: &[f64]) -> f64 {
                 }
             }
         }
-        xtwx[0][0] * xtwx[1][1] - xtwx[0][1] * xtwx[1][0]
+        let det = xtwx[0][0] * xtwx[1][1] - xtwx[0][1] * xtwx[1][0];
+        if det > 0.0 { Some(det.ln()) } else { None }
     } else {
         let mut xtwx = vec![vec![0.0; p]; p];
         for i in 0..n {
@@ -1158,9 +1111,49 @@ fn cox_reid_term(design: &Array2<f64>, weights: &[f64]) -> f64 {
                 }
             }
         }
-        matrix_determinant(&xtwx)
+        log_determinant_positive(&xtwx)
     };
-    if det > 1e-10 { -0.5 * det.ln() } else { 0.0 }
+    match log_det {
+        Some(ld) => -0.5 * ld,
+        None => 0.0,
+    }
+}
+
+/// log(det(A)) for a matrix with positive determinant, from the LU pivots
+/// (summing logs avoids the underflow of multiplying many small pivots);
+/// `None` when A is singular or its determinant is not positive.
+fn log_determinant_positive(a: &[Vec<f64>]) -> Option<f64> {
+    let n = a.len();
+    let mut lu: Vec<Vec<f64>> = a.to_vec();
+    let mut sign = 1.0;
+    let mut log_det = 0.0;
+    for col in 0..n {
+        let mut max_row = col;
+        for row in (col + 1)..n {
+            if lu[row][col].abs() > lu[max_row][col].abs() {
+                max_row = row;
+            }
+        }
+        if lu[max_row][col] == 0.0 {
+            return None;
+        }
+        if max_row != col {
+            lu.swap(col, max_row);
+            sign = -sign;
+        }
+        let pivot = lu[col][col];
+        if pivot < 0.0 {
+            sign = -sign;
+        }
+        log_det += pivot.abs().ln();
+        for row in (col + 1)..n {
+            let factor = lu[row][col] / pivot;
+            for j in col..n {
+                lu[row][j] -= factor * lu[col][j];
+            }
+        }
+    }
+    if sign > 0.0 { Some(log_det) } else { None }
 }
 
 /// Digamma function
@@ -1170,7 +1163,10 @@ fn digamma(x: f64) -> f64 {
 
 /// Log-gamma function
 fn lgamma(x: f64) -> f64 {
-    statrs::function::gamma::ln_gamma(x)
+    // R's lgammafn: statrs's Lanczos ln_gamma loses ~1e-6 absolute in
+    // lgamma(y + 1/alpha) - lgamma(1/alpha) when 1/alpha ~ 1e8, enough to change
+    // which point of the flat low-dispersion end of the grid search wins.
+    crate::optim::nmath::lgammafn(x)
 }
 
 /// Debug function to trace optimization for specific genes
