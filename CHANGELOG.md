@@ -63,6 +63,11 @@ names the R function it now follows.
   spanning the range of mean counts. Without `--nsub`, `vst` remains
   `varianceStabilizingTransformation()`.
 - `src/optim`: R's L-BFGS-B, `dnbinom` and long-double `sum()` for use by the above.
+- Observation weights (R's `assays(dds)[["weights"]]`): `run --weights <FILE>` and
+  `DESeqDataSet::set_weights`. Weights enter baseMean, gene-wise and MAP dispersions (weighted
+  likelihood, Cox-Reid term on samples with weight > 0.01), the GLM fits, the LRT, outlier refits
+  and the `--use-t` degrees of freedom, following `getAndCheckWeights` and the C++ fitters.
+  Weighted `lfcShrink` (normal, apeglm) is not ported and is rejected.
 
 ### Changed
 - `--replace-outliers` now takes a value: `--replace-outliers false`.

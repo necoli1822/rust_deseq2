@@ -60,11 +60,11 @@ for s in sorted(os.listdir(D)):
     print(f"{s:24s} {dl:9.2e} {dse:9.2e} {dp:9.2e} {dq:9.2e} {namis:6d} {sigdis:6d} {nsig:6d}")
 
 TD = os.path.join(D, "transform")
-for name in ["norm", "vst_TRUE", "vst_FALSE", "vstlocal_TRUE", "vstlocal_FALSE", "vstmean_TRUE", "vstmean_FALSE", "rlog_TRUE", "rlog_FALSE"]:
+for name in ["norm", "vst_TRUE", "vst_FALSE", "vstlocal_TRUE", "vstlocal_FALSE", "vstmean_TRUE", "vstmean_FALSE", "fastvstparametric_TRUE", "fastvstparametric_FALSE", "fastvstlocal_TRUE", "fastvstlocal_FALSE", "fastvstmean_TRUE", "fastvstmean_FALSE", "rlog_TRUE", "rlog_FALSE"]:
     rp, up = os.path.join(TD, f"r_{name}.tsv"), os.path.join(TD, f"rust_{name}_{T}.tsv")
     if not os.path.exists(up):
-        print(f"transform/{name:14s} (no rust output)")
+        print(f"transform/{name:24s} (no rust output)")
         continue
     R, U = matrix(rp), matrix(up)
     d = max(abs(a - b) for g in R for a, b in zip(R[g], U[g]))
-    print(f"transform/{name:14s} max|diff| = {d:.3e}")
+    print(f"transform/{name:24s} max|diff| = {d:.3e}")

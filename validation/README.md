@@ -15,6 +15,8 @@ validation/run.sh "pixi run --manifest-path tool/deseq2/pixi.toml Rscript" /tmp/
 | `gen2.R` | Model-matrix cells: 16 samples with batch 4/4 (no replacement in R), unbalanced 2 vs 5 |
 | `gen3.R` | VST with `fitType = "local"` and `"mean"` |
 | `gen4.R` | Residual df 2-3 with realistic dispersion scatter (simulated prior-variance path) |
+| `gen5.R` | R's subsampling `vst(nsub = 1000)` for each fitType, blind and not |
+| `gen6.R` | Observation weights (4 vs 4, `useT`, `~batch + condition`) and `sfType = "iterate"` |
 | `run_rust.sh` | Runs the CLI on every scenario |
 | `compare.py` | Max abs difference per column, NA-pattern and padj < 0.1 mismatches |
 | `worst.py` | Genes with the largest difference in one column of one scenario |

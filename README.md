@@ -88,6 +88,7 @@ rust_deseq2 normalize -c counts.csv -o normalized.tsv
 | `--shrinkage` | Apply LFC shrinkage | `false` |
 | `--shrinkage-method` | Shrinkage: `normal`, `apeglm`, `ashr` | `normal` |
 | `--replace-outliers <BOOL>` | Replace Cook's distance outliers (`true`/`false`) | `true` |
+| `--weights <FILE>` | Observation weights, a genes × samples matrix in the count-matrix layout (R: `assays(dds)[["weights"]]`) | — |
 | `-o, --output` | Output file path | `deseq2_results.csv` |
 | `-a, --alpha` | Significance threshold | `0.1` |
 | `--maxit` | Max IRLS iterations (GLM + dispersion) | `100` |
@@ -118,10 +119,11 @@ rust_deseq2 normalize -c counts.csv -o normalized.tsv
 | `-o, --output` | Output file path | `vst_transformed.tsv` |
 | `--method` | Dispersion fitType: `parametric`, `mean`, `local` | `parametric` |
 | `--blind` | Blind to experimental design | `false` |
+| `--nsub <N>` | Fit the dispersion trend on N genes, as R's `vst(dds, nsub = N)` (R's default N is 1000) | — |
 
-This is R's `varianceStabilizingTransformation(dds, blind, fitType)`: the dispersion trend is
-fitted on all genes. R's faster `vst()`, which fits it on a subset of `nsub = 1000` genes, is not
-implemented, so values can differ slightly from `vst(dds)`.
+Without `--nsub` this is R's `varianceStabilizingTransformation(dds, blind, fitType)`: the
+dispersion trend is fitted on all genes. With `--nsub 1000` it is R's faster `vst(dds)`. Note that
+R's default is `blind = TRUE` for both, while this subcommand needs `--blind`.
 
 ### `rlog` — Regularized Log Transformation
 
@@ -211,37 +213,40 @@ release 0.1.0; "sig." counts genes called significant (padj < 0.1) by only one o
 |---|---|---:|---:|
 | 2 groups, `parametric` / `local` / `mean`, `--use-t` | matched | ≤ 6e-7 | 0 |
 | `~batch + condition` (Wald, LRT) | max \|ΔLFC\| 3.9e-4 | 5e-7 | 0 |
-| `~age + condition` (`--continuous`) | failed to run | 1.6e-4 ¹ | 0 |
+| `~age + condition` (`--continuous`, Wald and LRT) | failed to run | 8e-7 | 0 |
 | WT/KO/DKO, `KO vs WT` | 212 sig. differences | 5e-7 | 0 |
 | 3 levels, `C vs B` (no reference level) | rejected | 5e-7 | 0 |
 | `--lfc-threshold 1` | 5 sig., 116 padj-NA differences | 6e-7 | 0 |
 | 7 vs 7 with outliers, `parametric` / `local` | local: aborted | 7e-7 | 0 |
-| 16 samples, batch 4/4, outliers | max \|ΔLFC\| 3.56 | 3e-5 | 0 |
-| 2 vs 5 with outliers | 19 sig., 75 padj-NA differences | ¹ | 0 |
-| 2 vs 2, 2 vs 3 with dispersion scatter | 3 sig. / 116 padj-NA differences | 5e-7 / ¹ | 0 |
-| `--sf-type poscounts`, 30% zeros | 2 sig., 75 padj-NA differences | ¹ | 2 |
+| 16 samples, batch 4/4, outliers | max \|ΔLFC\| 3.56 | 5e-7 | 0 |
+| 2 vs 5 with outliers | 19 sig., 75 padj-NA differences | 5e-7 | 0 |
+| 2 vs 2, 2 vs 3 with dispersion scatter | 3 sig. / 116 padj-NA differences | 5e-7 / 7e-7 | 0 |
+| `--sf-type poscounts`, 30% zeros | 2 sig., 75 padj-NA differences | 1.2e-2 ¹ | 0 |
+| `--sf-type iterate`, 30% zeros | different algorithm | 8e-5 | 0 |
+| `--weights` (4 vs 4, `--use-t`, `~batch + condition`) | not supported | 5e-7 | 0 |
 | shrinkage `normal` / `apeglm` / `ashr` | 5e-7 / 4.2e-2 / 5.9e-2 | 5e-7 / 1.5e-6 / 1.8e-5 | 0 |
 | `apeglm` with `--covariate batch` | 5.84 (wrong coefficient) | 4e-6 | 0 |
-| VST `parametric` / `mean` / `local` | 6e-7 / 2.4 / 1.8e8 | 6e-7 / 6e-7 / 1e-3 | — |
+| VST `parametric` / `mean` / `local` | 6e-7 / 2.4 / 1.8e8 | 6e-7 / 6e-7 / 1e-3 ² | — |
+| `vst --nsub 1000` `parametric` / `mean` / `local` | not available | 6e-7 / 6e-7 / 1.4e-2 ² | — |
 | rlog (blind and not) | matched | 7e-8 | — |
 | `normalize` subcommand | failed to run | 5e-8 (relative) | — |
 
-¹ Apart from genes that are zero in one group or have a single non-zero count. Their MLE
-diverges (|LFC| ≈ 20-30), and R stops its `optim(method = "L-BFGS-B")` fallback at a different
-point than this port's L-BFGS (e.g. LFC 23.1 vs 30.0, the bound). Their p-values are NA or
-extreme in both, but through Cook's distances and the independent-filtering threshold they can
-change a few calls on very sparse data (the 2 poscounts differences above).
+¹ Genes with a single non-zero count, whose likelihood is nearly flat in the LFC (|LFC| ≈ 27).
+The L-BFGS-B fallback is a port of R's and reproduces R's result from R's starting values to
+1e-12, but the least-squares starting values differ from R's QR-based ones in the last bits,
+which these flat objectives amplify (R itself gives 27.3617 vs 27.3606 for one such gene fitted
+alone vs in the full data set). No p-value or significance call differs.
+
+² The local dispersion trend agrees with R's locfit within the data range (~1e-8 relative), but
+differs near and below the smallest mean, where the VST evaluates it; DE results are unaffected.
 
 ### Known differences from R
 
-- The optim fallback for non-converging GLM rows is a hand-written L-BFGS, not R's L-BFGS-B
-  (affects only degenerate genes, see ¹ above).
-- `vst` is `varianceStabilizingTransformation()`; R's subsampling `vst()` is not implemented.
-  The local-fit VST differs by ~1e-3 where the locfit approximation is evaluated outside the
-  data range.
-- `--sf-type iterate` is not R's `estimateSizeFactorsIterate` algorithm.
-- Observation weights, normalization factors (other than in `rlog`), `betaPrior = TRUE`,
-  expanded model matrices and interaction terms in the CLI are not supported.
+- Local-fit (`fitType = "local"`) dispersion trend near the lower end of the data, see ².
+- Shrinkage with `--weights`: `normal` and `apeglm` stop with an error (weighted `lfcShrink` is
+  not ported); `ashr` is allowed. VST and rlog do not take weights.
+- Normalization factors (other than in `rlog`), `betaPrior = TRUE`, expanded model matrices and
+  interaction terms in the CLI are not supported.
 
 ### Why Are There Small Numerical Differences?
 

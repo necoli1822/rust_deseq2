@@ -28,6 +28,10 @@ run outlier_batch16 $W --covariate batch
 run unbal_2v5 $W
 run small_var_2v2 $W
 run small_var_2v3 $W
+run iterate $W --sf-type iterate
+run weights $W --weights $D/weights/weights.csv
+run weights_use_t $W --use-t --weights $D/weights_use_t/weights.csv
+run weights_batch $W --covariate batch --weights $D/weights_batch/weights.csv
 TD=$D/transform
 "$B" normalize -c $TD/counts.csv -o $TD/rust_norm_$T.tsv >/dev/null 2>&1 || echo "normalize FAILED"
 "$B" vst -c $TD/counts.csv -m $TD/metadata.csv -d condition -o $TD/rust_vst_TRUE_$T.tsv --blind >/dev/null 2>&1 || echo "vst blind FAILED"
@@ -37,4 +41,8 @@ TD=$D/transform
 for ft in local mean; do
   "$B" vst -c $TD/counts.csv -m $TD/metadata.csv -d condition --method $ft --blind -o $TD/rust_vst${ft}_TRUE_$T.tsv >/dev/null 2>&1 || echo "vst $ft blind FAILED"
   "$B" vst -c $TD/counts.csv -m $TD/metadata.csv -d condition --method $ft -o $TD/rust_vst${ft}_FALSE_$T.tsv >/dev/null 2>&1 || echo "vst $ft FAILED"
+done
+for ft in parametric local mean; do
+  "$B" vst -c $TD/counts.csv -m $TD/metadata.csv -d condition --method $ft --nsub 1000 --blind -o $TD/rust_fastvst${ft}_TRUE_$T.tsv >/dev/null 2>&1 || echo "fast vst $ft blind FAILED"
+  "$B" vst -c $TD/counts.csv -m $TD/metadata.csv -d condition --method $ft --nsub 1000 -o $TD/rust_fastvst${ft}_FALSE_$T.tsv >/dev/null 2>&1 || echo "fast vst $ft FAILED"
 done
