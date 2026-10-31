@@ -226,8 +226,8 @@ release 0.1.0; "sig." counts genes called significant (padj < 0.1) by only one o
 | `--weights` (4 vs 4, `--use-t`, `~batch + condition`) | not supported | 5e-7 | 0 |
 | shrinkage `normal` / `apeglm` / `ashr` | 5e-7 / 4.2e-2 / 5.9e-2 | 5e-7 / 1.5e-6 / 1.8e-5 | 0 |
 | `apeglm` with `--covariate batch` | 5.84 (wrong coefficient) | 4e-6 | 0 |
-| VST `parametric` / `mean` / `local` | 6e-7 / 2.4 / 1.8e8 | 6e-7 / 6e-7 / 1e-3 ² | — |
-| `vst --nsub 1000` `parametric` / `mean` / `local` | not available | 6e-7 / 6e-7 / 1.4e-2 ² | — |
+| VST `parametric` / `mean` / `local` | 6e-7 / 2.4 / 1.8e8 | 6e-7 / 6e-7 / 5e-7 | — |
+| `vst --nsub 1000` `parametric` / `mean` / `local` | not available | 6e-7 / 6e-7 / 5e-7 | — |
 | rlog (blind and not) | matched | 7e-8 | — |
 | `normalize` subcommand | failed to run | 5e-8 (relative) | — |
 
@@ -237,8 +237,9 @@ The L-BFGS-B fallback is a port of R's and reproduces R's result from R's starti
 which these flat objectives amplify (R itself gives 27.3617 vs 27.3606 for one such gene fitted
 alone vs in the full data set). No p-value or significance call differs.
 
-² The local dispersion trend agrees with R's locfit within the data range (~1e-8 relative), but
-differs near and below the smallest mean, where the VST evaluates it; DE results are unaffected.
+The local (`fitType = "local"`) trend is a port of locfit's fit, including its global quadratic
+("parametric component") and evaluation tree, and equals R's bit for bit inside and outside the
+data range.
 
 ### Validation on public bacterial RNA-seq data
 
@@ -254,7 +255,7 @@ and runs the CLI. No scenario has a padj-NA or significance difference (padj < 0
 | *M. tuberculosis* GSE100097 (`~phase + carbon`, 12 samples) | Wald, LRT `~phase` | 5e-7 | 5e-7 |
 | *P. aeruginosa* GSE55197 | 2 vs 2, 6 vs 4 | 5e-7 | 5e-7 |
 | *E. coli* GSE220559 (11 groups × 3) | CIP vs CAZ, LRT | 5e-7 | 5e-7 |
-| *Salmonella* transforms | VST, `vst --nsub 1000`, rlog | 5e-7 / 7e-4 ² / 1e-9 | — |
+| *Salmonella* transforms | VST, `vst --nsub 1000`, rlog | 5e-7 / 5e-7 / 1e-9 | — |
 
 ³ A few genes have a log posterior of ~1e5 whose first line-search step is accepted or rejected
 at rounding level, so the outcome depends on the last bits of the inputs. R itself is not stable
@@ -267,7 +268,6 @@ determinant cutoff, `lgamma` is R's, and size factors are computed bit-identical
 
 ### Known differences from R
 
-- Local-fit (`fitType = "local"`) dispersion trend near the lower end of the data, see ².
 - Shrinkage with `--weights`: `normal` and `apeglm` stop with an error (weighted `lfcShrink` is
   not ported); `ashr` is allowed. VST and rlog do not take weights.
 - Normalization factors (other than in `rlog`), `betaPrior = TRUE`, expanded model matrices and

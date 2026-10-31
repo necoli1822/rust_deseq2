@@ -66,6 +66,11 @@ names the R function it now follows.
   which flipped rounding-level line-search decisions; the ashr weight solver could stall on a
   suboptimal mixture, and genes ash excludes now get the prior instead of NaN.
 
+- **Local dispersion trend** (`fitType = "local"`) now ports locfit's fit exactly, including
+  the global quadratic it subtracts before interpolating; the old version extrapolated the local
+  fit itself and diverged below the smallest mean (e.g. 167231 vs R's 130832 at mean 0.001),
+  which the VST evaluates (VST local off by up to 1.4e-2; now 5e-7).
+
 ### Added
 - `vst --nsub N`: R's `vst()`, which fits the dispersion trend on N genes (R's default 1000)
   spanning the range of mean counts. Without `--nsub`, `vst` remains
