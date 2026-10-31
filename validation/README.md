@@ -1,0 +1,28 @@
+# Validation against R DESeq2
+
+Simulated scenarios, one per code path, each run through R DESeq2 and the
+`rust_deseq2` CLI with equivalent settings.
+
+```bash
+validation/run.sh "Rscript" /tmp/deseq2-val
+# or with a pixi environment providing R + DESeq2 + apeglm + ashr:
+validation/run.sh "pixi run --manifest-path tool/deseq2/pixi.toml Rscript" /tmp/deseq2-val
+```
+
+| File | Role |
+|---|---|
+| `gen.R` | Base scenarios: fitTypes, `useT`, `lfcThreshold`, shrinkage, 3-level and LRT designs, batch and continuous covariates, outlier replacement/filtering, poscounts, WT/KO/DKO contrasts, 2 vs 2, VST/rlog/normalize |
+| `gen2.R` | Model-matrix cells: 16 samples with batch 4/4 (no replacement in R), unbalanced 2 vs 5 |
+| `gen3.R` | VST with `fitType = "local"` and `"mean"` |
+| `gen4.R` | Residual df 2-3 with realistic dispersion scatter (simulated prior-variance path) |
+| `run_rust.sh` | Runs the CLI on every scenario |
+| `compare.py` | Max abs difference per column, NA-pattern and padj < 0.1 mismatches |
+| `worst.py` | Genes with the largest difference in one column of one scenario |
+
+Columns of the `compare.py` table: `dLFC`, `dSE`, `dpadj` are max absolute
+differences; `dlog10p` is the max difference of log10 p-values; `NAmis` counts
+genes whose padj is NA in only one of R and Rust; `sigDis` counts genes called
+significant (padj < 0.1) by only one; `nSigR` is R's number of significant genes.
+
+Reference versions used for the results in the top-level README: R 4.5.3,
+DESeq2 1.50.2, apeglm 1.32.0, ashr 2.2-63, RcppNumerical 0.7-0.
