@@ -21,12 +21,10 @@ pub enum SizeFactorMethod {
 /// This is the standard DESeq2 normalization method that accounts for
 /// both sequencing depth and RNA composition bias.
 pub fn estimate_size_factors(dds: &mut DESeqDataSet, method: SizeFactorMethod) -> Result<()> {
-    let counts = dds.counts().counts();
-
     let size_factors = match method {
-        SizeFactorMethod::Ratio => estimate_size_factors_ratio(counts)?,
-        SizeFactorMethod::PosCounts => estimate_size_factors_poscounts(counts)?,
-        SizeFactorMethod::Iterate => estimate_size_factors_iterate(counts)?,
+        SizeFactorMethod::Ratio => estimate_size_factors_ratio(dds.counts().counts())?,
+        SizeFactorMethod::PosCounts => estimate_size_factors_poscounts(dds.counts().counts())?,
+        SizeFactorMethod::Iterate => estimate_size_factors_iterate(dds)?,
     };
 
     dds.set_size_factors(size_factors)?;
@@ -184,52 +182,99 @@ fn estimate_size_factors_poscounts(counts: ArrayView2<f64>) -> Result<Array1<f64
     Ok(size_factors)
 }
 
-/// Iterative method for sparse data
+/// Iterative size factor estimation for data where every gene has a zero
+/// R equivalent: estimateSizeFactorsIterate(object, niter = 10, Q = 0.05) in core.R
 ///
-/// NOTE: This implementation differs from R's estimateSizeFactorsIterate (core.R:2609-2640).
-/// R uses NB-likelihood optimization via IRLS fitting per gene to get fitted values,
-/// then computes new size factors from geometric means of (count/mu) ratios.
-/// This implementation uses iterative poscounts recalculation as an approximation.
-fn estimate_size_factors_iterate(counts: ArrayView2<f64>) -> Result<Array1<f64>> {
-    // Start with poscounts method
-    let mut size_factors = estimate_size_factors_poscounts(counts)?;
-    let n_samples = counts.ncols();
+/// With design ~1, alternately (1) estimate dispersions with fitType = "mean" given
+/// the current size factors, and (2) choose the size factors maximising the summed
+/// negative binomial log-likelihood of all genes above the Q = 5% quantile of
+/// per-gene log-likelihood, by optim(log(sf), fn, method = "L-BFGS-B",
+/// control = list(fnscale = -1)) with sf = exp(p - mean(p)). Stops when the squared
+/// change in log size factors is below 1e-4 (after at least two iterations).
+fn estimate_size_factors_iterate(dds: &DESeqDataSet) -> Result<Array1<f64>> {
+    use crate::dispersion::{estimate_dispersions, DispersionParams, TrendFitMethod};
+    use crate::optim::nmath::{dnbinom_mu_log, r_sum};
+    use crate::optim::{optim_lbfgsb, LbfgsbControl};
 
-    // Iterate to refine
-    for _ in 0..10 {
-        // Normalize counts
-        let mut normalized = counts.to_owned();
-        for j in 0..n_samples {
-            if size_factors[j] > 0.0 {
-                for i in 0..counts.nrows() {
-                    normalized[[i, j]] /= size_factors[j];
-                }
-            }
-        }
-
-        // Recalculate size factors
-        let new_sf = estimate_size_factors_poscounts(normalized.view())?;
-
-        // Update and check convergence
-        let mut max_diff = 0.0f64;
-        for j in 0..n_samples {
-            let adjustment = new_sf[j];
-            let new_val = size_factors[j] * adjustment;
-            max_diff = max_diff.max((new_val - size_factors[j]).abs());
-            size_factors[j] = new_val;
-        }
-
-        if max_diff < 1e-6 {
-            break;
-        }
+    const NITER: usize = 10;
+    const Q: f64 = 0.05;
+    let n_samples = dds.n_samples();
+    let counts = dds.counts().counts();
+    // idx <- rowSums(counts(object)) > 0
+    let idx: Vec<usize> = (0..dds.n_genes())
+        .filter(|&i| (0..n_samples).any(|j| counts[[i, j]] > 0.0))
+        .collect();
+    if idx.is_empty() {
+        return Err(DeseqError::SizeFactorFailed { reason: "all genes have zero counts".to_string() });
     }
 
-    // Re-center (geometric mean of size factors = 1)
-    let log_mean: f64 = size_factors.iter().map(|&x| x.ln()).sum::<f64>() / n_samples as f64;
-    let center = log_mean.exp();
-    size_factors.mapv_inplace(|x| x / center);
+    // design(object) <- ~ 1
+    let mut work = dds.clone();
+    work.set_design_matrix(ndarray::Array2::from_elem((n_samples, 1), 1.0))?;
 
-    Ok(size_factors)
+    let r_mean = |x: &[f64]| -> f64 {
+        // R's mean(): long-double sum / n, then one refinement pass
+        let n = x.len() as f64;
+        let s = r_sum(x.iter().copied()) / n;
+        s + r_sum(x.iter().map(|v| v - s)) / n
+    };
+
+    let mut sf = vec![1.0; n_samples];
+    for iter in 1..=NITER {
+        work.set_size_factors(Array1::from(sf.clone()))?;
+        estimate_dispersions(&mut work, TrendFitMethod::Mean, &DispersionParams::default())?;
+        let mu = work.mu().ok_or_else(|| DeseqError::SizeFactorFailed { reason: "mu not available".to_string() })?;
+        let disps = work.dispersions().ok_or_else(|| DeseqError::SizeFactorFailed {
+            reason: "dispersions not available".to_string(),
+        })?;
+        // q <- t(t(assays(object)[["mu"]]) / sf)[idx,]; disps <- dispersions(object)[idx]
+        let q: Vec<Vec<f64>> = idx.iter().map(|&i| (0..n_samples).map(|j| mu[[i, j]] / sf[j]).collect()).collect();
+        let size: Vec<f64> = idx.iter().map(|&i| 1.0 / disps[i]).collect();
+        let y: Vec<Vec<f64>> = idx.iter().map(|&i| (0..n_samples).map(|j| counts[[i, j]]).collect()).collect();
+
+        let objective = |p: &[f64]| -> f64 {
+            let m = r_mean(p);
+            let sf_new: Vec<f64> = p.iter().map(|v| (v - m).exp()).collect();
+            let gene_ll: Vec<f64> = (0..idx.len())
+                .map(|g| r_sum((0..n_samples).map(|j| dnbinom_mu_log(y[g][j], size[g], q[g][j] * sf_new[j]))))
+                .collect();
+            let threshold = quantile_type7(&gene_ll, Q);
+            r_sum(gene_ll.iter().copied().filter(|&ll| ll > threshold))
+        };
+
+        let sf_old = sf.clone();
+        let start: Vec<f64> = sf_old.iter().map(|v| v.ln()).collect();
+        let control = LbfgsbControl { fnscale: -1.0, ..Default::default() };
+        let res = optim_lbfgsb(&start, objective, None, &[f64::NEG_INFINITY], &[f64::INFINITY], &control)
+            .map_err(|e| DeseqError::SizeFactorFailed { reason: format!("iterative size factors: {:?}", e) })?;
+        if res.convergence != 0 {
+            return Err(DeseqError::SizeFactorFailed {
+                reason: "iterative size factor normalization did not converge within an iteration".to_string(),
+            });
+        }
+        let m = r_mean(&res.par);
+        sf = res.par.iter().map(|v| (v - m).exp()).collect();
+
+        let change: f64 = sf_old.iter().zip(&sf).map(|(a, b)| (a.ln() - b.ln()).powi(2)).sum();
+        if iter > 1 && change < 1e-4 {
+            break;
+        } else if iter == NITER {
+            return Err(DeseqError::SizeFactorFailed {
+                reason: "iterative size factor normalization did not converge".to_string(),
+            });
+        }
+    }
+    Ok(Array1::from(sf))
+}
+
+/// R's quantile(x, p) with the default type 7
+fn quantile_type7(x: &[f64], p: f64) -> f64 {
+    let mut v = x.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let h = (v.len() - 1) as f64 * p;
+    let lo = h.floor() as usize;
+    let hi = (lo + 1).min(v.len() - 1);
+    v[lo] + (h - lo as f64) * (v[hi] - v[lo])
 }
 
 #[cfg(test)]
