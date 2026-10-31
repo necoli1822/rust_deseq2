@@ -177,7 +177,11 @@ pub fn vst_subsampled(dds: &DESeqDataSet, method: VstMethod, nsub: usize) -> Res
     let selected: Vec<usize> = (0..nsub)
         .map(|k| {
             let pos = if k == nsub - 1 { n as f64 } else { 1.0 + k as f64 * by };
-            kept[pos.round_ties_even() as usize - 1]
+            // R's round() rounds halves to even (f64::round_ties_even needs Rust 1.77)
+            let floor = pos.floor();
+            let frac = pos - floor;
+            let rounded = if frac > 0.5 || (frac == 0.5 && floor % 2.0 != 0.0) { floor + 1.0 } else { floor };
+            kept[rounded as usize - 1]
         })
         .collect();
 
