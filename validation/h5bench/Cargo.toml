@@ -3,13 +3,15 @@ name = "h5bench"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Compare pure-Rust HDF5 readers on kallisto abundance.h5 files"
+description = "Compare the pure-Rust HDF5 readers hdf5-pure and rust-hdf5"
 
 [dependencies]
-hdf5-reader = "0.11"
 hdf5-pure = "0.47"
 rust-hdf5 = "0.7"
-hdf5-rust = "2"
+
+[features]
+# rust-hdf5's rayon-parallel chunk decompression
+par = ["rust-hdf5/parallel"]
 
 [profile.release]
 debug = false
