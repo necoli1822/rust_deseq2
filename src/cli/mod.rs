@@ -310,6 +310,13 @@ Examples:
                 Use blind=true for QC (PCA, sample clustering).\n\
                 Use blind=false when design is expected to explain variance.")]
         blind: bool,
+
+        /// Fit the dispersion trend on N genes (R's vst()); omit for the full VST
+        #[arg(long, value_name = "N",
+            long_help = "Estimate the dispersion trend on a subset of N genes, as R's\n\
+                vst(object, nsub = N) does (R's default N is 1000), then transform all genes.\n\
+                Omit to fit the trend on all genes, as varianceStabilizingTransformation() does.")]
+        nsub: Option<usize>,
     },
 
     /// Apply Regularized Log Transformation (rlog)

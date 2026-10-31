@@ -6,5 +6,5 @@
 mod vst;
 mod rlog;
 
-pub use vst::{vst, VstMethod, VstResult};
+pub use vst::{vst, vst_subsampled, VstMethod, VstResult};
 pub use rlog::{rlog, RlogResult};

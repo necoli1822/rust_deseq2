@@ -133,7 +133,8 @@ fn main() {
             output,
             method,
             blind,
-        }) => run_vst(&counts, &metadata, &design, &output, &method, blind),
+            nsub,
+        }) => run_vst(&counts, &metadata, &design, &output, &method, blind, nsub),
         Some(Commands::Rlog {
             counts,
             metadata,
@@ -776,8 +777,9 @@ fn run_vst(
     output_path: &str,
     method: &str,
     blind: bool,
+    nsub: Option<usize>,
 ) -> Result<()> {
-    use rust_deseq2::transform::{vst, VstMethod};
+    use rust_deseq2::transform::{vst, vst_subsampled, VstMethod};
 
     info!("Loading count matrix from: {}", counts_path);
     let counts = read_count_matrix(counts_path)?;
@@ -814,16 +816,21 @@ fn run_vst(
         let intercept_design = Array2::from_elem((n_samples, 1), 1.0);
         dds.set_design_matrix(intercept_design)?;
     }
-    // R: varianceStabilizingTransformation(dds, fitType=...) estimates the dispersion
-    // trend with that fitType; the transformation then follows the fitted trend.
-    let trend_method = match vst_method {
-        VstMethod::Parametric => TrendFitMethod::Parametric,
-        VstMethod::Mean => TrendFitMethod::Mean,
-        VstMethod::Local => TrendFitMethod::Local,
+    let vst_result = match nsub {
+        // R: vst(dds, blind, nsub, fitType) fits the trend on a gene subset
+        Some(nsub) => vst_subsampled(&dds, vst_method, nsub)?,
+        None => {
+            // R: varianceStabilizingTransformation(dds, fitType=...) estimates the
+            // dispersion trend with that fitType; the transformation follows it.
+            let trend_method = match vst_method {
+                VstMethod::Parametric => TrendFitMethod::Parametric,
+                VstMethod::Mean => TrendFitMethod::Mean,
+                VstMethod::Local => TrendFitMethod::Local,
+            };
+            estimate_dispersions(&mut dds, trend_method, &DispersionParams::default())?;
+            vst(&dds, vst_method, blind)?
+        }
     };
-    estimate_dispersions(&mut dds, trend_method, &DispersionParams::default())?;
-
-    let vst_result = vst(&dds, vst_method, blind)?;
 
     info!("Writing VST-transformed data to: {}", output_path);
 

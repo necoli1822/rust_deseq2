@@ -133,6 +133,80 @@ pub fn vst(dds: &DESeqDataSet, method: VstMethod, _blind: bool) -> Result<VstRes
     })
 }
 
+/// Variance stabilizing transformation with the dispersion trend fitted on a
+/// subset of genes
+/// R equivalent: vst(object, blind, nsub, fitType) in vst.R
+///
+/// R keeps the genes with mean normalized count > 5, orders them by that mean and
+/// takes the `nsub` at positions round(seq(1, n, length.out = nsub)). Gene-wise
+/// dispersions and the trend (no MAP step) are estimated on that subset with the
+/// full data's size factors and the design already set on `dds` (an intercept-only
+/// design for a blind transformation), and the trend is then applied to all genes.
+pub fn vst_subsampled(dds: &DESeqDataSet, method: VstMethod, nsub: usize) -> Result<VstResult> {
+    use crate::dispersion::{estimate_gene_dispersions, fit_dispersion_trend, DispersionParams, TrendFitMethod};
+
+    if nsub < 2 {
+        return Err(DeseqError::InvalidInput { reason: "nsub must be at least 2".to_string() });
+    }
+    if dds.n_genes() < nsub {
+        return Err(DeseqError::InvalidInput {
+            reason: "less than 'nsub' rows, it is recommended to use the full VST directly".to_string(),
+        });
+    }
+    let size_factors = dds.size_factors().ok_or_else(|| DeseqError::InvalidInput {
+        reason: "Size factors must be estimated before VST".to_string(),
+    })?;
+    let counts = dds.counts().counts();
+    let base_means: Vec<f64> = (0..dds.n_genes())
+        .map(|i| (0..dds.n_samples()).map(|j| counts[[i, j]] / size_factors[j]).sum::<f64>() / dds.n_samples() as f64)
+        .collect();
+
+    // object.sub <- object[baseMean > 5,]; o <- order(baseMean)  (order() is stable)
+    let mut kept: Vec<usize> = (0..dds.n_genes()).filter(|&i| base_means[i] > 5.0).collect();
+    if kept.len() < nsub {
+        return Err(DeseqError::InvalidInput {
+            reason: "less than 'nsub' rows with mean normalized count > 5, it is recommended to use the full VST directly"
+                .to_string(),
+        });
+    }
+    kept.sort_by(|&a, &b| base_means[a].partial_cmp(&base_means[b]).unwrap());
+
+    // idx <- o[round(seq(from = 1, to = length(o), length.out = nsub))]  (1-based, round half to even)
+    let n = kept.len();
+    let by = (n as f64 - 1.0) / (nsub as f64 - 1.0);
+    let selected: Vec<usize> = (0..nsub)
+        .map(|k| {
+            let pos = if k == nsub - 1 { n as f64 } else { 1.0 + k as f64 * by };
+            kept[pos.round_ties_even() as usize - 1]
+        })
+        .collect();
+
+    let sub_counts = dds.counts().subset_genes(&selected)?;
+    let mut sub = DESeqDataSet::new(sub_counts, dds.sample_metadata().clone(), dds.design_variable())?;
+    sub.set_size_factors(size_factors.clone())?;
+    if let Some(design) = dds.design_matrix() {
+        sub.set_design_matrix(design.clone())?;
+    }
+    let trend_method = match method {
+        VstMethod::Parametric => TrendFitMethod::Parametric,
+        VstMethod::Mean => TrendFitMethod::Mean,
+        VstMethod::Local => TrendFitMethod::Local,
+    };
+    estimate_gene_dispersions(&mut sub, &DispersionParams::default())?;
+    fit_dispersion_trend(&mut sub, trend_method)?;
+
+    // dispersionFunction(object) <- dispersionFunction(object.sub)
+    let trend = sub.dispersion_trend().cloned().ok_or_else(|| DeseqError::TrendFittingFailed {
+        reason: "no dispersion trend fitted on the gene subset".to_string(),
+    })?;
+    let mut full = dds.clone();
+    if let DispersionTrend::Parametric { asympt_disp, extra_pois } = trend {
+        full.set_dispersion_function(asympt_disp, extra_pois);
+    }
+    full.set_dispersion_trend(trend);
+    vst(&full, method, false)
+}
+
 /// Parametric VST transformation
 /// DESeq2 formula: log2((1 + e + 2*a*q + 2*sqrt(a*q*(1 + e + a*q))) / (4*a))
 /// where a = asymptotic dispersion, e = extra Poisson term, q = normalized count
