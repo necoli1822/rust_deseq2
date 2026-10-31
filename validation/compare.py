@@ -59,7 +59,23 @@ for s in sorted(os.listdir(D)):
         sigdis += sa != sb
     print(f"{s:24s} {dl:9.2e} {dse:9.2e} {dp:9.2e} {dq:9.2e} {namis:6d} {sigdis:6d} {nsig:6d}")
 
+# Matrix outputs (VST, rlog, normalized counts) of other scenarios: r_<name>.tsv vs rust_<name>_<tag>.tsv
+for s in sorted(os.listdir(D)):
+    d = os.path.join(D, s)
+    if s == "transform" or not os.path.isdir(d):
+        continue
+    for f in sorted(os.listdir(d)):
+        name = f[2:-4]
+        up = os.path.join(d, f"rust_{name}_{T}.tsv")
+        if not (f.startswith("r_") and f.endswith(".tsv")) or name == "results" or not os.path.exists(up):
+            continue
+        R, U = matrix(os.path.join(d, f)), matrix(up)
+        dm = max(abs(a - b) for g in R for a, b in zip(R[g], U[g]))
+        print(f"{s + '/' + name:34s} max|diff| = {dm:.3e}")
+
 TD = os.path.join(D, "transform")
+if not os.path.isdir(TD):
+    sys.exit(0)
 for name in ["norm", "vst_TRUE", "vst_FALSE", "vstlocal_TRUE", "vstlocal_FALSE", "vstmean_TRUE", "vstmean_FALSE", "fastvstparametric_TRUE", "fastvstparametric_FALSE", "fastvstlocal_TRUE", "fastvstlocal_FALSE", "fastvstmean_TRUE", "fastvstmean_FALSE", "rlog_TRUE", "rlog_FALSE"]:
     rp, up = os.path.join(TD, f"r_{name}.tsv"), os.path.join(TD, f"rust_{name}_{T}.tsv")
     if not os.path.exists(up):

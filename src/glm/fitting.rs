@@ -56,7 +56,7 @@ fn nb_log_likelihood_for_deviance(y: f64, mu: f64, size: f64) -> f64 {
 /// but may be less stable for rank-deficient or near-collinear designs.
 pub fn fit_glm(dds: &mut DESeqDataSet, params: &GlmFitParams) -> Result<DesignInfo> {
     // Check prerequisites
-    if !dds.has_size_factors() {
+    if !dds.has_size_or_norm_factors() {
         return Err(DeseqError::GLMConvergenceFailed {
             gene_id: "N/A".to_string(),
             reason: "Size factors must be estimated first".to_string(),
@@ -94,7 +94,6 @@ pub fn fit_glm(dds: &mut DESeqDataSet, params: &GlmFitParams) -> Result<DesignIn
 
     // Get data
     let counts = dds.counts().counts();
-    let size_factors = dds.size_factors().unwrap();
     let dispersions = dds.dispersions().unwrap();
     let n_genes = dds.n_genes();
     // R (fitNbinomGLMs): getAndCheckWeights() weights, normalised by row maximum.
@@ -110,7 +109,9 @@ pub fn fit_glm(dds: &mut DESeqDataSet, params: &GlmFitParams) -> Result<DesignIn
             let gene_counts = counts.row(i);
             let alpha = dispersions[i];
             let w = gene_weights(weights.as_ref(), weights_fail, i);
-            fit_single_gene_weighted(gene_counts, &design, size_factors.view(), alpha, params, w.as_deref())
+            // R: normalizationFactors <- getSizeOrNormFactors(object)
+            let nf = dds.gene_norm_factors(i).unwrap();
+            fit_single_gene_weighted(gene_counts, &design, nf, alpha, params, w.as_deref())
         })
         .collect();
 
@@ -192,6 +193,8 @@ pub fn fit_single_gene(
 
 /// Fit the NB GLM of one gene with optional observation weights (normalised
 /// by row maximum, as getAndCheckWeights() returns them).
+/// `size_factors` is the gene's row of getSizeOrNormFactors(): the size
+/// factors, or the gene's normalization factors (the fit's offset is their log).
 /// R equivalent: fitNbinomGLMs() for one row with `useWeights`: the IRLS weights
 /// are `weights * mu/(1 + alpha*mu)` (C++ fitBeta), the convergence deviance,
 /// the logLike and the optim() objective are weighted sums, and the hat
@@ -715,13 +718,26 @@ pub fn refit_glm_with_prior(
     design: &Array2<f64>,
     lambda: &[f64],
 ) -> Result<(Array2<f64>, Array2<f64>)> {
+    refit_glm_with_prior_counts(dds, dds.counts().counts(), design, lambda)
+}
+
+/// [`refit_glm_with_prior`] on the given counts (genes x samples) instead of the
+/// dataset's. After outlier replacement R's counts(dds) are the original counts
+/// again, and lfcShrink(type = "normal") fits those with the refitted dispersions.
+pub fn refit_glm_with_prior_counts(
+    dds: &DESeqDataSet,
+    counts: ndarray::ArrayView2<f64>,
+    design: &Array2<f64>,
+    lambda: &[f64],
+) -> Result<(Array2<f64>, Array2<f64>)> {
     let n_genes = dds.n_genes();
     let n_coefs = design.ncols();
 
-    let counts = dds.counts().counts();
-    let size_factors = dds.size_factors().ok_or_else(|| DeseqError::InvalidInput {
-        reason: "Size factors required for GLM refit".to_string(),
-    })?;
+    if !dds.has_size_or_norm_factors() {
+        return Err(DeseqError::InvalidInput {
+            reason: "Size factors required for GLM refit".to_string(),
+        });
+    }
     let dispersions = dds.dispersions().ok_or_else(|| DeseqError::InvalidInput {
         reason: "Dispersions required for GLM refit".to_string(),
     })?;
@@ -732,7 +748,7 @@ pub fn refit_glm_with_prior(
         .map(|i| {
             let gene_counts = counts.row(i);
             let alpha = dispersions[i];
-            fit_single_gene_with_lambda(gene_counts, design, size_factors.view(), alpha, lambda)
+            fit_single_gene_with_lambda(gene_counts, design, dds.gene_norm_factors(i).unwrap(), alpha, lambda)
         })
         .collect();
 

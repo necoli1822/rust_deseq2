@@ -6,6 +6,28 @@
 /// qnorm(0.975) - the 97.5th percentile of the standard normal
 const QNORM_0975: f64 = 1.959963984540054;
 
+/// Mean as R's rowMeans()/mean() compute it: a long-double accumulation divided
+/// by n, rounded once to double. Emulated with a compensated (double-double) sum
+/// and an exact remainder for the division, which gives the correctly rounded mean.
+pub(crate) fn ld_mean(values: impl IntoIterator<Item = f64>) -> f64 {
+    let (mut hi, mut lo, mut n) = (0.0f64, 0.0f64, 0usize);
+    for v in values {
+        let s = hi + v;
+        let bb = s - hi;
+        lo += (hi - (s - bb)) + (v - bb);
+        hi = s;
+        n += 1;
+    }
+    if !hi.is_finite() {
+        return hi / n as f64;
+    }
+    let nf = n as f64;
+    let q = hi / nf;
+    // remainder of (hi + lo) - q * n, exactly via fused multiply-add
+    let r = (-q).mul_add(nf, hi) + lo;
+    q + r / nf
+}
+
 /// Weighted quantile matching R's Hmisc.wtd.quantile with type='quantile' and normwt=TRUE.
 /// R equivalent: Hmisc::wtd.quantile() used in core.R
 ///

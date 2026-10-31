@@ -82,7 +82,7 @@ pub struct VstResult {
 /// ```
 pub fn vst(dds: &DESeqDataSet, method: VstMethod, _blind: bool) -> Result<VstResult> {
     // Check prerequisites
-    if !dds.has_size_factors() {
+    if !dds.has_size_or_norm_factors() {
         return Err(DeseqError::InvalidInput {
             reason: "Size factors must be estimated before VST".to_string(),
         });
@@ -91,18 +91,9 @@ pub fn vst(dds: &DESeqDataSet, method: VstMethod, _blind: bool) -> Result<VstRes
         reason: "Dispersions must be estimated before VST (R: call estimateDispersions)".to_string(),
     })?;
 
-    let n_genes = dds.n_genes();
-    let n_samples = dds.n_samples();
-    let counts = dds.counts().counts();
-    let size_factors = dds.size_factors().unwrap();
-
-    // Calculate normalized counts
-    let mut norm_counts = Array2::zeros((n_genes, n_samples));
-    for i in 0..n_genes {
-        for j in 0..n_samples {
-            norm_counts[[i, j]] = counts[[i, j]] / size_factors[j];
-        }
-    }
+    // R: ncounts <- counts(object, normalized = TRUE) (divided by the
+    // normalization factors when they are set)
+    let norm_counts = dds.normalized_counts().unwrap().clone();
 
     let (used, transformed, disp_intercept, extra_pois) = match trend {
         DispersionTrend::Parametric { asympt_disp, extra_pois } => (
@@ -114,7 +105,7 @@ pub fn vst(dds: &DESeqDataSet, method: VstMethod, _blind: bool) -> Result<VstRes
         DispersionTrend::Mean(alpha) => (VstMethod::Mean, vst_mean(&norm_counts, *alpha), *alpha, 0.0),
         DispersionTrend::Local(_) => (
             VstMethod::Local,
-            vst_local(&norm_counts, trend, size_factors),
+            vst_local(&norm_counts, trend, &dds.vst_size_factors().unwrap()),
             f64::NAN,
             f64::NAN,
         ),
@@ -153,12 +144,15 @@ pub fn vst_subsampled(dds: &DESeqDataSet, method: VstMethod, nsub: usize) -> Res
             reason: "less than 'nsub' rows, it is recommended to use the full VST directly".to_string(),
         });
     }
-    let size_factors = dds.size_factors().ok_or_else(|| DeseqError::InvalidInput {
-        reason: "Size factors must be estimated before VST".to_string(),
-    })?;
-    let counts = dds.counts().counts();
+    if !dds.has_size_or_norm_factors() {
+        return Err(DeseqError::InvalidInput {
+            reason: "Size factors must be estimated before VST".to_string(),
+        });
+    }
+    // baseMean <- rowMeans(counts(object, normalized = TRUE))
+    let norm_counts = dds.normalized_counts().unwrap();
     let base_means: Vec<f64> = (0..dds.n_genes())
-        .map(|i| (0..dds.n_samples()).map(|j| counts[[i, j]] / size_factors[j]).sum::<f64>() / dds.n_samples() as f64)
+        .map(|i| (0..dds.n_samples()).map(|j| norm_counts[[i, j]]).sum::<f64>() / dds.n_samples() as f64)
         .collect();
 
     // object.sub <- object[baseMean > 5,]; o <- order(baseMean)  (order() is stable)
@@ -187,7 +181,14 @@ pub fn vst_subsampled(dds: &DESeqDataSet, method: VstMethod, nsub: usize) -> Res
 
     let sub_counts = dds.counts().subset_genes(&selected)?;
     let mut sub = DESeqDataSet::new(sub_counts, dds.sample_metadata().clone(), dds.design_variable())?;
-    sub.set_size_factors(size_factors.clone())?;
+    // object.sub keeps the size factors, or the selected rows of the
+    // normalization factors
+    if let Some(sf) = dds.size_factors() {
+        sub.set_size_factors(sf.clone())?;
+    }
+    if let Some(nf) = dds.normalization_factors() {
+        sub.set_normalization_factors(nf.select(ndarray::Axis(0), &selected))?;
+    }
     if let Some(design) = dds.design_matrix() {
         sub.set_design_matrix(design.clone())?;
     }

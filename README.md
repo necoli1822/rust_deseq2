@@ -16,7 +16,10 @@ A pure Rust implementation of the [DESeq2](https://bioconductor.org/packages/rel
 - **Multi-factor designs**: batch correction with categorical and continuous covariates
 - **t-distribution p-values**: more conservative testing for small samples (`--use-t`)
 - **Transformations**: VST (Variance Stabilizing Transformation), rlog (Regularized Log)
-- **Normalization**: median-of-ratios, positive counts, iterative methods
+- **Normalization**: median-of-ratios, positive counts, iterative methods; gene- and
+  sample-specific normalization factors (`normalizationFactors`) in every fit
+- **Input**: count matrix, htseq-count files, salmon quantifications summarized to genes
+  (tximport) or tximport matrices
 - **Convenience functions**: fpkm, fpm, collapseReplicates
 - **100% significance agreement** with R DESeq2 across all validated datasets
 - **8-12x faster**, **~90x less memory** than R DESeq2
@@ -69,6 +72,18 @@ rust_deseq2 normalize -c counts.csv -o normalized.tsv
 # htseq-count output files instead of a count matrix (R: DESeqDataSetFromHTSeqCount)
 rust_deseq2 run --htseq sample_table.csv --htseq-dir counts/ -d condition \
   --numerator treated --denominator control
+
+# salmon quant.sf files (R: tximport(type = "salmon") + DESeqDataSetFromTximport)
+rust_deseq2 run --salmon samples.csv --salmon-dir quants/ --tx2gene tx2gene.csv \
+  -d condition --numerator treated --denominator control
+
+# tximport matrices written from R (txi$counts, txi$length)
+rust_deseq2 run -c txi_counts.csv -m metadata.csv --avg-tx-length txi_length.csv \
+  -d condition --numerator treated --denominator control
+
+# Gene- and sample-specific normalization factors (R: normalizationFactors(dds) <- nf)
+rust_deseq2 run -c counts.csv -m metadata.csv --norm-factors nf.csv \
+  -d condition --numerator treated --denominator control
 ```
 
 ## CLI Reference
@@ -81,6 +96,12 @@ rust_deseq2 run --htseq sample_table.csv --htseq-dir counts/ -d condition \
 | `-m, --metadata` | Sample metadata CSV file | *required* ³ |
 | `--htseq <SAMPLE_TABLE>` | htseq-count files listed in a sample table, instead of `-c`/`-m` (see [Input File Format](#input-file-format)) | — |
 | `--htseq-dir <DIR>` | Directory of the files named in the sample table | `.` |
+| `--salmon <SAMPLE_TABLE>` | salmon `quant.sf` files listed in a sample table, summarized to genes as `tximport(type = "salmon")` does, instead of `-c`/`-m` (needs `--tx2gene`) | — |
+| `--salmon-dir <DIR>` | Directory the `quant.sf` paths of the sample table are relative to | `.` |
+| `--tx2gene <FILE>` | Transcript-to-gene table for `--salmon` (columns 1-2: transcript, gene) | — |
+| `--avg-tx-length <FILE>` | tximport `txi$length`, a genes × samples matrix, for a `-c` matrix of `txi$counts`: counts are rounded and the lengths give normalization factors (implies `--tximport`) | — |
+| `--tximport` | The `-c` counts are tximport counts: round them (without lengths: `countsFromAbundance = "scaledTPM"`/`"lengthScaledTPM"`) | `false` |
+| `--norm-factors <FILE>` | Normalization factors, a genes × samples matrix in the count-matrix layout, used instead of size factors (R: `normalizationFactors(dds) <- nf`; `--sf-type` is then ignored) | — |
 | `-d, --design` | Design variable (column in metadata) | *required* |
 | `--covariate` | Categorical covariate for batch correction | — |
 | `--continuous` | Continuous covariate | — |
@@ -107,8 +128,10 @@ rust_deseq2 run --htseq sample_table.csv --htseq-dir counts/ -d condition \
 | `--upper-quantile` | Upper quantile for beta prior variance | `0.05` |
 | `-t, --threads` | Number of threads (0 = auto) | `0` |
 
-³ Unless `--htseq` is given. `vst` and `rlog` take `--htseq`/`--htseq-dir` the same way, and
-`normalize` takes them in place of `-c`.
+³ Unless `--htseq` or `--salmon` is given. `vst` and `rlog` take the input options
+(`--htseq`, `--salmon`, `--avg-tx-length`, `--tximport`, `--norm-factors`) the same way, and
+`normalize` takes them in place of `-c` (without `-m`). Non-integer `-c` counts are an error, as
+in R's `DESeqDataSetFromMatrix()`, unless `--tximport` or `--avg-tx-length` is given.
 
 ### `normalize` — Normalize counts
 
@@ -175,6 +198,50 @@ In each file the first column is the gene ID and the last the count, so files wr
 `--additional-attr` work. The gene IDs must be the same, in the same order, in every file. The
 counter rows (IDs starting with `_`, such as `__no_feature`, and the pre-0.6 names `no_feature`,
 `ambiguous`, `too_low_aQual`, `not_aligned`, `alignment_not_unique`) are dropped.
+
+### salmon quantifications (`--salmon`)
+R's `tximport(files, type = "salmon", tx2gene = tx2gene)` with its defaults
+(`countsFromAbundance = "no"`, `txOut = FALSE`, `ignoreTxVersion = FALSE`), followed by
+`DESeqDataSetFromTximport(txi, colData, design)`. The sample table names the sample in column 1
+and its `quant.sf` (relative to `--salmon-dir`) in column 2; the remaining columns are the sample
+variables:
+```
+sample,file,condition
+sample1,sample1/quant.sf,control
+sample2,sample2/quant.sf,control
+sample3,sample3/quant.sf,treated
+```
+The `--tx2gene` table (CSV or TSV) maps the transcript in column 1 to the gene in column 2, by
+position; a header row is optional and further columns are ignored. As in tximport:
+- `quant.sf` columns are found by name: `Name`, `EffectiveLength`, `TPM`, `NumReads`, and every
+  file must list the same transcripts in the same order; numbers are parsed as R's
+  `read.delim()` parses them;
+- transcripts missing from tx2gene are dropped, and for a transcript listed twice the first row
+  is used; genes are sorted as R sorts factor levels;
+- gene counts and abundances are the sums over the gene's transcripts, and the gene length is
+  the abundance-weighted mean of their effective lengths. Where a gene has zero abundance in a
+  sample, the length is the geometric mean of its lengths in the other samples, or, when it is
+  zero in every sample, the mean over its transcripts of their mean effective length.
+
+Then, as in `DESeqDataSetFromTximport()`, the counts are rounded (halves to even) and the gene
+lengths are stored as `avgTxLength`: size factor estimation (`--sf-type ratio` or `poscounts`)
+produces normalization factors, `estimateNormFactors(counts, normMatrix = avgTxLength /
+exp(rowMeans(log(avgTxLength))))`; `--sf-type iterate` ignores the lengths, as in R.
+
+### tximport matrices (`--avg-tx-length`, `--tximport`)
+For other quantifiers, or to import in R and analyse here, write `txi$counts` as the `-c` count
+matrix and `txi$length` as a matrix of the same layout for `--avg-tx-length`. With
+`countsFromAbundance = "scaledTPM"` or `"lengthScaledTPM"`, R's `DESeqDataSetFromTximport()`
+uses just the counts: pass `-c` with `--tximport`.
+
+### Normalization factors (`--norm-factors`)
+A genes × samples matrix in the layout of the count matrix (gene and sample IDs must match it).
+The factors replace the size factors wherever R uses `getSizeOrNormFactors()`: as the GLM
+offset `log(nf)` in the dispersion, Wald/LRT, Cook's distance, outlier-refit and shrinkage fits,
+in the normalized counts (`counts / nf`, so in baseMean, the VST and rlog), in
+`momentsDispEstimate()` (`mean(1/colMeans(nf))`) and in the outlier replacement values
+(`trimBaseMean * nf`). They are used as given: like R's `normalizationFactors<-`, no centering is
+applied (R's vignette suggests dividing them by their row geometric means first).
 
 ## Benchmark
 
@@ -249,6 +316,10 @@ release 0.1.0; "sig." counts genes called significant (padj < 0.1) by only one o
 | `--sf-type iterate`, 30% zeros | different algorithm | 8e-5 | 0 |
 | `--weights` (4 vs 4, `--use-t`, `~batch + condition`) | not supported | 5e-7 | 0 |
 | `--htseq` input (`~batch + condition`, VST, normalize) | not supported | 5e-7 | 0 |
+| `--salmon` input (tximport, Wald, VST `parametric` / `local` / `--nsub`, rlog, normalize) | not supported | 5e-7 | 0 |
+| `-c --avg-tx-length` (`ratio`, `poscounts`), `-c --tximport` (`lengthScaledTPM`) | not supported | 5e-7 | 0 |
+| `--norm-factors`, 7 vs 7 with outlier replacement (Wald, LRT, `local`, `--weights`, `~batch + condition`, VST, rlog) | not used in the fits | 5e-7 | 0 |
+| shrinkage `normal` / `apeglm` after outlier replacement | fitted the replaced counts (ΔLFC up to 4.4) | 5e-7 / 8e-7 | 0 |
 | shrinkage `normal` / `apeglm` / `ashr` | 5e-7 / 4.2e-2 / 5.9e-2 | 5e-7 / 1.5e-6 / 1.8e-5 | 0 |
 | `apeglm` with `--covariate batch` | 5.84 (wrong coefficient) | 4e-6 | 0 |
 | VST `parametric` / `mean` / `local` | 6e-7 / 2.4 / 1.8e8 | 6e-7 / 6e-7 / 5e-7 | — |
@@ -295,8 +366,12 @@ determinant cutoff, `lgamma` is R's, and size factors are computed bit-identical
 
 - Shrinkage with `--weights`: `normal` and `apeglm` stop with an error (weighted `lfcShrink` is
   not ported); `ashr` is allowed. VST and rlog do not take weights.
-- Normalization factors (other than in `rlog`), `betaPrior = TRUE`, expanded model matrices and
-  interaction terms in the CLI are not supported.
+- `betaPrior = TRUE`, expanded model matrices and interaction terms in the CLI are not supported.
+- tximport: only salmon `quant.sf` files are read directly, with `countsFromAbundance = "no"`;
+  inferential replicates are not read (they do not change the counts, abundances or lengths).
+  `quant.sf` numbers are parsed as `read.delim()` does (R's `R_strtod`), which is what tximport
+  uses without the readr package; with readr installed tximport parses with `readr::read_tsv`,
+  which was not compared and may differ in the last bit.
 
 ### Why Are There Small Numerical Differences?
 
@@ -327,6 +402,10 @@ Key equivalences between R DESeq2 and RustDESeq2:
 | `lfcShrink(type="apeglm")` | `shrink_lfc_apeglm()` | Apeglm shrinkage |
 | `lfcShrink(type="ashr")` | `apply_ashr_shrinkage()` | Ashr shrinkage |
 | `DESeqDataSetFromHTSeqCount()` | `io::read_htseq_count()` / CLI `--htseq` | Counts from htseq-count files |
+| `tximport(type = "salmon")` | `io::read_salmon()`, `io::tximport::tximport_salmon()` / CLI `--salmon` | salmon quantifications summarized to genes |
+| `DESeqDataSetFromTximport()` | `DESeqDataSet::set_avg_tx_length()` / CLI `--salmon`, `--avg-tx-length`, `--tximport` | Rounded counts and `avgTxLength` |
+| `estimateNormFactors()` | `normalization::estimate_norm_factors()` | Normalization factors from `avgTxLength` |
+| `normalizationFactors<-` | `DESeqDataSet::set_normalization_factors()` / CLI `--norm-factors` | Gene- and sample-specific normalization factors |
 | `varianceStabilizingTransformation()` | `vst()` | VST |
 | `rlog()` | `rlog()` | Regularized log |
 | `fpkm()` | `fpkm()` | FPKM normalization |

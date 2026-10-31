@@ -1,6 +1,6 @@
 //! DESeqDataSet - Main data structure for differential expression analysis
 
-use ndarray::{Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, ArrayView1};
 use std::collections::HashMap;
 
 use super::{CountMatrix, GeneMetadata, SampleMetadata};
@@ -34,8 +34,11 @@ pub struct DESeqDataSet {
     size_factors: Option<Array1<f64>>,
     /// Custom normalization factors matrix (genes x samples)
     /// R equivalent: normalizationFactors(dds)
-    /// When set, used instead of size factors for normalization
+    /// When set, used instead of size factors everywhere R uses getSizeOrNormFactors()
     normalization_factors: Option<Array2<f64>>,
+    /// Average transcript lengths (genes x samples) from tximport
+    /// R equivalent: assays(dds)[["avgTxLength"]] (DESeqDataSetFromTximport)
+    avg_tx_length: Option<Array2<f64>>,
     /// Normalized counts (counts / size_factors or counts / normalization_factors)
     normalized_counts: Option<Array2<f64>>,
     /// Raw observation weights (genes x samples), as supplied
@@ -140,6 +143,7 @@ impl DESeqDataSet {
             reference_levels: HashMap::new(),
             size_factors: None,
             normalization_factors: None,
+            avg_tx_length: None,
             normalized_counts: None,
             weights: None,
             weights_fail: None,
@@ -205,6 +209,92 @@ impl DESeqDataSet {
     /// R equivalent: normalizationFactors()
     pub fn normalization_factors(&self) -> Option<&Array2<f64>> {
         self.normalization_factors.as_ref()
+    }
+
+    /// The factors gene `i` is fitted with: its row of the normalization factors
+    /// when they are set, otherwise the size factors (the same for every gene).
+    /// The offset of every GLM / dispersion fit is the log of these.
+    /// R equivalent: getSizeOrNormFactors(object)[i, ]
+    pub fn gene_norm_factors(&self, i: usize) -> Option<ArrayView1<'_, f64>> {
+        match &self.normalization_factors {
+            Some(nf) => Some(nf.row(i)),
+            None => self.size_factors.as_ref().map(|sf| sf.view()),
+        }
+    }
+
+    /// Size or normalization factors as a genes x samples matrix
+    /// R equivalent: getSizeOrNormFactors(object)
+    pub fn size_or_norm_factors(&self) -> Option<Array2<f64>> {
+        match &self.normalization_factors {
+            Some(nf) => Some(nf.clone()),
+            None => self.size_factors.as_ref().map(|sf| {
+                Array2::from_shape_fn((self.n_genes(), self.n_samples()), |(_, j)| sf[j])
+            }),
+        }
+    }
+
+    /// Whether size factors or normalization factors are available, so the data
+    /// can be normalized (R's DESeq() then skips estimateSizeFactors()).
+    pub fn has_size_or_norm_factors(&self) -> bool {
+        self.size_factors.is_some() || self.normalization_factors.is_some()
+    }
+
+    /// xim of momentsDispEstimate() for the genes `genes` (R's objectNZ):
+    /// mean(1/colMeans(normalizationFactors(object))) with normalization factors,
+    /// otherwise mean(1/sizeFactors(object)).
+    /// R equivalent: the xim of momentsDispEstimate() in core.R
+    pub fn moments_xim(&self, genes: &[usize]) -> Option<f64> {
+        if let Some(nf) = &self.normalization_factors {
+            let n = self.n_samples();
+            if genes.is_empty() {
+                return Some(f64::NAN);
+            }
+            let inv: Vec<f64> = (0..n)
+                .map(|j| 1.0 / crate::stats::ld_mean(genes.iter().map(|&i| nf[[i, j]])))
+                .collect();
+            return Some(crate::stats::ld_mean(inv));
+        }
+        let sf = self.size_factors.as_ref()?;
+        Some(sf.iter().map(|&s| 1.0 / s.max(1e-10)).sum::<f64>() / sf.len() as f64)
+    }
+
+    /// Size factors as the local-fit VST uses them: the size factors, or without
+    /// them exp(colMeans(log(normalizationFactors(object)))).
+    /// R equivalent: the sf of getVarianceStabilizedData() for fitType "local"
+    pub fn vst_size_factors(&self) -> Option<Array1<f64>> {
+        if let Some(sf) = &self.size_factors {
+            return Some(sf.clone());
+        }
+        let nf = self.normalization_factors.as_ref()?;
+        Some(Array1::from_shape_fn(self.n_samples(), |j| {
+            crate::stats::ld_mean(nf.column(j).iter().map(|x| x.ln())).exp()
+        }))
+    }
+
+    /// Average transcript lengths from tximport, if set
+    /// R equivalent: assays(dds)[["avgTxLength"]]
+    pub fn avg_tx_length(&self) -> Option<&Array2<f64>> {
+        self.avg_tx_length.as_ref()
+    }
+
+    /// Set the average transcript lengths (genes x samples), which make
+    /// estimate_size_factors() compute normalization factors.
+    /// R equivalent: assays(object)[["avgTxLength"]] <- lengths in
+    /// DESeqDataSetFromTximport() (with stopifnot(all(lengths > 0)))
+    pub fn set_avg_tx_length(&mut self, lengths: Array2<f64>) -> Result<()> {
+        if lengths.nrows() != self.n_genes() || lengths.ncols() != self.n_samples() {
+            return Err(DeseqError::DimensionMismatch {
+                expected: format!("{}x{} average transcript length matrix", self.n_genes(), self.n_samples()),
+                got: format!("{}x{}", lengths.nrows(), lengths.ncols()),
+            });
+        }
+        if lengths.iter().any(|&x| x.is_nan() || x <= 0.0 || x.is_infinite()) {
+            return Err(DeseqError::InvalidInput {
+                reason: "average transcript lengths must be positive finite values".to_string(),
+            });
+        }
+        self.avg_tx_length = Some(lengths);
+        Ok(())
     }
 
     pub fn gene_dispersions(&self) -> Option<&Array1<f64>> {
@@ -436,9 +526,11 @@ impl DESeqDataSet {
 
     /// Set normalization factors matrix (genes x samples)
     /// R equivalent: normalizationFactors<-()
-    /// When set, these are used instead of size factors for normalization.
+    /// When set, these are used instead of size factors for normalization and as
+    /// the offsets of every fit. They are stored as given: like R, no centering is
+    /// applied (R's vignette suggests dividing by the row geometric means first).
     /// The matrix should have dimensions (n_genes, n_samples).
-    pub fn set_normalization_factors(&mut self, mut nf: Array2<f64>) -> Result<()> {
+    pub fn set_normalization_factors(&mut self, nf: Array2<f64>) -> Result<()> {
         if nf.nrows() != self.n_genes() || nf.ncols() != self.n_samples() {
             return Err(DeseqError::InvalidInput {
                 reason: format!(
@@ -447,23 +539,11 @@ impl DESeqDataSet {
                 ),
             });
         }
+        // R: stopifnot(all(!is.na(value))); all(is.finite(value)); all(value > 0)
         if nf.iter().any(|&x| x.is_nan() || x.is_infinite() || x <= 0.0) {
             return Err(DeseqError::InvalidInput {
                 reason: "normalization factors must be positive finite values".to_string(),
             });
-        }
-        // Center by row-wise geometric mean (R: nf / exp(rowMeans(log(nf))))
-        let (n_genes, n_samples) = nf.dim();
-        for i in 0..n_genes {
-            let row_log_mean = nf.row(i).iter()
-                .map(|&x| x.ln())
-                .sum::<f64>() / n_samples as f64;
-            let center = row_log_mean.exp();
-            if center > 0.0 && center.is_finite() {
-                for j in 0..n_samples {
-                    nf[[i, j]] /= center;
-                }
-            }
         }
         self.normalization_factors = Some(nf);
         self.compute_normalized_counts();
@@ -619,11 +699,12 @@ impl DESeqDataSet {
         let n_samples = self.n_samples();
 
         // If normalization_factors are set, use them instead of size_factors
+        // R: counts(object, normalized = TRUE) is cnts / normalizationFactors(object)
         if let Some(nf) = &self.normalization_factors {
             let mut normalized = raw.to_owned();
             for i in 0..n_genes {
                 for j in 0..n_samples {
-                    normalized[[i, j]] /= nf[[i, j]].max(1e-10);
+                    normalized[[i, j]] /= nf[[i, j]];
                 }
             }
             self.normalized_counts = Some(normalized);
@@ -661,9 +742,15 @@ impl DESeqDataSet {
     /// Used for outlier replacement
     pub fn replace_count(&mut self, gene_idx: usize, sample_idx: usize, new_value: f64) -> Result<()> {
         self.counts.set_count(gene_idx, sample_idx, new_value)?;
-        // Recompute normalized counts if size factors are available
-        if self.size_factors.is_some() {
-            self.compute_normalized_counts();
+        // Update the normalized count of this entry (counts / factor, as
+        // compute_normalized_counts() computes it)
+        let factor = match (&self.normalization_factors, &self.size_factors) {
+            (Some(nf), _) => Some(nf[[gene_idx, sample_idx]]),
+            (None, Some(sf)) if sf[sample_idx] > 0.0 => Some(sf[sample_idx]),
+            _ => None,
+        };
+        if let (Some(f), Some(nc)) = (factor, self.normalized_counts.as_mut()) {
+            nc[[gene_idx, sample_idx]] = new_value / f;
         }
         Ok(())
     }
@@ -756,25 +843,20 @@ mod tests {
         assert!(dds.normalization_factors().is_some());
         assert!(dds.normalized_counts().is_some());
 
-        // After centering, each row's geometric mean should be ~1.0
+        // Stored as given (R's normalizationFactors<- does not center them)
         let stored_nf = dds.normalization_factors().unwrap();
-        for i in 0..dds.n_genes() {
-            let row_geo_mean = (stored_nf.row(i).iter()
-                .map(|&x| x.ln())
-                .sum::<f64>() / dds.n_samples() as f64).exp();
-            assert!((row_geo_mean - 1.0).abs() < 1e-9,
-                "Row {} geometric mean should be ~1.0, got {}", i, row_geo_mean);
-        }
+        assert_eq!(stored_nf, &nf);
 
-        // Verify normalized counts are computed using the CENTERED normalization factors
+        // Normalized counts are counts / normalizationFactors
         let normalized = dds.normalized_counts().unwrap();
         let counts = dds.counts().counts();
         for i in 0..dds.n_genes() {
             for j in 0..dds.n_samples() {
-                let expected = counts[[i, j]] / stored_nf[[i, j]];
-                assert!((normalized[[i, j]] - expected).abs() < 1e-9);
+                assert_eq!(normalized[[i, j]], counts[[i, j]] / nf[[i, j]]);
             }
         }
+        // Every gene is fitted with its own row of factors
+        assert_eq!(dds.gene_norm_factors(2).unwrap().to_vec(), nf.row(2).to_vec());
     }
 
     #[test]
@@ -787,7 +869,7 @@ mod tests {
         let normalized_with_sf = dds.normalized_counts().unwrap().clone();
 
         // Then set normalization factors - should override
-        // Use non-uniform rows so centering produces distinct values
+        // Normalization factors replace the size factors (they are not centered)
         let nf = array![
             [1.0, 2.0, 3.0, 4.0],
             [1.5, 2.5, 3.5, 4.5],
@@ -797,6 +879,7 @@ mod tests {
         let normalized_with_nf = dds.normalized_counts().unwrap();
 
         // Results should be different since normalization factors override size factors
-        assert_ne!(normalized_with_sf[[0, 0]], normalized_with_nf[[0, 0]]);
+        assert_ne!(normalized_with_sf[[0, 1]], normalized_with_nf[[0, 1]]);
+        assert_eq!(normalized_with_nf[[0, 1]], 200.0 / 2.0);
     }
 }

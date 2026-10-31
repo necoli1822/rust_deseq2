@@ -85,7 +85,7 @@ impl GeneEstWeights {
 /// R equivalent: estimateDispersionsGeneEst() in core.R
 /// with alternating optimization (matching R DESeq2)
 pub fn estimate_gene_dispersions(dds: &mut DESeqDataSet, params: &DispersionParams) -> Result<()> {
-    if !dds.has_size_factors() {
+    if !dds.has_size_or_norm_factors() {
         return Err(DeseqError::DispersionEstimationFailed {
             gene_id: "N/A".to_string(),
             reason: "Size factors must be estimated first".to_string(),
@@ -93,7 +93,6 @@ pub fn estimate_gene_dispersions(dds: &mut DESeqDataSet, params: &DispersionPara
     }
 
     let counts = dds.counts().counts();
-    let size_factors = dds.size_factors().unwrap();
     let n_genes = dds.n_genes();
     let n_samples = dds.n_samples();
 
@@ -108,10 +107,6 @@ pub fn estimate_gene_dispersions(dds: &mut DESeqDataSet, params: &DispersionPara
             design.nrows()
         );
     }
-
-    // Pre-compute xim (mean of 1/sizeFactors) for momentsDispEstimate
-    let sf_slice = size_factors.as_slice().unwrap();
-    let xim: f64 = sf_slice.iter().map(|&s| 1.0 / s.max(1e-10)).sum::<f64>() / n_samples as f64;
 
     // Observation weights (R: getAndCheckWeights): normalised by row maximum;
     // genes whose weights do not allow estimation are treated as allZero.
@@ -130,6 +125,16 @@ pub fn estimate_gene_dispersions(dds: &mut DESeqDataSet, params: &DispersionPara
         ok.into_iter().map(|o| !o).collect()
     });
     let base_mean_counts = dds.base_mean_counts().map(|c| c.into_owned());
+
+    // xim of momentsDispEstimate(objectNZ): mean(1/sizeFactors), or with
+    // normalization factors mean(1/colMeans(nf)) over the genes that are fitted
+    // (not allZero, which includes the genes whose weights fail)
+    let nz_genes: Vec<usize> = (0..n_genes)
+        .filter(|&i| {
+            counts.row(i).iter().any(|&c| c != 0.0) && !weights_fail.as_ref().is_some_and(|f| f[i])
+        })
+        .collect();
+    let xim = dds.moments_xim(&nz_genes).unwrap();
 
     // Check if design supports linear mu (simple group model)
     // R: linearMu is forced FALSE when weights are used
@@ -150,7 +155,8 @@ pub fn estimate_gene_dispersions(dds: &mut DESeqDataSet, params: &DispersionPara
                 }
                 _ => None,
             };
-            estimate_dispersion_gene(&gene_counts, sf_slice, &design, xim, n_samples, use_linear_mu, params, gene_weights.as_ref())
+            let nf = dds.gene_norm_factors(i).unwrap().to_vec();
+            estimate_dispersion_gene(&gene_counts, &nf, &design, xim, n_samples, use_linear_mu, params, gene_weights.as_ref())
         })
         .collect();
 

@@ -3,7 +3,7 @@
 use clap::Parser;
 use log::{info, LevelFilter};
 
-use rust_deseq2::cli::{Cli, Commands, InputArgs};
+use rust_deseq2::cli::{Cli, Commands, InputArgs, TximportArgs};
 use rust_deseq2::filter::{calculate_cooks_distance, default_cooks_cutoff, filter_by_cooks_with_counts, n_or_more_in_cell, replace_outliers};
 use rust_deseq2::prelude::*;
 
@@ -125,9 +125,10 @@ fn main() {
             counts,
             htseq,
             htseq_dir,
+            tx,
             output,
             method,
-        }) => run_normalize(counts.as_deref(), htseq.as_deref(), &htseq_dir, &output, &method),
+        }) => run_normalize(counts.as_deref(), htseq.as_deref(), &htseq_dir, &tx, &output, &method),
         Some(Commands::Vst {
             input,
             design,
@@ -219,22 +220,116 @@ fn print_long_help() {
 // Subcommand implementations
 // ---------------------------------------------------------------------------
 
+/// Counts, sample metadata and (tximport) average transcript lengths
+struct LoadedInput {
+    counts: CountMatrix,
+    /// None for `normalize -c`, which takes no metadata
+    metadata: Option<SampleMetadata>,
+    /// txi$length (R: assays(dds)[["avgTxLength"]])
+    avg_tx_length: Option<ndarray::Array2<f64>>,
+}
+
 /// Read the counts and sample metadata: a count matrix with a metadata table, or
 /// htseq-count files listed in a sample table (R: DESeqDataSetFromHTSeqCount)
-fn load_input(input: &InputArgs) -> Result<(CountMatrix, SampleMetadata)> {
-    if let Some(table) = &input.htseq {
-        return load_htseq(table, &input.htseq_dir);
-    }
-    let counts_path = input.counts.as_deref().expect("clap requires --counts or --htseq");
-    let metadata_path = input.metadata.as_deref().ok_or_else(|| DeseqError::InvalidInput {
+fn load_input(input: &InputArgs) -> Result<(CountMatrix, SampleMetadata, Option<ndarray::Array2<f64>>)> {
+    let loaded = load_counts(input.counts.as_deref(), input.metadata.as_deref(), input.htseq.as_deref(), &input.htseq_dir, &input.tx)?;
+    let metadata = loaded.metadata.ok_or_else(|| DeseqError::InvalidInput {
         reason: "--metadata is required with --counts".to_string(),
     })?;
-    info!("Loading count matrix from: {}", counts_path);
-    let counts = read_count_matrix(counts_path)?;
-    info!("  {} genes, {} samples", counts.n_genes(), counts.n_samples());
-    info!("Loading metadata from: {}", metadata_path);
-    let metadata = read_metadata(metadata_path)?;
-    Ok((counts, metadata))
+    Ok((loaded.counts, metadata, loaded.avg_tx_length))
+}
+
+/// Read counts from -c (with -m), --htseq or --salmon.
+/// R: DESeqDataSetFromMatrix() rejects non-integer counts ("some values in assay are
+/// not integers"); tximport counts (--salmon, --avg-tx-length, --tximport) are
+/// rounded first, as DESeqDataSetFromTximport() does with round(txi$counts).
+fn load_counts(
+    counts_path: Option<&str>,
+    metadata_path: Option<&str>,
+    htseq: Option<&str>,
+    htseq_dir: &str,
+    tx: &TximportArgs,
+) -> Result<LoadedInput> {
+    use rust_deseq2::io::tximport::r_round;
+    if let Some(table) = &tx.salmon {
+        let tx2gene = tx.tx2gene.as_deref().expect("clap requires --tx2gene with --salmon");
+        info!("Loading salmon quantifications listed in {} (directory {}, tx2gene {})", table, tx.salmon_dir, tx2gene);
+        let (txi, metadata) = rust_deseq2::io::read_salmon(table, &tx.salmon_dir, tx2gene)?;
+        info!("  {} genes, {} samples (tximport, countsFromAbundance = \"no\")", txi.gene_ids.len(), txi.sample_ids.len());
+        let counts = CountMatrix::new(txi.counts.mapv(r_round), txi.gene_ids, txi.sample_ids)?;
+        return Ok(LoadedInput { counts, metadata: Some(metadata), avg_tx_length: Some(txi.length) });
+    }
+    let tximport = tx.tximport || tx.avg_tx_length.is_some();
+    let (counts, metadata) = match (counts_path, htseq) {
+        (_, Some(table)) => {
+            let (counts, metadata) = load_htseq(table, htseq_dir)?;
+            (counts, Some(metadata))
+        }
+        (Some(path), None) => {
+            info!("Loading count matrix from: {}", path);
+            let counts = if tximport {
+                // DESeqDataSetFromTximport(): counts <- round(txi$counts)
+                info!("  tximport counts: rounding them");
+                rust_deseq2::io::read_tximport_counts(path)?
+            } else {
+                read_count_matrix(path)?
+            };
+            info!("  {} genes, {} samples", counts.n_genes(), counts.n_samples());
+            let metadata = match metadata_path {
+                Some(m) => {
+                    info!("Loading metadata from: {}", m);
+                    Some(read_metadata(m)?)
+                }
+                None => None,
+            };
+            (counts, metadata)
+        }
+        (None, None) => unreachable!("clap requires --counts, --htseq or --salmon"),
+    };
+    // R: DESeqDataSetFromMatrix() stops with "some values in assay are not integers"
+    if counts.counts().iter().any(|&x| x != r_round(x)) {
+        return Err(DeseqError::InvalidCountMatrix {
+            reason: "some values in the count matrix are not integers (for tximport counts use \
+                     --tximport or --avg-tx-length)"
+                .to_string(),
+        });
+    }
+    let avg_tx_length = match &tx.avg_tx_length {
+        Some(path) => {
+            info!("Loading average transcript lengths from: {}", path);
+            Some(rust_deseq2::io::read_aligned_matrix(path, counts.gene_ids(), counts.sample_ids(), "average transcript length")?)
+        }
+        None => None,
+    };
+    Ok(LoadedInput { counts, metadata, avg_tx_length })
+}
+
+/// Attach the tximport lengths and, if given, the normalization factors; then
+/// estimate size factors unless normalization factors were supplied.
+/// R: DESeqDataSetFromTximport() stores assays(dds)[["avgTxLength"]];
+/// normalizationFactors(dds) <- nf; DESeq() skips estimateSizeFactors() when
+/// size or normalization factors are already set.
+fn normalize_dataset(
+    dds: &mut DESeqDataSet,
+    avg_tx_length: Option<ndarray::Array2<f64>>,
+    tx: &TximportArgs,
+    sf_method: SizeFactorMethod,
+    sf_name: &str,
+) -> Result<()> {
+    if let Some(lengths) = avg_tx_length {
+        dds.set_avg_tx_length(lengths)?;
+    }
+    if let Some(path) = &tx.norm_factors {
+        info!("Loading normalization factors from: {} (size factor estimation skipped)", path);
+        let nf = rust_deseq2::io::read_aligned_matrix(path, dds.counts().gene_ids(), dds.counts().sample_ids(), "normalization factor")?;
+        return dds.set_normalization_factors(nf);
+    }
+    if dds.avg_tx_length().is_some() && sf_method != SizeFactorMethod::Iterate {
+        info!("Estimating normalization factors from the average transcript lengths (method: {})...", sf_name);
+    } else {
+        info!("Estimating size factors (method: {})...", sf_name);
+    }
+    estimate_size_factors(dds, sf_method)
 }
 
 fn load_htseq(table: &str, directory: &str) -> Result<(CountMatrix, SampleMetadata)> {
@@ -303,7 +398,7 @@ fn run_analysis(
         }
     }
 
-    let (counts, mut metadata) = load_input(input)?;
+    let (counts, mut metadata, avg_tx_length) = load_input(input)?;
 
     // read_metadata keeps every column as a categorical factor. Columns named by
     // --continuous are numeric covariates (R: a numeric colData column), so
@@ -422,8 +517,7 @@ fn run_analysis(
         "iterate" => SizeFactorMethod::Iterate,
         _ => SizeFactorMethod::Ratio,
     };
-    info!("Estimating size factors (method: {})...", sf_type);
-    estimate_size_factors(&mut dds, sf_method)?;
+    normalize_dataset(&mut dds, avg_tx_length, &input.tx, sf_method, sf_type)?;
 
     let trend_method = match fit_type {
         "local" => TrendFitMethod::Local,
@@ -589,7 +683,7 @@ fn run_analysis(
             .map(|levels| levels.len())
             .unwrap_or(0);
         let is_two_level_design = covariates.is_empty() && continuous_vars.is_empty() && n_levels == 2;
-        let counts = original_counts.unwrap_or_else(|| dds.counts().counts().to_owned());
+        let counts = original_counts.clone().unwrap_or_else(|| dds.counts().counts().to_owned());
         filter_by_cooks_with_counts(
             &mut results,
             &cooks,
@@ -622,11 +716,15 @@ fn run_analysis(
         independent_filtering(&mut results, alpha);
     }
 
+    // After a refit R's counts(dds) are the original counts again
+    // (refitWithoutOutliers restores them), and lfcShrink() fits those with the
+    // refitted dispersions and MLE.
+    let shrink_counts = if refit_done { original_counts.as_ref() } else { None };
     if shrinkage && test_type == "wald" {
         match shrinkage_method {
             "apeglm" => {
                 info!("Applying apeglm LFC shrinkage...");
-                use rust_deseq2::shrinkage::{shrink_lfc_apeglm, ApeglmParams};
+                use rust_deseq2::shrinkage::{shrink_lfc_apeglm_with_counts, ApeglmParams};
                 let params = ApeglmParams::default();
                 // apeglm shrinks one coefficient (R: lfcShrink(coef=...)), so it must be
                 // the coefficient the Wald contrast reported. A reversed contrast
@@ -637,7 +735,7 @@ fn run_analysis(
                     numerator.unwrap(),
                     denominator.unwrap(),
                 )?;
-                shrink_lfc_apeglm(&dds, &mut results, coef_idx, &params)?;
+                shrink_lfc_apeglm_with_counts(&dds, shrink_counts, &mut results, coef_idx, &params)?;
                 if sign < 0.0 {
                     results.log2_fold_changes.iter_mut().for_each(|lfc| *lfc = -*lfc);
                 }
@@ -654,7 +752,7 @@ fn run_analysis(
                 // coefficient and leaves the MLE in place, which would be written out as if
                 // it were shrunken. Fail here instead.
                 rust_deseq2::glm::get_contrast_index(&design_info, numerator.unwrap(), denominator.unwrap())?;
-                shrink_lfc_normal(&dds, &design_info, &mut results, upper_quantile);
+                rust_deseq2::shrinkage::shrink_lfc_normal_with_counts(&dds, shrink_counts, &design_info, &mut results, upper_quantile);
             }
         }
     }
@@ -758,19 +856,11 @@ fn run_normalize(
     counts_path: Option<&str>,
     htseq: Option<&str>,
     htseq_dir: &str,
+    tx: &TximportArgs,
     output_path: &str,
     method: &str,
 ) -> Result<()> {
-    let counts = match (counts_path, htseq) {
-        (_, Some(table)) => load_htseq(table, htseq_dir)?.0,
-        (Some(path), None) => {
-            info!("Loading count matrix from: {}", path);
-            let counts = read_count_matrix(path)?;
-            info!("  {} genes, {} samples", counts.n_genes(), counts.n_samples());
-            counts
-        }
-        (None, None) => unreachable!("clap requires --counts or --htseq"),
-    };
+    let LoadedInput { counts, avg_tx_length, .. } = load_counts(counts_path, None, htseq, htseq_dir, tx)?;
 
     // Size factors do not depend on the design, but DESeqDataSet requires a
     // design variable that exists in the metadata, so supply a single-level one.
@@ -791,8 +881,7 @@ fn run_normalize(
         }
     };
 
-    info!("Estimating size factors using {} method...", method);
-    estimate_size_factors(&mut dds, size_method)?;
+    normalize_dataset(&mut dds, avg_tx_length, tx, size_method, method)?;
 
     info!("Writing normalized counts to: {}", output_path);
 
@@ -828,13 +917,12 @@ fn run_vst(
 ) -> Result<()> {
     use rust_deseq2::transform::{vst, vst_subsampled, VstMethod};
 
-    let (counts, metadata) = load_input(input)?;
+    let (counts, metadata, avg_tx_length) = load_input(input)?;
 
     info!("Creating DESeqDataSet with design: ~ {}", design);
     let mut dds = DESeqDataSet::new(counts, metadata, design)?;
 
-    info!("Estimating size factors...");
-    estimate_size_factors(&mut dds, SizeFactorMethod::Ratio)?;
+    normalize_dataset(&mut dds, avg_tx_length, &input.tx, SizeFactorMethod::Ratio, "ratio")?;
 
     let vst_method = match method {
         "parametric" => VstMethod::Parametric,
@@ -902,7 +990,7 @@ fn run_rlog(
 ) -> Result<()> {
     use rust_deseq2::transform::rlog;
 
-    let (counts, metadata) = load_input(input)?;
+    let (counts, metadata, avg_tx_length) = load_input(input)?;
 
     let mut dds = if blind {
         let mut blind_meta = metadata.clone();
@@ -915,8 +1003,7 @@ fn run_rlog(
         DESeqDataSet::new(counts, metadata, design)?
     };
 
-    info!("Estimating size factors...");
-    estimate_size_factors(&mut dds, SizeFactorMethod::Ratio)?;
+    normalize_dataset(&mut dds, avg_tx_length, &input.tx, SizeFactorMethod::Ratio, "ratio")?;
 
     info!(
         "Applying rlog transformation (blind: {})...",

@@ -56,8 +56,9 @@ use prelude::*;
 /// Run the complete DESeq2 analysis pipeline
 /// R equivalent: DESeq() in core.R
 pub fn run_deseq(dds: &mut DESeqDataSet) -> Result<DesignInfo> {
-    // Step 1: Estimate size factors (skip if already set, matching R DESeq2 behavior)
-    if !dds.has_size_factors() {
+    // Step 1: Estimate size factors (skip if size or normalization factors are
+    // already set, matching R DESeq2 behavior)
+    if !dds.has_size_or_norm_factors() {
         estimate_size_factors(dds, SizeFactorMethod::Ratio)?;
     }
 

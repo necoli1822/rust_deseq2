@@ -110,13 +110,13 @@ fn read_htseq_file(path: &Path) -> Result<(Vec<String>, Vec<f64>)> {
 }
 
 /// A delimited table with a header (CSV or TSV, auto-detected), quotes stripped
-fn read_table(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+pub(crate) fn read_table(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
     let text = fs::read_to_string(path).map_err(|e| DeseqError::InvalidInput {
         reason: format!("Cannot read sample table {}: {}", path.display(), e),
     })?;
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     let header_line = lines.next().ok_or_else(|| DeseqError::EmptyData {
-        reason: "Empty HTSeq sample table".to_string(),
+        reason: "Empty sample table".to_string(),
     })?;
     let delimiter = if header_line.contains('\t') { '\t' } else { ',' };
     let clean = |s: &str| s.trim().trim_matches('"').trim_matches('\'').to_string();

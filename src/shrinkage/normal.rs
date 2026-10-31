@@ -7,7 +7,7 @@
 //! 4. Only LFC and SE change; stat/pvalue are preserved from MLE
 
 use crate::data::DESeqDataSet;
-use crate::glm::{get_contrast_index, refit_glm_with_prior, DesignInfo};
+use crate::glm::{get_contrast_index, refit_glm_with_prior_counts, DesignInfo};
 use crate::io::DESeqResults;
 use crate::stats::match_weighted_upper_quantile_for_variance;
 
@@ -23,6 +23,21 @@ use crate::stats::match_weighted_upper_quantile_for_variance;
 /// * `results` - Results to update (LFC and SE are replaced; stat/pvalue preserved)
 /// * `upper_quantile` - Upper quantile for beta prior variance estimation (default 0.05)
 pub fn shrink_lfc_normal(dds: &DESeqDataSet, design_info: &DesignInfo, results: &mut DESeqResults, upper_quantile: f64) {
+    shrink_lfc_normal_with_counts(dds, None, design_info, results, upper_quantile)
+}
+
+/// [`shrink_lfc_normal`] whose GLM refit uses `fit_counts` instead of the dataset's
+/// counts. After outlier replacement, R's counts(dds) are the original counts again
+/// (refitWithoutOutliers restores them), so lfcShrink(type = "normal") refits the
+/// original counts with the refitted dispersions, MLE betas and baseMean.
+/// R equivalent: lfcShrink(type="normal") after DESeq() replaced outliers
+pub fn shrink_lfc_normal_with_counts(
+    dds: &DESeqDataSet,
+    fit_counts: Option<&ndarray::Array2<f64>>,
+    design_info: &DesignInfo,
+    results: &mut DESeqResults,
+    upper_quantile: f64,
+) {
     let n_genes = results.gene_ids.len();
     let n_samples = dds.n_samples();
 
@@ -181,7 +196,8 @@ pub fn shrink_lfc_normal(dds: &DESeqDataSet, design_info: &DesignInfo, results: 
     // ---------------------------------------------------------------
     // Step 3: Re-fit GLM with per-coefficient lambda
     // ---------------------------------------------------------------
-    let refit_result = refit_glm_with_prior(dds, &design, &lambda);
+    let counts = fit_counts.map(|c| c.view()).unwrap_or_else(|| dds.counts().counts());
+    let refit_result = refit_glm_with_prior_counts(dds, counts, &design, &lambda);
 
     match refit_result {
         Ok((new_coefficients, new_standard_errors)) => {

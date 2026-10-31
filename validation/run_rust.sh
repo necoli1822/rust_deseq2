@@ -36,6 +36,36 @@ HD=$D/htseq
 "$B" run --htseq $HD/sample_table.csv --htseq-dir $HD/files $W --covariate batch -o $HD/rust_$T.tsv > $HD/rust_$T.log 2>&1 || echo "htseq: FAILED"
 "$B" vst --htseq $HD/sample_table.csv --htseq-dir $HD/files -d condition --blind -o $HD/rust_vst_$T.tsv > /dev/null 2>&1 || echo "htseq vst: FAILED"
 "$B" normalize --htseq $HD/sample_table.csv --htseq-dir $HD/files -o $HD/rust_norm_$T.tsv > /dev/null 2>&1 || echo "htseq normalize: FAILED"
+SD=$D/tximport_salmon
+SALMON="--salmon $SD/sample_table.csv --salmon-dir $SD/files --tx2gene $SD/tx2gene.csv"
+if [ -d "$SD" ]; then
+  "$B" run $SALMON $W -o $SD/rust_$T.tsv > $SD/rust_$T.log 2>&1 || echo "tximport_salmon: FAILED"
+  "$B" vst $SALMON -d condition --blind -o $SD/rust_vst_$T.tsv > /dev/null 2>&1 || echo "salmon vst: FAILED"
+  "$B" vst $SALMON -d condition --blind --method local -o $SD/rust_vstlocal_$T.tsv > /dev/null 2>&1 || echo "salmon vst local: FAILED"
+  "$B" vst $SALMON -d condition --blind --nsub 500 -o $SD/rust_fastvst_$T.tsv > /dev/null 2>&1 || echo "salmon vst nsub: FAILED"
+  "$B" rlog $SALMON -d condition --blind -o $SD/rust_rlog_$T.tsv > /dev/null 2>&1 || echo "salmon rlog: FAILED"
+  "$B" normalize $SALMON -o $SD/rust_norm_$T.tsv > /dev/null 2>&1 || echo "salmon normalize: FAILED"
+  run tximport_matrix $W --avg-tx-length $D/tximport_matrix/avg_tx_length.csv
+  run tximport_poscounts $W --sf-type poscounts --avg-tx-length $D/tximport_poscounts/avg_tx_length.csv
+  run tximport_lstpm $W --tximport
+fi
+ND=$D/normfactors
+if [ -d "$ND" ]; then
+  NF="--norm-factors $ND/nf.csv"
+  run normfactors $W $NF
+  run normfactors_lrt -d condition --test lrt --reduced "~1" $NF
+  run normfactors_apeglm $W --shrinkage --shrinkage-method apeglm $NF
+  run normfactors_normal $W --shrinkage --shrinkage-method normal $NF
+  run normfactors_local $W --fit-type local $NF
+  run normfactors_weights $W --weights $D/normfactors_weights/weights.csv $NF
+  run normfactors_batch $W --covariate batch $NF
+  NI="-c $ND/counts.csv -m $ND/metadata.csv -d condition $NF"
+  "$B" vst $NI --blind -o $ND/rust_vst_$T.tsv > /dev/null 2>&1 || echo "normfactors vst: FAILED"
+  "$B" vst $NI --blind --method local -o $ND/rust_vstlocal_$T.tsv > /dev/null 2>&1 || echo "normfactors vst local: FAILED"
+  "$B" vst $NI --blind --nsub 500 -o $ND/rust_fastvst_$T.tsv > /dev/null 2>&1 || echo "normfactors vst nsub: FAILED"
+  "$B" rlog $NI --blind -o $ND/rust_rlog_$T.tsv > /dev/null 2>&1 || echo "normfactors rlog: FAILED"
+  "$B" normalize -c $ND/counts.csv $NF -o $ND/rust_norm_$T.tsv > /dev/null 2>&1 || echo "normfactors normalize: FAILED"
+fi
 TD=$D/transform
 "$B" normalize -c $TD/counts.csv -o $TD/rust_norm_$T.tsv >/dev/null 2>&1 || echo "normalize FAILED"
 "$B" vst -c $TD/counts.csv -m $TD/metadata.csv -d condition -o $TD/rust_vst_TRUE_$T.tsv --blind >/dev/null 2>&1 || echo "vst blind FAILED"

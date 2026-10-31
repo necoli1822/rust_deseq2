@@ -71,7 +71,34 @@ names the R function it now follows.
   fit itself and diverged below the smallest mean (e.g. 167231 vs R's 130832 at mean 0.001),
   which the VST evaluates (VST local off by up to 1.4e-2; now 5e-7).
 
+- **Normalization factors were not used in the fits.** `normalizationFactors` (a genes x samples
+  matrix) only entered the normalized counts and rlog; the GLM, gene-wise/MAP dispersion,
+  moments estimate, LRT, Cook's distances, outlier replacement and refit, apeglm and normal
+  shrinkage, VST and baseMean used the size factors. Every fit now takes the gene's row of
+  `getSizeOrNormFactors()` (`DESeqDataSet::gene_norm_factors`), with `momentsDispEstimate`'s
+  `mean(1/colMeans(nf))`, `replaceOutliers`' `trimBaseMean * nf` and the local VST's
+  `exp(colMeans(log(nf)))`. The size-factor path is unchanged bit for bit.
+- **`set_normalization_factors` centered the factors** by their row geometric means; R's
+  `normalizationFactors<-` stores them as given, and so does this now.
+- **Shrinkage after outlier replacement** (`normal`, `apeglm`) fitted the replaced counts. R's
+  `refitWithoutOutliers` restores the original counts, which `lfcShrink` then fits with the
+  refitted dispersions and MLE (ΔLFC up to 4.4 for the replaced genes; now 8e-7).
+- **Non-integer counts** were accepted with a warning; like `DESeqDataSetFromMatrix()`, the CLI now
+  rejects them unless they are tximport counts (`--tximport`, `--avg-tx-length`).
+
 ### Added
+- tximport input. `--salmon <SAMPLE_TABLE> --salmon-dir <DIR> --tx2gene <FILE>` reads salmon
+  `quant.sf` files and summarizes them to genes as `tximport(type = "salmon")` does
+  (`io::tximport`: sums, abundance-weighted lengths, `replaceMissingLength`, transcripts missing
+  from tx2gene dropped, R's `read.delim` number parsing), then builds the dataset as
+  `DESeqDataSetFromTximport()`: counts rounded halves to even, lengths stored as `avgTxLength`.
+  `-c` with `--avg-tx-length <FILE>` takes `txi$counts`/`txi$length` matrices, and `--tximport`
+  rounds `-c` counts without lengths (`countsFromAbundance` other than `"no"`). With
+  `avgTxLength`, `estimate_size_factors` sets normalization factors (`estimateNormFactors`,
+  `ratio` and `poscounts`; `iterate` ignores the lengths, as in R). For `run`, `vst`, `rlog` and
+  `normalize`.
+- `--norm-factors <FILE>` (R: `normalizationFactors(dds) <- nf`) for `run`, `vst`, `rlog` and
+  `normalize`; size factor estimation is then skipped, as in `DESeq()`. Works with `--weights`.
 - htseq-count input (R's `DESeqDataSetFromHTSeqCount`): `--htseq <SAMPLE_TABLE>` and
   `--htseq-dir <DIR>` for `run`, `vst`, `rlog` and `normalize`, and `io::read_htseq_count`.
   Counts come from the last column of each file, gene IDs must agree across files, and

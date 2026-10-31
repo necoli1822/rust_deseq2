@@ -101,10 +101,27 @@ pub fn shrink_lfc_apeglm(
     coef_idx: usize,
     params: &ApeglmParams,
 ) -> Result<()> {
-    let counts = dds.counts().counts();
-    let size_factors = dds.size_factors().ok_or_else(|| DeseqError::InvalidContrast {
-        reason: "Size factors required for apeglm".to_string(),
-    })?;
+    shrink_lfc_apeglm_with_counts(dds, None, results, coef_idx, params)
+}
+
+/// [`shrink_lfc_apeglm`] with `Y = fit_counts` instead of the dataset's counts.
+/// After outlier replacement, R's counts(dds) are the original counts again
+/// (refitWithoutOutliers restores them), and lfcShrink() passes those to apeglm
+/// with the refitted dispersions and MLE.
+/// R equivalent: lfcShrink(type="apeglm") after DESeq() replaced outliers
+pub fn shrink_lfc_apeglm_with_counts(
+    dds: &DESeqDataSet,
+    fit_counts: Option<&ndarray::Array2<f64>>,
+    results: &mut DESeqResults,
+    coef_idx: usize,
+    params: &ApeglmParams,
+) -> Result<()> {
+    let counts = fit_counts.map(|c| c.view()).unwrap_or_else(|| dds.counts().counts());
+    if !dds.has_size_or_norm_factors() {
+        return Err(DeseqError::InvalidContrast {
+            reason: "Size factors required for apeglm".to_string(),
+        });
+    }
     let dispersions = dds.dispersions().ok_or_else(|| DeseqError::InvalidContrast {
         reason: "Dispersions required for apeglm".to_string(),
     })?;
@@ -119,9 +136,10 @@ pub fn shrink_lfc_apeglm(
     let n_samples = dds.n_samples();
     let n_coefs = design.ncols();
 
-    // Prepare offset matrix: log(size_factors) broadcast to [genes x samples]
+    // Offset matrix [genes x samples], one row per gene below
     // R: offset <- matrix(log(sizeFactors(dds)), nrow=nrow(dds), ncol=ncol(dds), byrow=TRUE)
-    let offsets: Vec<f64> = size_factors.iter().map(|sf| sf.ln()).collect();
+    //    or, with normalization factors, offset <- log(normalizationFactors(dds))
+    let gene_offsets = |i: usize| -> Vec<f64> { dds.gene_norm_factors(i).unwrap().iter().map(|f| f.ln()).collect() };
 
     // Identify nonzero genes: R filters with nonzero <- rowSums(Y) > 0
     // In R, zero-count genes get NA LFC/SE, so priorVar automatically excludes them
@@ -198,6 +216,7 @@ pub fn shrink_lfc_apeglm(
             }
 
             let size = 1.0 / dispersions[i]; // R: size = 1/param
+            let offsets = gene_offsets(i);
 
             // Gene data struct for objective function
             let gd = GeneData {

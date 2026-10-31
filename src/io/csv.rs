@@ -28,19 +28,35 @@ pub fn read_count_matrix<P: AsRef<Path>>(path: P) -> Result<CountMatrix> {
     CountMatrix::new(counts, gene_ids, sample_ids)
 }
 
+/// Read a count matrix of tximport estimated counts (txi$counts, which are not
+/// integers) and round them, halves to even.
+/// R equivalent: counts <- round(txi$counts) in DESeqDataSetFromTximport()
+pub fn read_tximport_counts<P: AsRef<Path>>(path: P) -> Result<CountMatrix> {
+    let (counts, gene_ids, sample_ids) = read_numeric_matrix(path)?;
+    CountMatrix::new(counts.mapv(super::tximport::r_round), gene_ids, sample_ids)
+}
+
 /// Read a genes x samples matrix of observation weights, in the layout of the
 /// count matrix (first column gene IDs, first row sample IDs; CSV or TSV), and
 /// return it with its rows and columns in the order of `gene_ids` / `sample_ids`.
 /// The weights file must contain exactly these genes and samples.
 /// R equivalent: assays(dds)[["weights"]] <- w
 pub fn read_weight_matrix<P: AsRef<Path>>(path: P, gene_ids: &[String], sample_ids: &[String]) -> Result<Array2<f64>> {
+    read_aligned_matrix(path, gene_ids, sample_ids, "weights")
+}
+
+/// Read a genes x samples matrix in the layout of the count matrix (weights,
+/// normalization factors, average transcript lengths) and return it with its rows
+/// and columns in the order of `gene_ids` / `sample_ids`. The file must contain
+/// exactly these genes and samples; `what` names the file in error messages.
+pub fn read_aligned_matrix<P: AsRef<Path>>(path: P, gene_ids: &[String], sample_ids: &[String], what: &str) -> Result<Array2<f64>> {
     let (values, w_genes, w_samples) = read_numeric_matrix(path)?;
-    let index = |ids: &[String], what: &str| -> Result<HashMap<String, usize>> {
+    let index = |ids: &[String], kind: &str| -> Result<HashMap<String, usize>> {
         let mut map = HashMap::with_capacity(ids.len());
         for (k, id) in ids.iter().enumerate() {
             if map.insert(id.clone(), k).is_some() {
                 return Err(DeseqError::InvalidInput {
-                    reason: format!("Duplicate {} ID '{}' in weights file", what, id),
+                    reason: format!("Duplicate {} ID '{}' in {} file", kind, id, what),
                 });
             }
         }
@@ -48,19 +64,19 @@ pub fn read_weight_matrix<P: AsRef<Path>>(path: P, gene_ids: &[String], sample_i
     };
     let gene_pos = index(&w_genes, "gene")?;
     let sample_pos = index(&w_samples, "sample")?;
-    let check = |want: &[String], have: &HashMap<String, usize>, what: &str| -> Result<Vec<usize>> {
+    let check = |want: &[String], have: &HashMap<String, usize>, kind: &str| -> Result<Vec<usize>> {
         if want.len() != have.len() {
             return Err(DeseqError::InvalidInput {
                 reason: format!(
-                    "Weights file has {} {}s, count matrix has {}",
-                    have.len(), what, want.len()
+                    "{} file has {} {}s, count matrix has {}",
+                    what, have.len(), kind, want.len()
                 ),
             });
         }
         want.iter()
             .map(|id| {
                 have.get(id).copied().ok_or_else(|| DeseqError::InvalidInput {
-                    reason: format!("{} '{}' of the count matrix is missing from the weights file", what, id),
+                    reason: format!("{} '{}' of the count matrix is missing from the {} file", kind, id, what),
                 })
             })
             .collect()

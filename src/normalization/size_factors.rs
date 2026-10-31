@@ -1,9 +1,10 @@
 //! Size factor estimation using the median of ratios method
 
-use ndarray::{Array1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView2, Axis};
 
 use crate::data::DESeqDataSet;
 use crate::error::{DeseqError, Result};
+use crate::stats::ld_mean;
 
 /// Method for size factor estimation
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -17,18 +18,76 @@ pub enum SizeFactorMethod {
 }
 
 /// Estimate size factors using the median of ratios method
+/// R equivalent: estimateSizeFactors() for a DESeqDataSet (methods.R)
 ///
 /// This is the standard DESeq2 normalization method that accounts for
 /// both sequencing depth and RNA composition bias.
+///
+/// When the dataset has average transcript lengths (tximport input,
+/// `assays(dds)[["avgTxLength"]]`), the `ratio` and `poscounts` methods set
+/// normalization factors instead (R: estimateNormFactors() with
+/// `normMatrix = avgTxLength / exp(rowMeans(log(avgTxLength)))`); `iterate`
+/// ignores the lengths and sets size factors, as in R.
 pub fn estimate_size_factors(dds: &mut DESeqDataSet, method: SizeFactorMethod) -> Result<()> {
+    if method != SizeFactorMethod::Iterate {
+        if let Some(lengths) = dds.avg_tx_length() {
+            let nf = estimate_norm_factors(dds.counts().counts(), lengths, method)?;
+            return dds.set_normalization_factors(nf);
+        }
+    }
     let size_factors = match method {
         SizeFactorMethod::Ratio => estimate_size_factors_ratio(dds.counts().counts())?,
-        SizeFactorMethod::PosCounts => estimate_size_factors_poscounts(dds.counts().counts())?,
+        SizeFactorMethod::PosCounts => {
+            let counts = dds.counts().counts();
+            estimate_size_factors_poscounts(counts, counts)?
+        }
         SizeFactorMethod::Iterate => estimate_size_factors_iterate(dds)?,
     };
 
     dds.set_size_factors(size_factors)?;
     Ok(())
+}
+
+/// Normalization factors from the average transcript lengths of tximport
+/// R equivalent: the avgTxLength branch of estimateSizeFactors(), then
+/// estimateNormFactors() (core.R):
+/// ```r
+/// nm <- assays(object)[["avgTxLength"]]
+/// nm <- nm / exp(rowMeans(log(nm)))
+/// sf <- estimateSizeFactorsForMatrix(counts / nm, geoMeans = geoMeans)
+/// nf <- t(t(nm) * sf)
+/// nf / exp(rowMeans(log(nf)))
+/// ```
+/// With `type = "poscounts"`, `geoMeans` are the poscounts geometric means of
+/// the counts themselves (not of counts / nm), and the size factors are then
+/// scaled to geometric mean 1 as for any incoming geoMeans.
+pub fn estimate_norm_factors(
+    counts: ArrayView2<f64>,
+    avg_tx_length: &Array2<f64>,
+    method: SizeFactorMethod,
+) -> Result<Array2<f64>> {
+    let (n_genes, n_samples) = counts.dim();
+    let row_geo_center = |m: &mut Array2<f64>| {
+        for mut row in m.rows_mut() {
+            let center = ld_mean(row.iter().map(|x| x.ln())).exp();
+            row.mapv_inplace(|x| x / center);
+        }
+    };
+    let mut norm_matrix = avg_tx_length.clone();
+    row_geo_center(&mut norm_matrix);
+    let ratio = Array2::from_shape_fn((n_genes, n_samples), |(i, j)| counts[[i, j]] / norm_matrix[[i, j]]);
+    let sf = match method {
+        SizeFactorMethod::Ratio => estimate_size_factors_ratio(ratio.view())?,
+        SizeFactorMethod::PosCounts => estimate_size_factors_poscounts(counts, ratio.view())?,
+        SizeFactorMethod::Iterate => {
+            return Err(DeseqError::InvalidInput {
+                reason: "normalization factors from transcript lengths need sfType ratio or poscounts".to_string(),
+            })
+        }
+    };
+    let mut nf = Array2::from_shape_fn((n_genes, n_samples), |(i, j)| norm_matrix[[i, j]] * sf[j]);
+    row_geo_center(&mut nf);
+    Ok(nf)
 }
 
 /// Standard median of ratios method
@@ -101,7 +160,10 @@ fn estimate_size_factors_ratio(counts: ArrayView2<f64>) -> Result<Array1<f64>> {
 }
 
 /// Modified method using positive counts for geometric mean calculation
-fn estimate_size_factors_poscounts(counts: ArrayView2<f64>) -> Result<Array1<f64>> {
+/// R equivalent: estimateSizeFactors(type = "poscounts"): geoMeans from
+/// `counts`, then estimateSizeFactorsForMatrix(ratio_matrix, geoMeans = geoMeans).
+/// `ratio_matrix` is the counts themselves, or counts / normMatrix for tximport.
+fn estimate_size_factors_poscounts(counts: ArrayView2<f64>, ratio_matrix: ArrayView2<f64>) -> Result<Array1<f64>> {
     let (n_genes, n_samples) = counts.dim();
 
     if n_genes == 0 || n_samples == 0 {
@@ -144,7 +206,7 @@ fn estimate_size_factors_poscounts(counts: ArrayView2<f64>) -> Result<Array1<f64
             .iter()
             .zip(geo_means.iter())
             .filter_map(|(&i, &geo_mean)| {
-                let count = counts[[i, j]];
+                let count = ratio_matrix[[i, j]];
                 if count > 0.0 && geo_mean > 0.0 {
                     Some(count.ln() - geo_mean.ln())
                 } else {
@@ -176,28 +238,6 @@ fn estimate_size_factors_poscounts(counts: ArrayView2<f64>) -> Result<Array1<f64
     size_factors.mapv_inplace(|s| s / log_geo_mean_sf.exp());
 
     Ok(size_factors)
-}
-
-/// Mean as R's rowMeans()/mean() compute it: a long-double accumulation divided
-/// by n, rounded once to double. Emulated with a compensated (double-double) sum
-/// and an exact remainder for the division, which gives the correctly rounded mean.
-fn ld_mean(values: impl IntoIterator<Item = f64>) -> f64 {
-    let (mut hi, mut lo, mut n) = (0.0f64, 0.0f64, 0usize);
-    for v in values {
-        let s = hi + v;
-        let bb = s - hi;
-        lo += (hi - (s - bb)) + (v - bb);
-        hi = s;
-        n += 1;
-    }
-    if !hi.is_finite() {
-        return hi / n as f64;
-    }
-    let nf = n as f64;
-    let q = hi / nf;
-    // remainder of (hi + lo) - q * n, exactly via fused multiply-add
-    let r = (-q).mul_add(nf, hi) + lo;
-    q + r / nf
 }
 
 /// Iterative size factor estimation for data where every gene has a zero

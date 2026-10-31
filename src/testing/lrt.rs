@@ -68,9 +68,11 @@ pub fn likelihood_ratio_test(
     design_reduced: &Array2<f64>,
 ) -> Result<DESeqResults> {
     let counts = dds.counts().counts();
-    let size_factors = dds.size_factors().ok_or_else(|| DeseqError::InvalidContrast {
-        reason: "Size factors required for LRT".to_string(),
-    })?;
+    if !dds.has_size_or_norm_factors() {
+        return Err(DeseqError::InvalidContrast {
+            reason: "Size factors required for LRT".to_string(),
+        });
+    }
     let dispersions = dds.dispersions().ok_or_else(|| DeseqError::InvalidContrast {
         reason: "Dispersions required for LRT".to_string(),
     })?;
@@ -109,9 +111,6 @@ pub fn likelihood_ratio_test(
         col.iter().all(|&v| (v - 1.0).abs() < 1e-12)
     };
 
-    // Prepare size factors as a slice
-    let sf: Vec<f64> = size_factors.iter().copied().collect();
-
     // Observation weights: normalised for the fits (getAndCheckWeights), raw for
     // baseMean/baseVar (getBaseMeansAndVariances); weightsFail genes are allZero.
     let raw_weights = dds.weights();
@@ -127,6 +126,8 @@ pub fn likelihood_ratio_test(
         .map(|i| {
             let gene_counts: Vec<f64> = (0..n_samples).map(|j| counts[[i, j]]).collect();
             let alpha = dispersions[i];
+            // R: getSizeOrNormFactors(objectNZ) row of this gene
+            let sf: Vec<f64> = dds.gene_norm_factors(i).unwrap().to_vec();
 
             // Check for allZero genes
             let row_sum: f64 = gene_counts.iter().sum();

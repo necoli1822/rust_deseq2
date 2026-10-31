@@ -3,5 +3,5 @@
 mod size_factors;
 mod counts;
 
-pub use size_factors::{estimate_size_factors, SizeFactorMethod};
+pub use size_factors::{estimate_norm_factors, estimate_size_factors, SizeFactorMethod};
 pub use counts::{fpm, fpkm};

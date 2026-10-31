@@ -92,10 +92,14 @@ pub fn refit_without_outliers(
 
     // Get required data
     let counts = dds.counts().counts().to_owned();
-    let size_factors = dds.size_factors().ok_or_else(|| DeseqError::DispersionEstimationFailed {
-        gene_id: "N/A".to_string(),
-        reason: "Size factors required for refit".to_string(),
-    })?.to_owned();
+    if !dds.has_size_or_norm_factors() {
+        return Err(DeseqError::DispersionEstimationFailed {
+            gene_id: "N/A".to_string(),
+            reason: "Size factors required for refit".to_string(),
+        });
+    }
+    // R: getSizeOrNormFactors(objectSub), one row per gene
+    let nf_rows: Vec<Vec<f64>> = (0..dds.n_genes()).map(|i| dds.gene_norm_factors(i).unwrap().to_vec()).collect();
     let design = dds.design_matrix().ok_or_else(|| DeseqError::DispersionEstimationFailed {
         gene_id: "N/A".to_string(),
         reason: "Design matrix required for refit".to_string(),
@@ -114,8 +118,15 @@ pub fn refit_without_outliers(
         reason: "Dispersion prior variance required for refit. Run full estimate_dispersions first.".to_string(),
     })?;
 
-    let sf_slice = size_factors.as_slice().unwrap();
-    let xim: f64 = sf_slice.iter().map(|&s| 1.0 / s.max(1e-10)).sum::<f64>() / n_samples as f64;
+    // xim of momentsDispEstimate() on objectSub <- object[refitReplace, ], the
+    // flagged genes that are not all zero after replacement (with normalization
+    // factors, their colMeans enter xim)
+    let refit_genes: Vec<usize> = flagged_gene_indices
+        .iter()
+        .copied()
+        .filter(|&i| (0..n_samples).any(|j| counts[[i, j]] != 0.0))
+        .collect();
+    let xim = dds.moments_xim(&refit_genes).unwrap();
 
     // Observation weights (R: objectSub keeps assays(object)[["weights"]])
     let raw_weights = dds.weights().cloned();
@@ -152,14 +163,14 @@ pub fn refit_without_outliers(
                     }
                     // R: getBaseMeansAndVariances(object) on the replaced counts
                     let base_mean_counts: Vec<f64> = (0..n_samples)
-                        .map(|j| raw[[gene_idx, j]] * (counts[[gene_idx, j]] / sf_slice[j]))
+                        .map(|j| raw[[gene_idx, j]] * (counts[[gene_idx, j]] / nf_rows[gene_idx][j]))
                         .collect();
                     Some(GeneEstWeights::new(w.row(gene_idx).to_vec(), base_mean_counts, &design))
                 }
                 _ => None,
             };
             let (disp, mu) = estimate_dispersion_gene(
-                &gene_counts, sf_slice, &design, xim, n_samples, use_linear_mu, &DispersionParams::default(),
+                &gene_counts, &nf_rows[gene_idx], &design, xim, n_samples, use_linear_mu, &DispersionParams::default(),
                 gene_weights.as_ref(),
             );
             (gene_idx, disp, mu)
@@ -182,7 +193,7 @@ pub fn refit_without_outliers(
     // R: baseMean from getBaseMeansAndVariances (weights * normalized counts)
     let base_means: Vec<f64> = flagged_gene_indices.iter().map(|&gene_idx| {
         let norm_counts: Vec<f64> = (0..n_samples)
-            .map(|j| if sf_slice[j] > 0.0 { counts[[gene_idx, j]] / sf_slice[j] } else { 0.0 })
+            .map(|j| if nf_rows[gene_idx][j] > 0.0 { counts[[gene_idx, j]] / nf_rows[gene_idx][j] } else { 0.0 })
             .enumerate()
             .map(|(j, x)| match &raw_weights {
                 Some(raw) => raw[[gene_idx, j]] * x,
@@ -264,7 +275,7 @@ pub fn refit_without_outliers(
             let alpha = dispersions[gene_idx];
             let w = crate::glm::gene_weights(weights.as_ref(), weights_fail.as_ref(), gene_idx);
             let result = fit_single_gene_weighted(
-                gene_counts, &design, size_factors.view(), alpha, &GlmFitParams::default(), w.as_deref(),
+                gene_counts, &design, ndarray::ArrayView1::from(&nf_rows[gene_idx][..]), alpha, &GlmFitParams::default(), w.as_deref(),
             );
             (gene_idx, result)
         })

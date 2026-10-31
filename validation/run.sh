@@ -4,7 +4,7 @@
 # usage: validation/run.sh <Rscript command> <work dir> [tag]
 #   e.g. validation/run.sh "pixi run --manifest-path tool/deseq2/pixi.toml Rscript" /tmp/deseq2-val
 #
-# Needs R with DESeq2, apeglm and ashr. Generates the data and R references once
+# Needs R with DESeq2, apeglm, ashr and tximport. Generates the data and R references once
 # (skipped if <work dir>/data exists), builds the release binary, runs every
 # scenario and prints max |R - Rust| per output column.
 set -e
@@ -16,7 +16,7 @@ DATA="$WORK/data"
 
 if [ ! -d "$DATA" ]; then
   mkdir -p "$DATA"
-  for g in gen.R gen2.R gen3.R gen4.R gen5.R gen6.R gen7.R; do
+  for g in gen.R gen2.R gen3.R gen4.R gen5.R gen6.R gen7.R gen8.R; do
     echo "generating R references: $g"
     $RSCRIPT "$HERE/$g" "$DATA"
   done

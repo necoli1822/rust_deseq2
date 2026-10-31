@@ -108,7 +108,7 @@ pub fn rlog(dds: &DESeqDataSet, blind: bool) -> Result<RlogResult> {
     }
 
     // Check prerequisites
-    if !dds.has_size_factors() {
+    if !dds.has_size_or_norm_factors() {
         return Err(DeseqError::InvalidInput {
             reason: "Size factors must be estimated before rlog".to_string(),
         });
@@ -117,9 +117,10 @@ pub fn rlog(dds: &DESeqDataSet, blind: bool) -> Result<RlogResult> {
     let n_genes = dds.n_genes();
     let n_samples = dds.n_samples();
     let counts = dds.counts().counts();
-    let size_factors = dds.size_factors().unwrap();
     // R uses normalization factors (if set) instead of size factors for GLM fitting
+    // and for the normalized counts
     let normalization_factors = dds.normalization_factors();
+    let norm_counts_all = dds.normalized_counts().unwrap();
 
     // Check for sparsity (R: sparseTest)
     let is_sparse = sparse_test(dds.counts().counts(), 0.9);
@@ -128,8 +129,10 @@ pub fn rlog(dds: &DESeqDataSet, blind: bool) -> Result<RlogResult> {
     }
 
     // Debug: dump size factors for comparison with R
-    for j in 0..n_samples {
-        log::debug!("rlog sf[{}]={:.15}", j + 1, size_factors[j]);
+    if let Some(size_factors) = dds.size_factors() {
+        for j in 0..n_samples {
+            log::debug!("rlog sf[{}]={:.15}", j + 1, size_factors[j]);
+        }
     }
 
     // Need trended (fitted) dispersions for rlog, NOT MAP dispersions
@@ -176,7 +179,7 @@ pub fn rlog(dds: &DESeqDataSet, blind: bool) -> Result<RlogResult> {
         for j in 0..n_samples {
             let raw = counts[[i, j]];
             row_sum += raw;
-            let nc = raw / size_factors[j];
+            let nc = norm_counts_all[[i, j]];
             norm_counts[[i, j]] = nc;
             base_means[i] += nc;
         }
@@ -304,7 +307,7 @@ pub fn rlog(dds: &DESeqDataSet, blind: bool) -> Result<RlogResult> {
             let nf: Vec<f64> = if let Some(nf_matrix) = normalization_factors {
                 (0..n_samples).map(|j| nf_matrix[[gi, j]]).collect()
             } else {
-                size_factors.to_vec()
+                dds.size_factors().unwrap().to_vec()
             };
 
             fit_rlog_gene(

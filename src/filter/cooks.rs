@@ -500,27 +500,18 @@ pub fn replace_outliers(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    // Get size factors
-    let size_factors = match dds.size_factors() {
-        Some(sf) => sf.to_vec(),
-        None => vec![1.0; n_samples],
+    // Size or normalization factors of each gene (R: replacementCounts is
+    // trimBaseMean * normalizationFactors when they are set, otherwise
+    // outer(trimBaseMean, sizeFactors))
+    let factors = match dds.size_or_norm_factors() {
+        Some(f) => f,
+        None => ndarray::Array2::from_elem((n_genes, n_samples), 1.0),
     };
 
     // Get normalized counts for trimmed mean calculation
     let norm_counts = match dds.normalized_counts() {
         Some(nc) => nc.clone(),
-        None => {
-            let counts = dds.counts().counts();
-            let mut nc = counts.to_owned();
-            for i in 0..n_genes {
-                for j in 0..n_samples {
-                    if size_factors[j] > 0.0 {
-                        nc[[i, j]] /= size_factors[j];
-                    }
-                }
-            }
-            nc
-        }
+        None => dds.counts().counts().to_owned(),
     };
 
     // Samples are replaceable if their model-matrix cell has >= minReplicatesForReplace
@@ -562,8 +553,9 @@ pub fn replace_outliers(
             let c = cooks[[gene_idx, sample_idx]];
             if c.is_finite() && c > cutoff && replaceable[sample_idx] {
                 // DESeq2: replacement = as.integer(trimBaseMean * sizeFactor)
+                // (or * normalizationFactors[gene, sample])
                 // R's as.integer() truncates toward zero (equivalent to floor for positive values)
-                let replacement = trim_base_means[gene_idx] * size_factors[sample_idx];
+                let replacement = trim_base_means[gene_idx] * factors[[gene_idx, sample_idx]];
                 dds.replace_count(gene_idx, sample_idx, replacement.floor())?;
                 gene_modified = true;
             }

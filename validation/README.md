@@ -18,8 +18,9 @@ validation/run.sh "pixi run --manifest-path tool/deseq2/pixi.toml Rscript" /tmp/
 | `gen5.R` | R's subsampling `vst(nsub = 1000)` for each fitType, blind and not |
 | `gen6.R` | Observation weights (4 vs 4, `useT`, `~batch + condition`) and `sfType = "iterate"` |
 | `gen7.R` | `--htseq` input: htseq-count files with counter rows and an `--additional-attr` column, read by `DESeqDataSetFromHTSeqCount` (`~batch + condition`, VST, normalized counts) |
+| `gen8.R` | tximport and normalization factors: simulated salmon `quant.sf` files (isoforms, genes without reads in some or all samples, a transcript missing from tx2gene) through `tximport` + `DESeqDataSetFromTximport` (`--salmon`; the same txi as `-c --avg-tx-length`, with `poscounts`; `lengthScaledTPM` counts with `--tximport`), and a 7 vs 7 data set with Cook's outliers and a `normalizationFactors` matrix (`--norm-factors`: Wald with outlier replacement, LRT, apeglm and normal shrinkage, `local`, `--weights`, `~batch + condition`); VST (parametric, local, `nsub`), rlog and normalized counts for both |
 | `run_rust.sh` | Runs the CLI on every scenario |
-| `compare.py` | Max abs difference per column, NA-pattern and padj < 0.1 mismatches |
+| `compare.py` | Max abs difference per column, NA-pattern and padj < 0.1 mismatches; max abs difference of every `r_<name>.tsv` matrix (VST, rlog, normalized counts) with its `rust_<name>_<tag>.tsv` |
 | `worst.py` | Genes with the largest difference in one column of one scenario |
 
 `real/` runs the same comparison on public GEO data (GSE151925, GSE46391, GSE130777,
@@ -33,4 +34,5 @@ genes whose padj is NA in only one of R and Rust; `sigDis` counts genes called
 significant (padj < 0.1) by only one; `nSigR` is R's number of significant genes.
 
 Reference versions used for the results in the top-level README: R 4.5.3,
-DESeq2 1.50.2, apeglm 1.32.0, ashr 2.2-63, RcppNumerical 0.7-0.
+DESeq2 1.50.2, apeglm 1.32.0, ashr 2.2-63, RcppNumerical 0.7-0, tximport 1.38.2 (without
+readr, so `quant.sf` files are read with `read.delim`).
