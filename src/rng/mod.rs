@@ -149,7 +149,9 @@ impl RMersenneTwister {
     /// Standard exponential deviate exactly as R's exp_rand() (sexp.c):
     /// Ahrens & Dieter (1972), algorithm SA, not -log(U)
     pub fn rexp(&mut self) -> f64 {
-        // q[k-1] = sum(log(2)^k / k!), k = 1..16
+        // q[k-1] = sum(log(2)^k / k!), k = 1..16, copied verbatim from sexp.c
+        // (q[0] is ln 2; kept as R's literal so the table reads as R's)
+        #[allow(clippy::approx_constant)]
         const Q: [f64; 16] = [
             0.6931471805599453,
             0.9333736875190459,
