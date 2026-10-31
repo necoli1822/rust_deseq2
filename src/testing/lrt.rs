@@ -20,7 +20,7 @@ use statrs::function::gamma::ln_gamma;
 use super::fdr::benjamini_hochberg;
 use crate::data::DESeqDataSet;
 use crate::error::{DeseqError, Result};
-use crate::glm::{fit_single_gene, GlmFitParams};
+use crate::glm::{fit_single_gene_weighted, GlmFitParams};
 use crate::io::{Contrast, DESeqResults};
 
 /// Negative binomial log-likelihood for a single observation.
@@ -112,6 +112,12 @@ pub fn likelihood_ratio_test(
     // Prepare size factors as a slice
     let sf: Vec<f64> = size_factors.iter().copied().collect();
 
+    // Observation weights: normalised for the fits (getAndCheckWeights), raw for
+    // baseMean/baseVar (getBaseMeansAndVariances); weightsFail genes are allZero.
+    let raw_weights = dds.weights();
+    let weights = dds.normalized_weights();
+    let all_zero = dds.all_zero();
+
     // R's nbinomLRT refits both full and reduced models from scratch
     // using fitNbinomGLMs (which includes IRLS + optim fallback).
 
@@ -136,12 +142,45 @@ pub fn likelihood_ratio_test(
                 };
             }
 
+            // Base mean and base var of normalized counts
+            // (R getBaseMeansAndVariances: times the raw weights when present)
+            let norm_counts: Vec<f64> = gene_counts
+                .iter()
+                .zip(sf.iter())
+                .map(|(&c, &s)| if s > 0.0 { c / s } else { 0.0 })
+                .enumerate()
+                .map(|(j, x)| match raw_weights {
+                    Some(raw) => raw[[i, j]] * x,
+                    None => x,
+                })
+                .collect();
+            let base_mean: f64 = norm_counts.iter().sum::<f64>() / n_samples as f64;
+            let base_var: f64 = norm_counts.iter()
+                .map(|&x| (x - base_mean).powi(2))
+                .sum::<f64>() / (n_samples as f64 - 1.0);
+
+            // Genes whose weights fail getAndCheckWeights() are allZero in R:
+            // baseMean is reported, every test statistic is NA
+            if all_zero[i] {
+                return LrtGeneResult {
+                    base_mean,
+                    base_var,
+                    lrt_stat: f64::NAN,
+                    log2_fold_change: f64::NAN,
+                    lfc_se: f64::NAN,
+                    betas_full: vec![f64::NAN; df_full],
+                    mu_full: vec![f64::NAN; n_samples],
+                };
+            }
+
             // R's nbinomLRT refits the full model with fitNbinomGLMs (IRLS from
             // the OLS start, then the optim() fallback of fitNbinomGLMsOptim for
             // the rows that need it), which is what fit_single_gene ports.
             let gene_view = ndarray::ArrayView1::from(&gene_counts[..]);
             let sf_view = ndarray::ArrayView1::from(&sf[..]);
-            let full_result = fit_single_gene(gene_view, design_full, sf_view, alpha, &GlmFitParams::default());
+            let gene_w = crate::glm::gene_weights(weights.as_ref(), dds.weights_fail(), i);
+            let gene_w = gene_w.as_deref();
+            let full_result = fit_single_gene_weighted(gene_view, design_full, sf_view, alpha, &GlmFitParams::default(), gene_w);
             let full_ll = full_result.log_likelihood;
 
             // Fit reduced model
@@ -152,7 +191,24 @@ pub fn likelihood_ratio_test(
             //   logLike = sum(dnbinom(k_j, mu=mu_j, size=1/alpha, log=TRUE))
             // No IRLS, no optim fallback. The intercept-only NB MLE for the
             // log-link is the arithmetic mean of normalized counts.
-            let reduced_ll = if is_intercept_only {
+            let reduced_ll = if let (true, Some(w)) = (is_intercept_only, gene_w) {
+                // With weights: betaMatrix <- log2(rowSums(weights * normCounts) / rowSums(weights)),
+                // mu <- nf * 2^betaMatrix, logLike <- rowSums(weights * dnbinom(k, mu, 1/alpha))
+                let wsum_norm: f64 = gene_counts
+                    .iter()
+                    .zip(sf.iter())
+                    .zip(w)
+                    .map(|((&c, &s), &wj)| wj * if s > 0.0 { c / s } else { 0.0 })
+                    .sum();
+                let mean_norm = wsum_norm / w.iter().sum::<f64>();
+                let beta = mean_norm.log2();
+                let mut ll = 0.0;
+                for j in 0..n_samples {
+                    let mu_j = sf[j] * 2f64.powf(beta);
+                    ll += w[j] * nb_log_likelihood(gene_counts[j], mu_j, alpha);
+                }
+                ll
+            } else if is_intercept_only {
                 // mean_norm = mean(k / sf) -- arithmetic mean of normalized counts
                 let mean_norm: f64 = gene_counts
                     .iter()
@@ -171,7 +227,8 @@ pub fn likelihood_ratio_test(
             } else {
                 let gene_view = ndarray::ArrayView1::from(&gene_counts[..]);
                 let sf_view = ndarray::ArrayView1::from(&sf[..]);
-                fit_single_gene(gene_view, design_reduced, sf_view, alpha, &GlmFitParams::default()).log_likelihood
+                fit_single_gene_weighted(gene_view, design_reduced, sf_view, alpha, &GlmFitParams::default(), gene_w)
+                    .log_likelihood
             };
 
             // LRT statistic
@@ -180,17 +237,6 @@ pub fn likelihood_ratio_test(
             // happen theoretically but can arise from numerical issues. We clamp
             // to 0 for safety; this is a minor deviation from R behavior.
             let lrt_stat = lrt_stat.max(0.0);
-
-            // Base mean and base var of normalized counts
-            let norm_counts: Vec<f64> = gene_counts
-                .iter()
-                .zip(sf.iter())
-                .map(|(&c, &s)| if s > 0.0 { c / s } else { 0.0 })
-                .collect();
-            let base_mean: f64 = norm_counts.iter().sum::<f64>() / n_samples as f64;
-            let base_var: f64 = norm_counts.iter()
-                .map(|&x| (x - base_mean).powi(2))
-                .sum::<f64>() / (n_samples as f64 - 1.0);
 
             // Log2 fold change: use full model's last non-intercept coefficient
             // Convert from natural log to log2 scale: beta_natlog * log2(e)

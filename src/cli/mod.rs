@@ -184,7 +184,8 @@ Examples:
         #[arg(long,
             long_help = "Use t-distribution instead of normal distribution for Wald test p-values.\n\
                 More conservative for small sample sizes (< 10).\n\
-                Degrees of freedom = n_samples - n_coefficients.")]
+                Degrees of freedom = n_samples - n_coefficients (with --weights, the sum of\n\
+                the gene's normalised weights - n_coefficients).")]
         use_t: bool,
 
         /// Maximum IRLS iterations for GLM fitting and dispersion estimation [default: 100]
@@ -231,6 +232,16 @@ Examples:
                 is set, BH adjustment is applied directly to all genes.\n\
                 R equivalent: results(dds, independentFiltering=FALSE)")]
         no_independent_filtering: bool,
+
+        /// Observation weights matrix (genes x samples)
+        #[arg(long, value_name = "FILE",
+            long_help = "Observation weights, a CSV/TSV matrix in the layout of the count matrix\n\
+                (first column = gene IDs, then one column per sample). Gene and sample IDs\n\
+                must match the count matrix; values must be non-negative and may be\n\
+                non-integer. Weights are normalised per gene by their maximum and enter\n\
+                the dispersion and GLM fits; baseMean uses the raw weights.\n\
+                R equivalent: assays(dds)[[\"weights\"]] <- w before DESeq()")]
+        weights: Option<String>,
 
         /// Cook's distance cutoff (use 'Inf' or a very large number to disable)
         #[arg(long,

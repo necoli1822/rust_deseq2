@@ -175,4 +175,77 @@ mod tests {
         let summary = results.summary(0.05);
         println!("{}", summary);
     }
+
+    fn weights_dataset() -> DESeqDataSet {
+        let counts = CountMatrix::new(
+            array![
+                [100.0, 110.0, 90.0, 95.0, 400.0, 420.0, 380.0, 300.0],
+                [500.0, 520.0, 480.0, 450.0, 500.0, 510.0, 490.0, 530.0],
+                [300.0, 310.0, 290.0, 250.0, 75.0, 80.0, 70.0, 95.0],
+                [50.0, 55.0, 45.0, 60.0, 50.0, 52.0, 48.0, 40.0],
+                [200.0, 220.0, 180.0, 230.0, 200.0, 210.0, 190.0, 160.0],
+                [150.0, 160.0, 140.0, 120.0, 300.0, 320.0, 280.0, 350.0],
+                [400.0, 420.0, 380.0, 450.0, 100.0, 110.0, 90.0, 85.0],
+                [80.0, 85.0, 75.0, 60.0, 80.0, 82.0, 78.0, 99.0],
+                [600.0, 620.0, 580.0, 650.0, 600.0, 610.0, 590.0, 560.0],
+                [250.0, 260.0, 240.0, 210.0, 500.0, 520.0, 480.0, 600.0],
+            ],
+            (0..10).map(|i| format!("g{}", i)).collect(),
+            (0..8).map(|j| format!("s{}", j)).collect(),
+        )
+        .unwrap();
+        let mut metadata = SampleMetadata::new((0..8).map(|j| format!("s{}", j)).collect());
+        metadata
+            .add_condition("treatment", (0..8).map(|j| if j < 4 { "a" } else { "b" }.to_string()).collect())
+            .unwrap();
+        DESeqDataSet::new(counts, metadata, "treatment").unwrap()
+    }
+
+    fn weights_matrix() -> ndarray::Array2<f64> {
+        ndarray::Array2::from_shape_fn((10, 8), |(i, j)| 0.2 + 0.8 * (((i * 7 + j * 3) % 11) as f64) / 10.0)
+    }
+
+    /// The fits use weights normalised by their row maximum, so scaling all
+    /// weights leaves the tests unchanged while baseMean (raw weights) scales.
+    #[test]
+    fn test_weights_scale_invariance() {
+        let run = |scale: f64| {
+            let mut dds = weights_dataset();
+            dds.set_weights(weights_matrix() * scale).unwrap();
+            let info = run_deseq(&mut dds).unwrap();
+            deseq_results(&dds, &info, "b", "a", 0.1).unwrap()
+        };
+        let (r1, r3) = (run(1.0), run(3.0));
+        for i in 0..10 {
+            assert!((r1.log2_fold_changes[i] - r3.log2_fold_changes[i]).abs() < 1e-9);
+            assert!((r1.lfc_se[i] - r3.lfc_se[i]).abs() < 1e-9);
+            assert!((r1.pvalues[i] - r3.pvalues[i]).abs() < 1e-9);
+            assert!((3.0 * r1.base_means[i] - r3.base_means[i]).abs() < 1e-9 * r3.base_means[i]);
+        }
+        // weighted results differ from unweighted ones
+        let mut dds = weights_dataset();
+        let info = run_deseq(&mut dds).unwrap();
+        let r0 = deseq_results(&dds, &info, "b", "a", 0.1).unwrap();
+        assert!((r0.log2_fold_changes[0] - r1.log2_fold_changes[0]).abs() > 1e-6);
+    }
+
+    /// R getAndCheckWeights(): a gene whose weights leave a coefficient
+    /// inestimable is flagged weightsFail and treated as allZero (NA results).
+    #[test]
+    fn test_weights_fail_gives_na() {
+        let mut dds = weights_dataset();
+        let mut w = weights_matrix();
+        for j in 4..8 {
+            w[[2, j]] = 0.0;
+        }
+        dds.set_weights(w).unwrap();
+        let info = run_deseq(&mut dds).unwrap();
+        let res = deseq_results(&dds, &info, "b", "a", 0.1).unwrap();
+        assert_eq!(dds.weights_fail().unwrap().iter().filter(|&&f| f).count(), 1);
+        assert!(dds.weights_fail().unwrap()[2]);
+        assert!(res.log2_fold_changes[2].is_nan() && res.pvalues[2].is_nan());
+        assert!(res.pvalues.iter().enumerate().all(|(i, p)| i == 2 || p.is_finite()));
+        assert!(dds.set_weights(ndarray::Array2::ones((3, 8))).is_err());
+        assert!(dds.set_weights(ndarray::Array2::from_elem((10, 8), -1.0)).is_err());
+    }
 }

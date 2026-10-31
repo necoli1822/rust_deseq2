@@ -5,13 +5,13 @@ mod loess;
 mod map;
 mod trend;
 
-pub use gene_wise::{estimate_gene_dispersions, debug_gene_dispersion, estimate_dispersion_gene};
+pub use gene_wise::{estimate_gene_dispersions, debug_gene_dispersion, estimate_dispersion_gene, DispWeights, GeneEstWeights};
 pub use map::{estimate_map_dispersions, fit_map_dispersion, estimate_prior_variance_with_var};
 pub use trend::{fit_dispersion_trend, DispersionTrend, LocalTrend, TrendFitMethod};
 
 use crate::data::DESeqDataSet;
 use crate::error::{DeseqError, Result};
-use crate::glm::{fit_single_gene, GlmFitParams, GlmFitResult};
+use crate::glm::{fit_single_gene_weighted, GlmFitParams, GlmFitResult};
 
 /// Configurable parameters for dispersion estimation.
 /// R equivalent: parameters of estimateDispersionsGeneEst() and estimateDispersionsMAP() in core.R
@@ -74,6 +74,9 @@ pub fn estimate_dispersions(dds: &mut DESeqDataSet, fit_type: TrendFitMethod, pa
 /// 3. Re-estimate MAP dispersions for ONLY flagged genes
 /// 4. Refit GLM for ONLY flagged genes
 /// 5. Write results back into the corresponding rows of the full DDS
+///
+/// Observation weights are carried through every refit, as R's objectSub keeps
+/// the weights assay.
 pub fn refit_without_outliers(
     dds: &mut DESeqDataSet,
     flagged_gene_indices: &[usize],
@@ -113,8 +116,14 @@ pub fn refit_without_outliers(
     let sf_slice = size_factors.as_slice().unwrap();
     let xim: f64 = sf_slice.iter().map(|&s| 1.0 / s.max(1e-10)).sum::<f64>() / n_samples as f64;
 
-    // Check if design supports linear mu
-    let use_linear_mu = {
+    // Observation weights (R: objectSub keeps assays(object)[["weights"]])
+    let raw_weights = dds.weights().cloned();
+    let weights = dds.normalized_weights();
+    let weights_fail = dds.weights_fail().cloned();
+    let gene_failed = |i: usize| weights_fail.as_ref().is_some_and(|f| f[i]);
+
+    // Check if design supports linear mu (R: never with weights)
+    let use_linear_mu = weights.is_none() && {
         let n = design.nrows();
         let p = design.ncols();
         let mut unique_rows: Vec<Vec<i64>> = Vec::new();
@@ -135,8 +144,22 @@ pub fn refit_without_outliers(
         .par_iter()
         .map(|&gene_idx| {
             let gene_counts: Vec<f64> = (0..n_samples).map(|j| counts[[gene_idx, j]]).collect();
+            let gene_weights = match (&weights, &raw_weights) {
+                (Some(w), Some(raw)) => {
+                    if gene_failed(gene_idx) {
+                        return (gene_idx, f64::NAN, vec![0.0; n_samples]);
+                    }
+                    // R: getBaseMeansAndVariances(object) on the replaced counts
+                    let base_mean_counts: Vec<f64> = (0..n_samples)
+                        .map(|j| raw[[gene_idx, j]] * (counts[[gene_idx, j]] / sf_slice[j]))
+                        .collect();
+                    Some(GeneEstWeights::new(w.row(gene_idx).to_vec(), base_mean_counts, &design))
+                }
+                _ => None,
+            };
             let (disp, mu) = estimate_dispersion_gene(
-                &gene_counts, sf_slice, &design, xim, n_samples, use_linear_mu, &DispersionParams::default()
+                &gene_counts, sf_slice, &design, xim, n_samples, use_linear_mu, &DispersionParams::default(),
+                gene_weights.as_ref(),
             );
             (gene_idx, disp, mu)
         })
@@ -155,9 +178,15 @@ pub fn refit_without_outliers(
     dds.set_mu(mu_matrix)?;
 
     // Step 2: Compute trended dispersions using ORIGINAL dispersion function
+    // R: baseMean from getBaseMeansAndVariances (weights * normalized counts)
     let base_means: Vec<f64> = flagged_gene_indices.iter().map(|&gene_idx| {
         let norm_counts: Vec<f64> = (0..n_samples)
             .map(|j| if sf_slice[j] > 0.0 { counts[[gene_idx, j]] / sf_slice[j] } else { 0.0 })
+            .enumerate()
+            .map(|(j, x)| match &raw_weights {
+                Some(raw) => raw[[gene_idx, j]] * x,
+                None => x,
+            })
             .collect();
         norm_counts.iter().sum::<f64>() / n_samples as f64
     }).collect();
@@ -181,9 +210,13 @@ pub fn refit_without_outliers(
             let gene_disp = gene_dispersions[gene_idx];
             let trend_disp = trended_dispersions[gene_idx];
             let mu: Vec<f64> = (0..n_samples).map(|j| mu_matrix_ref[[gene_idx, j]]).collect();
+            let gene_weights = match &weights {
+                Some(w) if !gene_failed(gene_idx) => Some(DispWeights::new(w.row(gene_idx).to_vec(), &design)),
+                _ => None,
+            };
 
             let map_disp = fit_map_dispersion(
-                &gene_counts, &design, &mu, gene_disp, trend_disp, prior_var, max_disp
+                &gene_counts, &design, &mu, gene_disp, trend_disp, prior_var, max_disp, gene_weights.as_ref()
             );
             (gene_idx, map_disp)
         })
@@ -228,7 +261,10 @@ pub fn refit_without_outliers(
         .map(|&gene_idx| {
             let gene_counts = counts.row(gene_idx);
             let alpha = dispersions[gene_idx];
-            let result = fit_single_gene(gene_counts, &design, size_factors.view(), alpha, &GlmFitParams::default());
+            let w = crate::glm::gene_weights(weights.as_ref(), weights_fail.as_ref(), gene_idx);
+            let result = fit_single_gene_weighted(
+                gene_counts, &design, size_factors.view(), alpha, &GlmFitParams::default(), w.as_deref(),
+            );
             (gene_idx, result)
         })
         .collect();

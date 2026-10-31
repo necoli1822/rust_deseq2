@@ -67,7 +67,9 @@ pub fn fit_dispersion_trend(dds: &mut DESeqDataSet, method: TrendFitMethod) -> R
         reason: "Gene-wise dispersions must be estimated first".to_string(),
     })?;
 
-    let normalized = dds.normalized_counts().ok_or_else(|| DeseqError::TrendFittingFailed {
+    // R: the trend is fitted against mcols(object)$baseMean, which with
+    // observation weights is the mean of weights * normalized counts
+    let normalized = dds.base_mean_counts().ok_or_else(|| DeseqError::TrendFittingFailed {
         reason: "Normalized counts required for trend fitting".to_string(),
     })?;
 

@@ -17,7 +17,8 @@ pub fn calculate_pvalue(z: f64) -> f64 {
 /// R equivalent: 2 * pt(abs(stat), df=df, lower.tail=FALSE)
 /// Used when useT=TRUE in nbinomWaldTest()
 pub fn calculate_pvalue_t(stat: f64, df: f64) -> f64 {
-    if !stat.is_finite() || df <= 0.0 {
+    // a NaN df is R's NA df (df <- ifelse(df > 0, df, NA))
+    if !stat.is_finite() || df.is_nan() || df <= 0.0 {
         return f64::NAN;
     }
 

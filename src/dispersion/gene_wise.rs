@@ -31,6 +31,56 @@ fn is_linear_mu(design: &Array2<f64>) -> bool {
     unique_rows.len() == p
 }
 
+/// Observation weights of one gene as the dispersion fits use them
+/// (`weightsSEXP` of DESeq2.cpp `fitDisp` / `fitDispGrid`), with the model matrix
+/// of the Cox-Reid term restricted to the samples with weight > weightThreshold.
+#[derive(Debug, Clone)]
+pub struct DispWeights {
+    /// Weights multiplying each sample's log-likelihood term
+    pub w: Vec<f64>,
+    /// R: x.rows(find(wts > weightThreshold)), then x.cols(find(sum(abs(x)) > 0))
+    pub cr_design: Array2<f64>,
+    /// Samples kept in the Cox-Reid term
+    pub cr_rows: Vec<usize>,
+}
+
+impl DispWeights {
+    pub fn new(w: Vec<f64>, design: &Array2<f64>) -> Self {
+        let (cr_design, cr_rows) =
+            crate::data::weights::cr_design(design, &w, crate::data::weights::WEIGHT_THRESHOLD);
+        Self { w, cr_design, cr_rows }
+    }
+
+    /// mu of the samples kept in the Cox-Reid term
+    pub(crate) fn cr_mu(&self, mu: &[f64]) -> Vec<f64> {
+        self.cr_rows.iter().map(|&i| mu[i]).collect()
+    }
+}
+
+/// Observation weights of one gene for estimateDispersionsGeneEst()
+#[derive(Debug, Clone)]
+pub struct GeneEstWeights {
+    /// Normalised weights, used by fitNbinomGLMs() for mu
+    pub glm: Vec<f64>,
+    /// R: pmax(weights, 1e-6), used by fitDisp() / fitDispGrid()
+    pub disp: DispWeights,
+    /// The gene's raw weights times its normalized counts (getBaseMeansAndVariances),
+    /// whose mean and variance give momentsDispEstimate()
+    pub base_mean_counts: Vec<f64>,
+}
+
+impl GeneEstWeights {
+    /// `normalized` are the gene's row-max-normalised weights and
+    /// `base_mean_counts` its raw weights times its normalized counts.
+    pub fn new(normalized: Vec<f64>, base_mean_counts: Vec<f64>, design: &Array2<f64>) -> Self {
+        let floored: Vec<f64> = normalized
+            .iter()
+            .map(|&x| x.max(crate::data::weights::GENE_EST_MIN_WEIGHT))
+            .collect();
+        Self { glm: normalized, disp: DispWeights::new(floored, design), base_mean_counts }
+    }
+}
+
 /// Estimate gene-wise dispersions using Cox-Reid adjusted profile likelihood
 /// R equivalent: estimateDispersionsGeneEst() in core.R
 /// with alternating optimization (matching R DESeq2)
@@ -63,8 +113,27 @@ pub fn estimate_gene_dispersions(dds: &mut DESeqDataSet, params: &DispersionPara
     let sf_slice = size_factors.as_slice().unwrap();
     let xim: f64 = sf_slice.iter().map(|&s| 1.0 / s.max(1e-10)).sum::<f64>() / n_samples as f64;
 
+    // Observation weights (R: getAndCheckWeights): normalised by row maximum;
+    // genes whose weights do not allow estimation are treated as allZero.
+    let weights = dds.normalized_weights();
+    let weights_fail: Option<Vec<bool>> = weights.as_ref().map(|w| {
+        let ok = crate::data::weights::weights_ok(w, &design);
+        let n_fail = ok.iter().filter(|&&o| !o).count();
+        if n_fail > 0 {
+            log::warn!(
+                "for {} row(s), the weights as supplied won't allow parameter estimation, \
+                 producing a degenerate design matrix; these rows are treated as if they \
+                 contained all zeros",
+                n_fail
+            );
+        }
+        ok.into_iter().map(|o| !o).collect()
+    });
+    let base_mean_counts = dds.base_mean_counts().map(|c| c.into_owned());
+
     // Check if design supports linear mu (simple group model)
-    let use_linear_mu = is_linear_mu(&design);
+    // R: linearMu is forced FALSE when weights are used
+    let use_linear_mu = is_linear_mu(&design) && weights.is_none();
 
     // Estimate dispersions in parallel using Cox-Reid likelihood
     // Returns (dispersion, mu) for each gene - mu is needed for MAP estimation
@@ -72,7 +141,16 @@ pub fn estimate_gene_dispersions(dds: &mut DESeqDataSet, params: &DispersionPara
         .into_par_iter()
         .map(|i| {
             let gene_counts: Vec<f64> = (0..n_samples).map(|j| counts[[i, j]]).collect();
-            estimate_dispersion_gene(&gene_counts, sf_slice, &design, xim, n_samples, use_linear_mu, params)
+            let gene_weights = match (&weights, &weights_fail, &base_mean_counts) {
+                (Some(w), Some(fail), Some(bm)) => {
+                    if fail[i] {
+                        return (f64::NAN, vec![0.0; n_samples]);
+                    }
+                    Some(GeneEstWeights::new(w.row(i).to_vec(), bm.row(i).to_vec(), &design))
+                }
+                _ => None,
+            };
+            estimate_dispersion_gene(&gene_counts, sf_slice, &design, xim, n_samples, use_linear_mu, params, gene_weights.as_ref())
         })
         .collect();
 
@@ -90,6 +168,9 @@ pub fn estimate_gene_dispersions(dds: &mut DESeqDataSet, params: &DispersionPara
     let dispersion_array = Array1::from_vec(dispersions);
     dds.set_gene_dispersions(dispersion_array)?;
     dds.set_mu(mu_matrix)?;
+    if let Some(fail) = weights_fail {
+        dds.set_weights_fail(fail);
+    }
 
     // Store the design matrix for use in MAP dispersion estimation
     dds.set_design_matrix(design)?;
@@ -552,14 +633,15 @@ fn linear_model_mu_for_gene_dispersion(counts: &[f64], size_factors: &[f64], des
 /// with its defaults (betaTol 1e-8, maxit 100, optim fallback), then
 /// fitMu[fitMu < minmu] <- minmu. Reuse the GLM fit rather than a separate IRLS, so
 /// the convergence rule, ridge and fallback are the same ones R uses.
-fn fit_nb_glm_mu(counts: &[f64], size_factors: &[f64], design: &Array2<f64>, alpha: f64) -> Vec<f64> {
+fn fit_nb_glm_mu(counts: &[f64], size_factors: &[f64], design: &Array2<f64>, alpha: f64, weights: Option<&[f64]>) -> Vec<f64> {
     const MINMU: f64 = 0.5;
-    let fit = crate::glm::fit_single_gene(
+    let fit = crate::glm::fit_single_gene_weighted(
         ndarray::ArrayView1::from(counts),
         design,
         ndarray::ArrayView1::from(size_factors),
         alpha,
         &crate::glm::GlmFitParams::default(),
+        weights,
     );
     fit.mu.iter().map(|&m| m.max(MINMU)).collect()
 }
@@ -596,6 +678,12 @@ fn moments_disp_estimate(normalized: &[f64], xim: f64) -> f64 {
 ///
 /// Returns (dispersion, mu) where mu is the expected counts for this gene across samples.
 /// The mu values are needed for MAP dispersion estimation (DESeq2 reuses them).
+///
+/// With observation weights, momentsDispEstimate() uses the weighted baseMean and
+/// baseVar, mu comes from the weighted GLM (`use_linear_mu` must then be false),
+/// and the line search and grid use the weighted log posterior; roughDispEstimate()
+/// stays unweighted, as in R.
+#[allow(clippy::too_many_arguments)]
 pub fn estimate_dispersion_gene(
     counts: &[f64],
     size_factors: &[f64],
@@ -604,6 +692,7 @@ pub fn estimate_dispersion_gene(
     n_samples: usize,
     use_linear_mu: bool,
     params: &DispersionParams,
+    weights: Option<&GeneEstWeights>,
 ) -> (f64, Vec<f64>) {
     // R filters out allZero genes: if all counts are zero, return NaN dispersion
     let all_zero = counts.iter().all(|&c| c == 0.0);
@@ -627,7 +716,12 @@ pub fn estimate_dispersion_gene(
     let rough_disp = rough_disp_estimate(counts, size_factors, design);
 
     // Step 2: Calculate momentsDispEstimate
-    let moments_disp = moments_disp_estimate(&normalized, xim);
+    // R: momentsDispEstimate() from mcols baseMean/baseVar (weighted when weights are set)
+    let moments_disp = match weights {
+        Some(w) => moments_disp_estimate(&w.base_mean_counts, xim),
+        None => moments_disp_estimate(&normalized, xim),
+    };
+    let disp_w = weights.map(|w| &w.disp);
 
     // Step 3: alpha_init = min(roughDisp, momentsDisp), clamped to [minDisp, maxDisp]
     let alpha_init = rough_disp.min(moments_disp).max(min_disp).min(max_disp);
@@ -639,12 +733,12 @@ pub fn estimate_dispersion_gene(
     let mu = if use_linear_mu {
         linear_model_mu_for_gene_dispersion(counts, size_factors, design)
     } else {
-        fit_nb_glm_mu(counts, size_factors, design, alpha_init)
+        fit_nb_glm_mu(counts, size_factors, design, alpha_init, weights.map(|w| w.glm.as_slice()))
     };
 
     // Step 5: Optimize dispersion with FIXED mu using DESeq2's Armijo line search
     // Returns (alpha_mle, initial_lp, last_lp, iter_count)
-    let (alpha_mle, initial_lp, last_lp, iter_count) = optimize_dispersion_with_mu_deseq2_full(counts, design, &mu, alpha_init, max_disp, params);
+    let (alpha_mle, initial_lp, last_lp, iter_count) = optimize_dispersion_with_mu_deseq2_full(counts, design, &mu, alpha_init, max_disp, params, disp_w);
 
     // Step 6: Apply noIncrease condition (DESeq2 R code line 828-831)
     // noIncrease <- last_lp < initial_lp + abs(initial_lp)/1e6
@@ -665,7 +759,7 @@ pub fn estimate_dispersion_gene(
 
     if refit_disp {
         // Fall back to grid search (DESeq2's fitDispGrid)
-        let grid_result = grid_search_dispersion(counts, design, &mu, min_disp, max_disp);
+        let grid_result = grid_search_dispersion(counts, design, &mu, min_disp, max_disp, disp_w);
         result = grid_result;
     }
 
@@ -680,6 +774,7 @@ fn grid_search_dispersion(
     mu: &[f64],
     min_disp: f64,
     max_disp: f64,
+    weights: Option<&DispWeights>,
 ) -> f64 {
     let min_log_alpha = min_disp.ln();
     let max_log_alpha = max_disp.ln();
@@ -693,7 +788,7 @@ fn grid_search_dispersion(
 
     // Evaluate log-posterior on coarse grid
     let coarse_lp: Vec<f64> = coarse_grid.iter()
-        .map(|&log_alpha| log_posterior_deseq2(counts, design, mu, log_alpha))
+        .map(|&log_alpha| log_posterior_deseq2(counts, design, mu, log_alpha, weights))
         .collect();
 
     // Find maximum on coarse grid
@@ -718,7 +813,7 @@ fn grid_search_dispersion(
 
     // Evaluate log-posterior on fine grid
     let fine_lp: Vec<f64> = fine_grid.iter()
-        .map(|&log_alpha| log_posterior_deseq2(counts, design, mu, log_alpha))
+        .map(|&log_alpha| log_posterior_deseq2(counts, design, mu, log_alpha, weights))
         .collect();
 
     // Find maximum on fine grid
@@ -742,11 +837,13 @@ fn optimize_dispersion_with_mu_deseq2_full(
     alpha_init: f64,
     max_disp: f64,
     params: &DispersionParams,
+    weights: Option<&DispWeights>,
 ) -> (f64, f64, f64, usize) {
-    optimize_dispersion_with_mu_deseq2_internal_full(counts, design, mu, alpha_init, false, max_disp, params)
+    optimize_dispersion_with_mu_deseq2_internal_full(counts, design, mu, alpha_init, false, max_disp, params, weights)
 }
 
 /// Internal optimization function with optional debug output - returns iter_count
+#[allow(clippy::too_many_arguments)]
 fn optimize_dispersion_with_mu_deseq2_internal_full(
     counts: &[f64],
     design: &Array2<f64>,
@@ -755,6 +852,7 @@ fn optimize_dispersion_with_mu_deseq2_internal_full(
     debug: bool,
     max_disp: f64,
     params: &DispersionParams,
+    weights: Option<&DispWeights>,
 ) -> (f64, f64, f64, usize) {
     // DESeq2 parameters (from C++ source), now configurable via params
     let min_log_alpha_hard = -30.0;  // C++ hard bound for proposals
@@ -767,9 +865,9 @@ fn optimize_dispersion_with_mu_deseq2_internal_full(
 
     // Initialize
     let mut log_alpha = alpha_init.max(1e-10).ln().max(min_log_alpha_hard).min(max_log_alpha);
-    let initial_lp = log_posterior_deseq2(counts, design, mu, log_alpha);
+    let initial_lp = log_posterior_deseq2(counts, design, mu, log_alpha, weights);
     let mut lp = initial_lp;
-    let mut dlp = d_log_posterior_deseq2_analytical(counts, design, mu, log_alpha);
+    let mut dlp = d_log_posterior_deseq2_analytical(counts, design, mu, log_alpha, weights);
     let mut kappa = kappa_0;
 
     if debug {
@@ -795,7 +893,7 @@ fn optimize_dispersion_with_mu_deseq2_internal_full(
         let a_propose = log_alpha + kappa * dlp;
 
         // Evaluate theta(kappa) = -log_posterior (we minimize theta)
-        let lp_propose = log_posterior_deseq2(counts, design, mu, a_propose);
+        let lp_propose = log_posterior_deseq2(counts, design, mu, a_propose, weights);
         let theta_kappa = -lp_propose;
         let theta_hat_kappa = -lp - kappa * epsilon * dlp * dlp;
 
@@ -832,7 +930,7 @@ fn optimize_dispersion_with_mu_deseq2_internal_full(
             }
 
             lp = lpnew;
-            dlp = d_log_posterior_deseq2_analytical(counts, design, mu, log_alpha);
+            dlp = d_log_posterior_deseq2_analytical(counts, design, mu, log_alpha, weights);
 
             // Adjust step size (DESeq2 style)
             kappa = (kappa * 1.1).min(kappa_0);
@@ -860,11 +958,16 @@ fn optimize_dispersion_with_mu_deseq2_internal_full(
 
 /// Analytical derivative of log-posterior w.r.t. log(alpha)
 /// Matches DESeq2's C++ implementation exactly
+///
+/// With observation weights (`useWeights`), each sample's likelihood term is
+/// multiplied by its weight and the Cox-Reid term uses only the samples with
+/// weight > weightThreshold (its own weights are not multiplied by them).
 fn d_log_posterior_deseq2_analytical(
     counts: &[f64],
     design: &Array2<f64>,
     mu: &[f64],
     log_alpha: f64,
+    weights: Option<&DispWeights>,
 ) -> f64 {
     let alpha = log_alpha.exp();
     let alpha_sq = alpha * alpha;
@@ -889,11 +992,31 @@ fn d_log_posterior_deseq2_analytical(
         // = (1/alpha^2)*log(1 + mu*alpha) - mu / (alpha * (1 + mu*alpha))
         let term4 = (1.0 + mu_i * alpha).ln() / alpha_sq - mu_i / (alpha * (1.0 + mu_i * alpha));
 
-        dll_dalpha += term1 + term2 + term3 + term4;
+        match weights {
+            Some(w) => dll_dalpha += w.w[i] * (term1 + term2 + term3 + term4),
+            None => dll_dalpha += term1 + term2 + term3 + term4,
+        }
     }
 
     // Convert to d/d(log_alpha) by multiplying by alpha
     let dll_dlog_alpha = dll_dalpha * alpha;
+
+    let dcr_dalpha = match weights {
+        Some(w) => d_cox_reid_dalpha(&w.cr_design, &w.cr_mu(mu), alpha),
+        None => d_cox_reid_dalpha(design, mu, alpha),
+    };
+
+    // Convert CR derivative to d/d(log_alpha) by multiplying by alpha
+    // This matches R's formula: return (ll_part + cr_term) * alpha
+    let dcr_dlog_alpha = dcr_dalpha * alpha;
+
+    dll_dlog_alpha + dcr_dlog_alpha
+}
+
+/// Derivative w.r.t. alpha of the Cox-Reid term -0.5 * log|X'WX|, w_i = 1/(1/mu_i + alpha)
+/// R: the `cr_term` of DESeq2.cpp `dlog_posterior`
+fn d_cox_reid_dalpha(design: &Array2<f64>, mu: &[f64], alpha: f64) -> f64 {
+    let n = mu.len();
 
     // Analytical Cox-Reid derivative matching DESeq2's C++ implementation
     // CR term = -0.5 * log|X'WX| where w_i = 1/(1/mu_i + alpha)
@@ -901,7 +1024,7 @@ fn d_log_posterior_deseq2_analytical(
     // dw_i/dalpha = -w_i^2, so dB/dalpha = X' * diag(dw) * X
     let p = design.ncols();
 
-    let dcr_dalpha = if p == 2 {
+    if p == 2 {
         // Optimized 2x2 path (most common: simple two-condition design)
         let mut b = [[0.0f64; 2]; 2];
         let mut db = [[0.0f64; 2]; 2];
@@ -956,26 +1079,38 @@ fn d_log_posterior_deseq2_analytical(
             // If singular, contribution is 0
         }
         -0.5 * trace
-    };
-
-    // Convert CR derivative to d/d(log_alpha) by multiplying by alpha
-    // This matches R's formula: return (ll_part + cr_term) * alpha
-    let dcr_dlog_alpha = dcr_dalpha * alpha;
-
-    dll_dlog_alpha + dcr_dlog_alpha
+    }
 }
 
 /// DESeq2's log-posterior function (without prior for gene estimation)
+///
+/// With observation weights the likelihood is `sum(w * ll_i)` and the Cox-Reid
+/// term uses only the samples with weight > weightThreshold (DESeq2.cpp
+/// `log_posterior` with `useWeights`).
 fn log_posterior_deseq2(
     counts: &[f64],
     design: &Array2<f64>,
     mu: &[f64],
     log_alpha: f64,
+    obs_weights: Option<&DispWeights>,
 ) -> f64 {
     let n = counts.len();
-    let p = design.ncols();
     let alpha = log_alpha.exp();
     let alpha_inv = 1.0 / alpha;
+
+    if let Some(w) = obs_weights {
+        let mut ll_part = 0.0;
+        for i in 0..n {
+            let y = counts[i];
+            let mu_i = mu[i].max(1e-10);
+            let ll_i = lgamma(y + alpha_inv) - lgamma(alpha_inv) - y * (mu_i + alpha_inv).ln()
+                - alpha_inv * (1.0 + mu_i * alpha).ln();
+            ll_part += w.w[i] * ll_i;
+        }
+        let cr_mu = w.cr_mu(mu);
+        let cr_w: Vec<f64> = cr_mu.iter().map(|&m| 1.0 / (1.0 / m.max(1e-10) + alpha)).collect();
+        return ll_part + cox_reid_term(&w.cr_design, &cr_w);
+    }
 
     let mut ll_part = 0.0;
     let mut weights = vec![0.0; n];
@@ -993,6 +1128,14 @@ fn log_posterior_deseq2(
         // Weight for Cox-Reid adjustment: w = 1 / (1/mu + alpha)
         weights[i] = 1.0 / (1.0 / mu_i + alpha);
     }
+
+    ll_part + cox_reid_term(design, &weights)
+}
+
+/// Cox-Reid adjustment -0.5 * log|X'WX| for GLM weights `weights` (w_i = 1/(1/mu_i + alpha))
+fn cox_reid_term(design: &Array2<f64>, weights: &[f64]) -> f64 {
+    let n = weights.len();
+    let p = design.ncols();
 
     // Cox-Reid adjustment: -0.5 * log|X'WX|
     // Use optimized 2x2 path for simple designs
@@ -1017,9 +1160,7 @@ fn log_posterior_deseq2(
         }
         matrix_determinant(&xtwx)
     };
-    let cr_term = if det > 1e-10 { -0.5 * det.ln() } else { 0.0 };
-
-    ll_part + cr_term
+    if det > 1e-10 { -0.5 * det.ln() } else { 0.0 }
 }
 
 /// Digamma function
@@ -1085,7 +1226,7 @@ pub fn debug_gene_dispersion(
     let debug_params = DispersionParams::default();
     eprintln!("\nOptimization trace:");
     let (_alpha_mle, initial_lp, last_lp, iter_count) = optimize_dispersion_with_mu_deseq2_internal_full(
-        counts, &design, &mu, alpha_init, true, max_disp, &debug_params
+        counts, &design, &mu, alpha_init, true, max_disp, &debug_params, None
     );
 
     // Check noIncrease condition
@@ -1109,7 +1250,7 @@ pub fn debug_gene_dispersion(
 
     if refit_disp {
         eprintln!("\nRunning grid search fallback...");
-        let grid_result = grid_search_dispersion(counts, &design, &mu, min_disp, max_disp);
+        let grid_result = grid_search_dispersion(counts, &design, &mu, min_disp, max_disp, None);
         eprintln!("Grid search result: {:.6e}", grid_result);
     }
 }
@@ -1229,7 +1370,7 @@ mod tests {
 
         let use_linear = is_linear_mu(&design);
         let params = DispersionParams::default();
-        let (disp, _mu) = estimate_dispersion_gene(&counts, &size_factors, &design, xim, 6, use_linear, &params);
+        let (disp, _mu) = estimate_dispersion_gene(&counts, &size_factors, &design, xim, 6, use_linear, &params, None);
         // Dispersion should be clamped to max_disp = max(6, 10) = 10.0
         assert!(disp <= 10.0);
 
@@ -1242,7 +1383,7 @@ mod tests {
         let xim_15: f64 = size_factors_15.iter().map(|&s: &f64| 1.0 / s.max(1e-10)).sum::<f64>() / 15.0;
 
         let use_linear_15 = is_linear_mu(&design_15);
-        let (disp_15, _mu_15) = estimate_dispersion_gene(&counts_15, &size_factors_15, &design_15, xim_15, 15, use_linear_15, &params);
+        let (disp_15, _mu_15) = estimate_dispersion_gene(&counts_15, &size_factors_15, &design_15, xim_15, 15, use_linear_15, &params, None);
         // Dispersion should be clamped to max_disp = max(15, 10) = 15.0
         assert!(disp_15 <= 15.0);
 

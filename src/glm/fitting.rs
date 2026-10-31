@@ -97,6 +97,11 @@ pub fn fit_glm(dds: &mut DESeqDataSet, params: &GlmFitParams) -> Result<DesignIn
     let size_factors = dds.size_factors().unwrap();
     let dispersions = dds.dispersions().unwrap();
     let n_genes = dds.n_genes();
+    // R (fitNbinomGLMs): getAndCheckWeights() weights, normalised by row maximum.
+    // Genes whose weights fail the check are allZero in R and never fitted; they
+    // are fitted unweighted here and reported as NA by the tests.
+    let weights = dds.normalized_weights();
+    let weights_fail = dds.weights_fail();
 
     // Fit GLM for each gene in parallel
     let results: Vec<GlmFitResult> = (0..n_genes)
@@ -104,7 +109,8 @@ pub fn fit_glm(dds: &mut DESeqDataSet, params: &GlmFitParams) -> Result<DesignIn
         .map(|i| {
             let gene_counts = counts.row(i);
             let alpha = dispersions[i];
-            fit_single_gene(gene_counts, &design, size_factors.view(), alpha, params)
+            let w = gene_weights(weights.as_ref(), weights_fail, i);
+            fit_single_gene_weighted(gene_counts, &design, size_factors.view(), alpha, params, w.as_deref())
         })
         .collect();
 
@@ -162,6 +168,18 @@ pub struct GlmFitResult {
     pub log_likelihood: f64,
 }
 
+/// Normalised observation weights of gene `i` for the GLM fits, or `None` without
+/// weights or when the gene's weights fail getAndCheckWeights().
+pub(crate) fn gene_weights(weights: Option<&Array2<f64>>, weights_fail: Option<&Vec<bool>>, i: usize) -> Option<Vec<f64>> {
+    let w = weights?;
+    if weights_fail.is_some_and(|f| f[i]) {
+        return None;
+    }
+    Some(w.row(i).to_vec())
+}
+
+/// Fit the NB GLM of one gene without observation weights.
+/// R equivalent: fitNbinomGLMs() for one row (C++ fitBeta, then fitNbinomGLMsOptim)
 pub fn fit_single_gene(
     counts: ArrayView1<f64>,
     design: &Array2<f64>,
@@ -169,6 +187,30 @@ pub fn fit_single_gene(
     alpha: f64,
     params: &GlmFitParams,
 ) -> GlmFitResult {
+    fit_single_gene_weighted(counts, design, size_factors, alpha, params, None)
+}
+
+/// Fit the NB GLM of one gene with optional observation weights (normalised
+/// by row maximum, as getAndCheckWeights() returns them).
+/// R equivalent: fitNbinomGLMs() for one row with `useWeights`: the IRLS weights
+/// are `weights * mu/(1 + alpha*mu)` (C++ fitBeta), the convergence deviance,
+/// the logLike and the optim() objective are weighted sums, and the hat
+/// diagonals and sandwich covariance use the weighted IRLS weights.
+pub fn fit_single_gene_weighted(
+    counts: ArrayView1<f64>,
+    design: &Array2<f64>,
+    size_factors: ArrayView1<f64>,
+    alpha: f64,
+    params: &GlmFitParams,
+    obs_weights: Option<&[f64]>,
+) -> GlmFitResult {
+    // IRLS weight of sample i: R `weights.row(i).t() % mu_hat/(1.0 + alpha_hat(i) * mu_hat)`
+    let irls_weight = |i: usize, mu: f64| -> f64 {
+        match obs_weights {
+            Some(w) => w[i] * mu / (1.0 + alpha * mu),
+            None => nb_weight(mu, alpha),
+        }
+    };
     let n_samples = counts.len();
     let n_coefs = design.ncols();
     let max_iter = params.maxit;
@@ -228,7 +270,7 @@ pub fn fit_single_gene(
             let mu_raw = nb_mean(eta, size_factors[i]);
             let mu_clamped = mu_raw.max(MIN_MU);
             mus[i] = mu_clamped;
-            weights[i] = nb_weight(mu_clamped, alpha);
+            weights[i] = irls_weight(i, mu_clamped);
             working_response[i] = (mu_clamped / size_factors[i]).ln() + (counts[i] - mu_clamped) / mu_clamped;
         }
 
@@ -250,12 +292,18 @@ pub fn fit_single_gene(
 
         // Compute deviance
         // R C++: dev = sum(-2.0 * Rf_dnbinom_mu(yrow(j), 1.0/alpha_hat(i), mu_hat(j), 1))
-        let dev: f64 = mus.iter().zip(counts.iter())
-            .map(|(&mu, &y)| {
-                let r = 1.0 / alpha;
-                -2.0 * nb_log_likelihood_for_deviance(y, mu, r)
-            })
-            .sum();
+        // (with weights: -2.0 * weights(i,j) * Rf_dnbinom_mu(...))
+        let dev: f64 = match obs_weights {
+            None => mus.iter().zip(counts.iter())
+                .map(|(&mu, &y)| {
+                    let r = 1.0 / alpha;
+                    -2.0 * nb_log_likelihood_for_deviance(y, mu, r)
+                })
+                .sum(),
+            Some(w) => (0..n_samples)
+                .map(|i| -2.0 * w[i] * nb_log_likelihood_for_deviance(counts[i], mus[i], 1.0 / alpha))
+                .sum(),
+        };
 
         // Convergence test
         // R C++: conv_test = fabs(dev - dev_old)/(fabs(dev) + 0.1)
@@ -305,7 +353,7 @@ pub fn fit_single_gene(
     // distances are computed from that H. `mus` holds the clamped mu the C++ loop
     // last computed, so these are the weights fitBeta used for hat_diagonals.
     let irls_hat = if needs_optim {
-        let irls_weights: Vec<f64> = mus.iter().map(|&mu| nb_weight(mu, alpha)).collect();
+        let irls_weights: Vec<f64> = mus.iter().enumerate().map(|(i, &mu)| irls_weight(i, mu)).collect();
         Some(calculate_standard_errors_and_hat(design, &irls_weights).1)
     } else {
         None
@@ -330,7 +378,7 @@ pub fn fit_single_gene(
         let sf_slice: Vec<f64> = size_factors.to_vec();
         // R: lambda <- rep(1e-6, ncol(modelMatrix))  (log2 scale)
         let lambda_log2 = vec![1e-6; n_coefs];
-        let fit = optim_nb_fallback_fitting(&counts_slice, &sf_slice, alpha, design, &start, &lambda_log2);
+        let fit = optim_nb_fallback_fitting(&counts_slice, &sf_slice, alpha, design, &start, &lambda_log2, obs_weights);
         // R: betaMatrix[row,] <- o$par (stored here on the natural-log scale)
         beta = fit.beta_log2.iter().map(|&p| p * std::f64::consts::LN_2).collect();
         // R: if (o$convergence == 0) betaConv[row] <- TRUE
@@ -347,9 +395,13 @@ pub fn fit_single_gene(
     let log_likelihood = if let Some(fit) = &optim_fit {
         // R (fitNbinomGLMsOptim): mu[row,] <- nf * 2^(x %*% o$par) (unclamped);
         // w <- diag((mu_row^-1 + alpha)^-1) and logLike from mu_row clamped at minmu.
+        // With weights: w <- diag(weights[row,] * (mu_row^-1 + alpha)^-1)
         mus.copy_from_slice(&fit.mu);
-        for (w, &m) in weights.iter_mut().zip(&fit.mu_clamped) {
-            *w = 1.0 / (1.0 / m + alpha);
+        for (i, (w, &m)) in weights.iter_mut().zip(&fit.mu_clamped).enumerate() {
+            *w = match obs_weights {
+                Some(ow) => ow[i] * (1.0 / (1.0 / m + alpha)),
+                None => 1.0 / (1.0 / m + alpha),
+            };
         }
         fit.log_likelihood
     } else {
@@ -357,14 +409,18 @@ pub fn fit_single_gene(
         // unclamped nf * exp(X beta), as in R's fitNbinomGLMs; Cook's distances are
         // computed from it. R: logLike <- nbinomLogLike(counts, mu, ...) with the
         // unclamped mu.
+        // With weights (nbinomLogLike): rowSums(weights * dnbinom(...)).
         let size = 1.0 / alpha;
         let mut ll = 0.0;
         for i in 0..n_samples {
             let eta: f64 = (0..n_coefs).map(|j| design[[i, j]] * beta[j]).sum();
             let mu = nb_mean(eta, size_factors[i]);
             mus[i] = mu;
-            weights[i] = nb_weight(mu.max(MIN_MU), alpha);
-            ll += nb_log_likelihood_for_deviance(counts[i], mu, size);
+            weights[i] = irls_weight(i, mu.max(MIN_MU));
+            match obs_weights {
+                Some(w) => ll += w[i] * nb_log_likelihood_for_deviance(counts[i], mu, size),
+                None => ll += nb_log_likelihood_for_deviance(counts[i], mu, size),
+            }
         }
         ll
     };
@@ -587,6 +643,9 @@ fn optim_mu_row(design: &Array2<f64>, nf: &[f64], p: &[f64]) -> Vec<f64> {
 /// R stops with an error if `optim()` does; that cannot happen here because
 /// non-finite objective values are replaced by 1e300. Should it happen
 /// anyway, the starting values are returned as not converged.
+///
+/// With observation weights (`useWeights`) the objective's and the stored
+/// logLike are `sum(weights[row,] * logLikeVector)`.
 fn optim_nb_fallback_fitting(
     counts: &[f64],
     size_factors: &[f64],
@@ -594,6 +653,7 @@ fn optim_nb_fallback_fitting(
     design: &Array2<f64>,
     beta_row: &[f64],
     lambda: &[f64],
+    obs_weights: Option<&[f64]>,
 ) -> OptimFallbackResult {
     const LARGE: f64 = 30.0;
     const MINMU: f64 = MIN_MU;
@@ -602,7 +662,10 @@ fn optim_nb_fallback_fitting(
 
     let objective = |p: &[f64]| -> f64 {
         let mu_row = optim_mu_row(design, size_factors, p);
-        let log_like = r_sum((0..counts.len()).map(|i| dnbinom_mu_log(counts[i], size, mu_row[i])));
+        let log_like = match obs_weights {
+            Some(w) => r_sum((0..counts.len()).map(|i| w[i] * dnbinom_mu_log(counts[i], size, mu_row[i]))),
+            None => r_sum((0..counts.len()).map(|i| dnbinom_mu_log(counts[i], size, mu_row[i]))),
+        };
         let log_prior = r_sum(p.iter().zip(&sd).map(|(&pj, &s)| dnorm_log(pj, 0.0, s)));
         // R: -1 * (logLike + logPrior), which is exactly the negation
         let neg_log_post = -(log_like + log_prior);
@@ -621,7 +684,10 @@ fn optim_nb_fallback_fitting(
 
     let mu = optim_mu_row(design, size_factors, &par);
     let mu_clamped: Vec<f64> = mu.iter().map(|&m| if m < MINMU { MINMU } else { m }).collect();
-    let log_likelihood = r_sum((0..counts.len()).map(|i| dnbinom_mu_log(counts[i], size, mu_clamped[i])));
+    let log_likelihood = match obs_weights {
+        Some(w) => r_sum((0..counts.len()).map(|i| w[i] * dnbinom_mu_log(counts[i], size, mu_clamped[i]))),
+        None => r_sum((0..counts.len()).map(|i| dnbinom_mu_log(counts[i], size, mu_clamped[i]))),
+    };
 
     OptimFallbackResult {
         beta_log2: par,
@@ -849,7 +915,7 @@ fn fit_single_gene_with_lambda(
         let counts_slice: Vec<f64> = counts.to_vec();
         let sf_slice: Vec<f64> = size_factors.to_vec();
         let optim_result = optim_nb_fallback_fitting(
-            &counts_slice, &sf_slice, alpha, design, &initial_for_optim, &lambda_log2,
+            &counts_slice, &sf_slice, alpha, design, &initial_for_optim, &lambda_log2, None,
         );
 
         // Use optim result UNCONDITIONALLY (R: betaMatrix[row,] <- o$par)
@@ -1020,7 +1086,7 @@ mod tests {
         ];
         let x = design_3v3();
         for (k, alpha, start, r_par) in cases {
-            let fit = optim_nb_fallback_fitting(k, &SF, alpha, &x, &start, &[1e-6, 1e-6]);
+            let fit = optim_nb_fallback_fitting(k, &SF, alpha, &x, &start, &[1e-6, 1e-6], None);
             assert!(fit.optim_converged);
             for j in 0..2 {
                 let rel = (fit.beta_log2[j] - r_par[j]).abs() / r_par[j].abs();

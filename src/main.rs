@@ -87,6 +87,7 @@ fn main() {
             upper_quantile,
             threads,
             no_independent_filtering,
+            weights,
             cooks_cutoff,
         }) => run_analysis(
             &counts,
@@ -119,6 +120,7 @@ fn main() {
             upper_quantile,
             threads,
             no_independent_filtering,
+            weights.as_deref(),
             cooks_cutoff,
         ),
         Some(Commands::Normalize {
@@ -250,6 +252,7 @@ fn run_analysis(
     upper_quantile: f64,
     threads: usize,
     no_independent_filtering: bool,
+    weights_path: Option<&str>,
     cooks_cutoff_override: Option<f64>,
 ) -> Result<()> {
     use rust_deseq2::testing::likelihood_ratio_test;
@@ -381,6 +384,21 @@ fn run_analysis(
 
         builder.build()?
     };
+
+    // Observation weights (R: assays(dds)[["weights"]])
+    if let Some(path) = weights_path {
+        if shrinkage && shrinkage_method != "ashr" {
+            return Err(DeseqError::InvalidInput {
+                reason: format!(
+                    "--shrinkage-method {} does not support --weights (use ashr, which only needs the LFC and its SE)",
+                    shrinkage_method
+                ),
+            });
+        }
+        info!("Loading observation weights from: {}", path);
+        let w = rust_deseq2::io::read_weight_matrix(path, dds.counts().gene_ids(), dds.counts().sample_ids())?;
+        dds.set_weights(w)?;
+    }
 
     let sf_method = match sf_type {
         "poscounts" => SizeFactorMethod::PosCounts,

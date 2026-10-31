@@ -38,6 +38,12 @@ pub struct DESeqDataSet {
     normalization_factors: Option<Array2<f64>>,
     /// Normalized counts (counts / size_factors or counts / normalization_factors)
     normalized_counts: Option<Array2<f64>>,
+    /// Raw observation weights (genes x samples), as supplied
+    /// R equivalent: assays(dds)[["weights"]]
+    weights: Option<Array2<f64>>,
+    /// Genes whose weights do not allow parameter estimation
+    /// R equivalent: mcols(dds)$weightsFail (these genes are treated as allZero)
+    weights_fail: Option<Vec<bool>>,
 
     // Dispersion estimation results
     /// Gene-wise dispersion estimates (MLE)
@@ -135,6 +141,8 @@ impl DESeqDataSet {
             size_factors: None,
             normalization_factors: None,
             normalized_counts: None,
+            weights: None,
+            weights_fail: None,
             gene_dispersions: None,
             trended_dispersions: None,
             map_dispersions: None,
@@ -201,6 +209,74 @@ impl DESeqDataSet {
 
     pub fn gene_dispersions(&self) -> Option<&Array1<f64>> {
         self.gene_dispersions.as_ref()
+    }
+
+    /// Raw observation weights (genes x samples), if set.
+    /// R equivalent: assays(dds)[["weights"]]
+    pub fn weights(&self) -> Option<&Array2<f64>> {
+        self.weights.as_ref()
+    }
+
+    /// Set observation weights (genes x samples). They are stored as given; the
+    /// fits use them normalised by their row maximum, as R's getAndCheckWeights()
+    /// does, while baseMean/baseVar use the raw values (getBaseMeansAndVariances()).
+    /// R equivalent: assays(dds)[["weights"]] <- w (with stopifnot(all(weights >= 0)))
+    pub fn set_weights(&mut self, weights: Array2<f64>) -> Result<()> {
+        if weights.nrows() != self.n_genes() || weights.ncols() != self.n_samples() {
+            return Err(DeseqError::DimensionMismatch {
+                expected: format!("{}x{} weight matrix", self.n_genes(), self.n_samples()),
+                got: format!("{}x{}", weights.nrows(), weights.ncols()),
+            });
+        }
+        if weights.iter().any(|&x| !x.is_finite() || x < 0.0) {
+            return Err(DeseqError::InvalidInput {
+                reason: "weights must be non-negative finite values".to_string(),
+            });
+        }
+        self.weights = Some(weights);
+        self.weights_fail = None;
+        Ok(())
+    }
+
+    /// Observation weights normalised by their row maximum, if weights are set.
+    /// R equivalent: getAndCheckWeights(object, modelMatrix)$weights
+    pub fn normalized_weights(&self) -> Option<Array2<f64>> {
+        self.weights.as_ref().map(super::weights::normalize_weights)
+    }
+
+    /// Genes whose weights do not allow parameter estimation (set during
+    /// gene-wise dispersion estimation).
+    /// R equivalent: mcols(dds)$weightsFail
+    pub fn weights_fail(&self) -> Option<&Vec<bool>> {
+        self.weights_fail.as_ref()
+    }
+
+    pub(crate) fn set_weights_fail(&mut self, fail: Vec<bool>) {
+        self.weights_fail = Some(fail);
+    }
+
+    /// Genes R excludes from fitting: all counts zero, or (with weights) the
+    /// weights fail getAndCheckWeights().
+    /// R equivalent: mcols(dds)$allZero
+    pub fn all_zero(&self) -> Vec<bool> {
+        let counts = self.counts.counts();
+        (0..self.n_genes())
+            .map(|i| {
+                counts.row(i).iter().all(|&c| c == 0.0)
+                    || self.weights_fail.as_ref().is_some_and(|f| f[i])
+            })
+            .collect()
+    }
+
+    /// The matrix whose row means and variances are baseMean and baseVar:
+    /// the normalized counts, multiplied by the raw weights when weights are set.
+    /// R equivalent: getBaseMeansAndVariances() (cts.norm <- wts * cts.norm)
+    pub fn base_mean_counts(&self) -> Option<std::borrow::Cow<'_, Array2<f64>>> {
+        let nc = self.normalized_counts.as_ref()?;
+        Some(match &self.weights {
+            Some(w) => std::borrow::Cow::Owned(w * nc),
+            None => std::borrow::Cow::Borrowed(nc),
+        })
     }
 
     pub fn trended_dispersions(&self) -> Option<&Array1<f64>> {

@@ -24,6 +24,55 @@ fn strip_quotes(s: &str) -> String {
 /// No direct R equivalent -- Rust-specific I/O helper
 /// Expected format: first column is gene IDs, first row is sample IDs
 pub fn read_count_matrix<P: AsRef<Path>>(path: P) -> Result<CountMatrix> {
+    let (counts, gene_ids, sample_ids) = read_numeric_matrix(path)?;
+    CountMatrix::new(counts, gene_ids, sample_ids)
+}
+
+/// Read a genes x samples matrix of observation weights, in the layout of the
+/// count matrix (first column gene IDs, first row sample IDs; CSV or TSV), and
+/// return it with its rows and columns in the order of `gene_ids` / `sample_ids`.
+/// The weights file must contain exactly these genes and samples.
+/// R equivalent: assays(dds)[["weights"]] <- w
+pub fn read_weight_matrix<P: AsRef<Path>>(path: P, gene_ids: &[String], sample_ids: &[String]) -> Result<Array2<f64>> {
+    let (values, w_genes, w_samples) = read_numeric_matrix(path)?;
+    let index = |ids: &[String], what: &str| -> Result<HashMap<String, usize>> {
+        let mut map = HashMap::with_capacity(ids.len());
+        for (k, id) in ids.iter().enumerate() {
+            if map.insert(id.clone(), k).is_some() {
+                return Err(DeseqError::InvalidInput {
+                    reason: format!("Duplicate {} ID '{}' in weights file", what, id),
+                });
+            }
+        }
+        Ok(map)
+    };
+    let gene_pos = index(&w_genes, "gene")?;
+    let sample_pos = index(&w_samples, "sample")?;
+    let check = |want: &[String], have: &HashMap<String, usize>, what: &str| -> Result<Vec<usize>> {
+        if want.len() != have.len() {
+            return Err(DeseqError::InvalidInput {
+                reason: format!(
+                    "Weights file has {} {}s, count matrix has {}",
+                    have.len(), what, want.len()
+                ),
+            });
+        }
+        want.iter()
+            .map(|id| {
+                have.get(id).copied().ok_or_else(|| DeseqError::InvalidInput {
+                    reason: format!("{} '{}' of the count matrix is missing from the weights file", what, id),
+                })
+            })
+            .collect()
+    };
+    let rows = check(gene_ids, &gene_pos, "gene")?;
+    let cols = check(sample_ids, &sample_pos, "sample")?;
+    Ok(Array2::from_shape_fn((rows.len(), cols.len()), |(i, j)| values[[rows[i], cols[j]]]))
+}
+
+/// Read a numeric matrix with gene IDs in the first column and sample IDs in the
+/// header row (comma- or tab-delimited).
+fn read_numeric_matrix<P: AsRef<Path>>(path: P) -> Result<(Array2<f64>, Vec<String>, Vec<String>)> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
@@ -103,7 +152,7 @@ pub fn read_count_matrix<P: AsRef<Path>>(path: P) -> Result<CountMatrix> {
         }
     }
 
-    CountMatrix::new(counts, gene_ids, sample_ids)
+    Ok((counts, gene_ids, sample_ids))
 }
 
 /// Read sample metadata from a CSV file

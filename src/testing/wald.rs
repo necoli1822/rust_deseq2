@@ -156,7 +156,8 @@ pub fn wald_test_extended(
     let nonzero: Vec<usize> = (0..n_coefs).filter(|&j| contrast_vec[j] != 0.0).collect();
 
     // Calculate base means and base vars
-    let (base_means, base_vars): (Vec<f64>, Vec<f64>) = if let Some(norm_counts) = dds.normalized_counts() {
+    // R: getBaseMeansAndVariances() -- with observation weights, of weights * normalized counts
+    let (base_means, base_vars): (Vec<f64>, Vec<f64>) = if let Some(norm_counts) = dds.base_mean_counts() {
         let n_samples_f = dds.n_samples() as f64;
         let means: Vec<f64> = norm_counts
             .axis_iter(ndarray::Axis(0))
@@ -175,12 +176,21 @@ pub fn wald_test_extended(
         (vec![f64::NAN; n_genes], vec![f64::NAN; n_genes])
     };
 
+    // R: mcols(object)$allZero -- every statistic is NA for these genes. Without
+    // weights this is baseMean == 0; with weights it also covers zero-weighted
+    // counts and genes whose weights fail getAndCheckWeights() (weightsFail).
+    let all_zero: Vec<bool> = if dds.weights().is_some() {
+        dds.all_zero()
+    } else {
+        base_means.iter().map(|&m| m == 0.0).collect()
+    };
+
     // Calculate log2 fold changes using contrast vector
     // LFC = sum(contrast_vec[j] * beta[j]) for j in coefficients
     // R reports NA for every statistic of an allZero gene (baseMean == 0)
     let mut log2_fold_changes: Vec<f64> = (0..n_genes)
         .map(|i| {
-            if base_means[i] == 0.0 {
+            if all_zero[i] {
                 return f64::NAN;
             }
             let lfc: f64 = (0..n_coefs)
@@ -196,7 +206,7 @@ pub fn wald_test_extended(
     // Otherwise, fallback to diagonal approximation: SE = sqrt(sum(contrast^2 * se^2))
     let lfc_se: Vec<f64> = (0..n_genes)
         .map(|i| {
-            if base_means[i] == 0.0 {
+            if all_zero[i] {
                 return f64::NAN;
             }
             let var = if let Some(covs) = covariances {
@@ -234,7 +244,7 @@ pub fn wald_test_extended(
     let mut stat: Vec<f64> = (0..n_genes)
         .map(|i| {
             // R sets pvalue/padj to NA for allZero genes (baseMean == 0)
-            if base_means[i] == 0.0 {
+            if all_zero[i] {
                 return f64::NAN;
             }
 
@@ -279,7 +289,7 @@ pub fn wald_test_extended(
             let counts = dds.counts().counts();
             (0..n_genes)
                 .map(|i| {
-                    base_means[i] != 0.0
+                    !all_zero[i]
                         && samples.iter().enumerate().all(|(j, &used)| !used || counts[[i, j]] == 0.0)
                 })
                 .collect()
@@ -292,7 +302,21 @@ pub fn wald_test_extended(
     }
 
     // Calculate p-values
-    let df = dds.n_samples() as f64 - design_info.coef_names.len() as f64;
+    // R (nbinomWaldTest, useT): df <- num.samps - ncol(dispModelMatrix), where
+    // num.samps is ncol(object), or rowSums of the normalised weights when
+    // weights are present; df <= 0 gives NA.
+    let n_coef_f = design_info.coef_names.len() as f64;
+    let df_gene: Vec<f64> = match dds.normalized_weights() {
+        Some(w) => w
+            .rows()
+            .into_iter()
+            .map(|row| {
+                let df = row.sum() - n_coef_f;
+                if df > 0.0 { df } else { f64::NAN }
+            })
+            .collect(),
+        None => vec![dds.n_samples() as f64 - n_coef_f; n_genes],
+    };
     let mut pvalues: Vec<f64> = if lfc_threshold > 0.0 {
         (0..n_genes)
             .map(|i| {
@@ -303,13 +327,14 @@ pub fn wald_test_extended(
                     log2_fold_changes[i],
                     lfc_se[i],
                     lfc_threshold,
-                    use_t.then_some(df),
+                    use_t.then_some(df_gene[i]),
                 )
             })
             .collect()
     } else if use_t {
         stat.iter()
-            .map(|&z| super::pvalue::calculate_pvalue_t(z, df))
+            .zip(&df_gene)
+            .map(|(&z, &df)| super::pvalue::calculate_pvalue_t(z, df))
             .collect()
     } else {
         stat.iter().map(|&z| calculate_pvalue(z)).collect()

@@ -5,6 +5,7 @@ mod collapse;
 mod count_matrix;
 mod dataset;
 mod metadata;
+pub mod weights;
 
 pub use builder::{DESeqDataSetBuilder, DesignMatrixBuilder, DesignMatrixInfo};
 pub use collapse::collapse_replicates;
