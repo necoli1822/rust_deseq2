@@ -92,6 +92,7 @@ dependencies = [
 name = "h5bench"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "hdf5-pure",
  "rust-hdf5",
 ]

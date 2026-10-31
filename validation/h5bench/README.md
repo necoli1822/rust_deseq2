@@ -97,7 +97,8 @@ median of 20 passes, in ms:
 | `rust-hdf5` | 14 | 18.3 s | 1.89 | MIT |
 | `rust-hdf5` + `parallel` | 20 | 18.6 s | 1.89 | MIT |
 
-Both trees are pure Rust: no `-sys`, `cc` or `cmake`. Deflate comes from `miniz_oxide`
+Both trees are pure Rust: no `-sys`, `cc` or `cmake`. flate2's `zlib-rs` backend for
+`hdf5-pure` is pure Rust too and adds the `zlib-rs` crate that `rust-hdf5` already uses. Deflate comes from `miniz_oxide`
 (and `zlib-rs` for `rust-hdf5`). `hdf5-pure`'s `fast-deflate` feature would add zlib-ng, which
 is C, and was not used. The `parallel` feature adds rayon, which `rust_deseq2` already depends
 on.
@@ -109,19 +110,74 @@ crates.io (2026-10-31):
 Both are 0.x and release often, so either one must be pinned (`~0.x`) and re-checked with
 this harness when upgraded.
 
+### Fairness re-run: same decompressor, application-level threads
+
+The runs above are not a like-for-like comparison:
+- **Different inflaters:** `rust-hdf5` uses `zlib-rs`, while `hdf5-pure` used `flate2`'s
+  default `miniz_oxide`.
+- **No `parallel` in `hdf5-pure`:** it has no parallel feature. Its CHANGELOG says the old
+  `parallel` feature gated a path no public function reached, so it was removed; the
+  `open_streaming` doc comment that still mentions it is stale.
+
+So both crates were re-run with every variant (`run_sc.sh`, 3 runs each; all 100 cases again
+identical to h5py):
+- `hdf5-pure` with `flate2`'s pure-Rust `zlib-rs` backend (the `zlibrs` feature of this
+  harness), the same inflater as `rust-hdf5`;
+- application-level threads for both: a whole dataset is read as 8 row ranges in 8 threads
+  (`*-threads`). `hdf5_pure::File` is `Sync` and is shared. `rust_hdf5::H5File` is not
+  (`Rc` inside unless its `threadsafe` feature is on), so each thread opens the file itself.
+
+This run had another job on the machine (load average 47-51 of 128 threads, a `zstd` using
+about 28 cores). Absolute times are higher than above (h5py most of all), but all variants
+ran under the same conditions.
+
+Full reads, seconds (peak RSS in MB):
+
+| Reader | pbmc_10k_v3 | medium.10x.h5 | medium.h5ad | large.10x.h5 | large.h5ad |
+|---|---:|---:|---:|---:|---:|
+| `hdf5-pure`, miniz_oxide | 0.66 | 1.66 | 1.51 | 12.1 (4,125) | 13.3 (3,032) |
+| `hdf5-pure`, zlib-rs | 0.57 | 1.17 | 1.08 | 8.52 (4,125) | 8.99 (3,034) |
+| `hdf5-pure` stream, zlib-rs | 0.54 | 1.12 | 1.15 | 8.21 (3,454) | 8.51 (2,313) |
+| `rust-hdf5` (1 thread) | 0.47 | 1.09 | 1.02 | 7.24 (3,452) | 7.22 (2,318) |
+| `hdf5-pure` 8 threads, miniz_oxide | 0.41 | 0.71 | 0.43 | 3.93 (6,217) | 4.07 (4,082) |
+| `hdf5-pure` 8 threads, zlib-rs | 0.33 | 0.62 | 0.47 | 4.28 (6,280) | 3.14 (4,169) |
+| `rust-hdf5` 8 threads | 0.29 | 0.59 | 0.40 | 3.16 (3,758) | 1.98 (2,479) |
+| `rust-hdf5` `parallel`, 8 threads | **0.078** | **0.138** | **0.081** | **0.57** (3,493) | **0.42** (2,344) |
+| `rust-hdf5` `parallel`, all threads | 0.083 | 0.137 | 0.086 | 0.60 (3,492) | 0.42 (2,346) |
+| h5py (loaded machine) | 3.68 | 3.77 | 1.62 | 20.2 (3,509) | 12.8 (2,402) |
+
+Partial reads (1,000 cells) were unchanged in ranking:
+- `rust-hdf5` single-threaded: 0.087-0.110 s, 45 MB.
+- `rust-hdf5` `parallel`: 0.049-0.088 s.
+- `hdf5-pure` streaming with zlib-rs: 0.089-0.216 s, 44-58 MB.
+- `hdf5-pure` `File::open`: 0.38-0.45 s, 730-770 MB.
+
+What the fair comparison changes:
+- **Single-threaded, same inflater:** the gap shrinks from 1.6-1.8x to 1.1-1.2x. Most of
+  it was miniz_oxide vs zlib-rs.
+- **Application-level threading** helps both by 2-4x. `rust-hdf5` stays ahead (1.98-3.16
+  s vs 3.14-4.28 s), and `hdf5-pure` threads on a buffered `File::open` need 1.6-1.8x the
+  memory.
+- **Built-in chunk-level parallelism** is what `hdf5-pure` lacks. With the same 8 threads,
+  `rust-hdf5` `parallel` (0.42-0.57 s) is about 7x faster than the best `hdf5-pure` setup
+  (3.1-4.3 s) and 4-5x faster than hand-split threads on `rust-hdf5` itself.
+
 ## Recommendation: `rust-hdf5` with `parallel`
 
-For single-cell-sized files the difference is large and consistent:
-- **Speed:** single-threaded, `rust-hdf5` is 1.6-1.8x faster than `hdf5-pure`. With
-  `parallel` it reads the 672 MB 10x file in 0.58 s, where `hdf5-pure` takes 10.7-11.8 s
-  and h5py (libhdf5) 12.6 s. That is a 20x gain, the same with 8 threads as with 128.
+For single-cell-sized files the difference holds up under a like-for-like comparison:
+- **Speed:** single-threaded with the same inflater, `rust-hdf5` is only 1.1-1.2x faster.
+  The decisive difference is its built-in chunk-level parallel decompression, which
+  `hdf5-pure` does not have. With 8 threads it reads the 672 MB 10x file in 0.57 s, against
+  3.9-4.3 s for the best `hdf5-pure` setup (zlib-rs + 8 application threads), about 7x
+  faster. 8 threads is as fast as 128.
 - **Memory:** `rust-hdf5` reads only what is needed (45 MB for a 1,000-cell range read).
 - **Cost:** the extra build cost is small: 6 s and 12 more dependencies, one of which
   (rayon) this crate already uses.
 
-`hdf5-pure`'s advantages are lighter: fewer dependencies, a dual license and more users.
-Its `File::open` loads the whole file. If it were chosen, `open_streaming` would be
-needed, and that mode is still 1.3-2.3x slower than `rust-hdf5` single-threaded.
+`hdf5-pure`'s advantages are lighter: fewer dependencies, a dual license, more users, and a
+`File` that can be shared between threads as is. Its `File::open` loads the whole file. If
+it were chosen, it would need `open_streaming`, flate2's `zlib-rs` backend and threading in
+the caller, and it would still be about 7x slower on large files.
 
 For kallisto files both are fast enough (≤ 72 ms for 99k transcripts vs rhdf5's 121 ms),
 and `rust-hdf5` is again the faster of the two.
@@ -149,9 +205,10 @@ Their code and builds were removed.
 # h5bench with and without rust-hdf5's parallel feature
 cargo build --release --manifest-path validation/h5bench/Cargo.toml --target-dir /tmp/h5b
 cargo build --release --manifest-path validation/h5bench/Cargo.toml --target-dir /tmp/h5b-par --features par
+cargo build --release --manifest-path validation/h5bench/Cargo.toml --target-dir /tmp/h5b-zr --features zlibrs
 # single-cell files (tool/h5py: python, h5py, anndata, numpy, scipy)
 pixi run --manifest-path tool/h5py/pixi.toml python validation/h5bench/gen_sc.py /tmp/sc 150000 2000 large
-REPEATS=3 bash validation/h5bench/run_sc.sh /tmp/h5b/release/h5bench /tmp/h5b-par/release/h5bench /tmp/scout \
+REPEATS=3 bash validation/h5bench/run_sc.sh /tmp/h5b/release/h5bench /tmp/h5b-zr/release/h5bench /tmp/h5b-par/release/h5bench /tmp/scout \
   /tmp/sc/large.10x.h5:10x /tmp/sc/large.h5ad:h5ad
 # kallisto files (tool/kallisto 0.52.0, tool/kallisto-0.46 0.46.2; reads from sim_reads.py)
 REPEATS=20 bash validation/h5bench/run.sh /tmp/h5b/release/h5bench /tmp/h5b-par/release/h5bench /tmp/kout \

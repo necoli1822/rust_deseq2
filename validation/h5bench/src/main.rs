@@ -3,9 +3,12 @@
 //! usage:
 //!   h5bench kallisto <reader> <abundance.h5> <out.tsv> <repeats>
 //!   h5bench sc <reader> <file> <spec from ref_sc.py> <full|partial>
-//! reader: hdf5-pure (File::open, buffers the whole file) | hdf5-pure-stream
+//! reader: hdf5-pure (File::open, buffers the whole file) | hdf5-pure-threads (File::open,
+//! whole numeric datasets read as row ranges in H5BENCH_THREADS threads, default 8) | hdf5-pure-stream
+//! | rust-hdf5-threads (the same application-level threading)
 //! (File::open_streaming) | rust-hdf5 (built with or without its `parallel` feature;
-//! the `par` feature of this crate turns it on).
+//! the `par` feature of this crate turns it on). The `zlibrs` feature makes hdf5-pure inflate
+//! with zlib-rs instead of miniz_oxide.
 //!
 //! kallisto: reads aux/ids, est_counts, aux/eff_lengths and every bootstrap/bs<k>,
 //! writes them as a TSV and prints the median and minimum of `repeats` passes.
@@ -47,6 +50,18 @@ impl Num {
             Num::F64(v) => v.iter().map(|&x| x.to_bits()).collect(),
         }
     }
+    fn into_i32(self) -> Vec<i32> {
+        if let Num::I32(v) = self { v } else { unreachable!() }
+    }
+    fn into_i64(self) -> Vec<i64> {
+        if let Num::I64(v) = self { v } else { unreachable!() }
+    }
+    fn into_f32(self) -> Vec<f32> {
+        if let Num::F32(v) = self { v } else { unreachable!() }
+    }
+    fn into_f64(self) -> Vec<f64> {
+        if let Num::F64(v) = self { v } else { unreachable!() }
+    }
     fn to_i64(&self) -> Vec<i64> {
         match self {
             Num::I32(v) => v.iter().map(|&x| x as i64).collect(),
@@ -58,7 +73,38 @@ impl Num {
 
 enum Reader {
     Pure(hdf5_pure::File),
+    /// hdf5-pure with application-level threads: a whole numeric dataset is read as
+    /// row ranges in `n` threads sharing the (buffered) file
+    PureThreads(hdf5_pure::File, usize),
     Rh(rust_hdf5::H5File),
+    /// rust-hdf5 with the same application-level threading (without its `parallel`).
+    /// H5File is not Sync (Rc inside, unless the `threadsafe` feature is on), so every
+    /// thread opens the file itself
+    RhThreads(rust_hdf5::H5File, String, usize),
+}
+
+fn env_threads() -> usize {
+    std::env::var("H5BENCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+}
+
+/// Read [0, len) of a 1-D dataset as `threads` row ranges in parallel and concatenate
+fn threaded<T: Send>(len: u64, threads: usize, read: impl Fn(u64, u64) -> R<Vec<T>> + Sync) -> R<Vec<T>> {
+    let step = len.div_ceil(threads as u64).max(1);
+    let parts: Vec<R<Vec<T>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..len)
+            .step_by(step as usize)
+            .map(|lo| {
+                let read = &read;
+                s.spawn(move || read(lo, step.min(len - lo)))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("thread")).collect()
+    });
+    let mut out = Vec::with_capacity(len as usize);
+    for p in parts {
+        out.extend(p?);
+    }
+    Ok(out)
 }
 
 impl Reader {
@@ -66,20 +112,56 @@ impl Reader {
         Ok(match name {
             "hdf5-pure" => Reader::Pure(hdf5_pure::File::open(path).map_err(e("open"))?),
             "hdf5-pure-stream" => Reader::Pure(hdf5_pure::File::open_streaming(path).map_err(e("open"))?),
+            "hdf5-pure-threads" => Reader::PureThreads(hdf5_pure::File::open(path).map_err(e("open"))?, env_threads()),
             "rust-hdf5" => Reader::Rh(rust_hdf5::H5File::open(path).map_err(e("open"))?),
+            "rust-hdf5-threads" => {
+                Reader::RhThreads(rust_hdf5::H5File::open(path).map_err(e("open"))?, path.to_string(), env_threads())
+            }
             _ => return Err(format!("unknown reader {}", name)),
         })
     }
 
+    fn pure(&self) -> Option<&hdf5_pure::File> {
+        match self {
+            Reader::Pure(f) | Reader::PureThreads(f, _) => Some(f),
+            _ => None,
+        }
+    }
+
     fn strings(&self, p: &str) -> R<Vec<String>> {
         match self {
-            Reader::Pure(f) => f.dataset(p).map_err(e(p))?.read_string().map_err(e(p)),
-            Reader::Rh(f) => f.dataset(p).map_err(e(p))?.read_strings().map_err(e(p)),
+            Reader::Rh(f) | Reader::RhThreads(f, _, _) => f.dataset(p).map_err(e(p))?.read_strings().map_err(e(p)),
+            _ => self.pure().unwrap().dataset(p).map_err(e(p))?.read_string().map_err(e(p)),
         }
     }
 
     fn num(&self, p: &str, kind: &str) -> R<Num> {
         match self {
+            Reader::PureThreads(f, n) => {
+                // the threads share `f` (hdf5_pure::File is Sync)
+                let d = f.dataset(p).map_err(e(p))?;
+                let len = d.shape().map_err(e(p))?[0];
+                let d = &d;
+                Ok(match kind {
+                    "i32" => Num::I32(threaded(len, *n, |lo, c| d.read_i32_rows(lo, c).map_err(e(p)))?),
+                    "i64" => Num::I64(threaded(len, *n, |lo, c| d.read_i64_rows(lo, c).map_err(e(p)))?),
+                    "f32" => Num::F32(threaded(len, *n, |lo, c| d.read_f32_rows(lo, c).map_err(e(p)))?),
+                    _ => Num::F64(threaded(len, *n, |lo, c| d.read_f64_rows(lo, c).map_err(e(p)))?),
+                })
+            }
+            Reader::RhThreads(f, path, n) => {
+                let len = f.dataset(p).map_err(e(p))?.shape()[0] as u64;
+                // a range read on a file opened by this thread
+                let part = |lo: u64, c: u64| -> R<Num> {
+                    Reader::Rh(rust_hdf5::H5File::open(path).map_err(e("open"))?).num_range(p, kind, lo, c)
+                };
+                Ok(match kind {
+                    "i32" => Num::I32(threaded(len, *n, |lo, c| part(lo, c).map(Num::into_i32))?),
+                    "i64" => Num::I64(threaded(len, *n, |lo, c| part(lo, c).map(Num::into_i64))?),
+                    "f32" => Num::F32(threaded(len, *n, |lo, c| part(lo, c).map(Num::into_f32))?),
+                    _ => Num::F64(threaded(len, *n, |lo, c| part(lo, c).map(Num::into_f64))?),
+                })
+            }
             Reader::Pure(f) => {
                 let d = f.dataset(p).map_err(e(p))?;
                 Ok(match kind {
@@ -104,7 +186,7 @@ impl Reader {
     /// Elements [lo, lo + n) of a 1-D dataset
     fn num_range(&self, p: &str, kind: &str, lo: u64, n: u64) -> R<Num> {
         match self {
-            Reader::Pure(f) => {
+            Reader::Pure(f) | Reader::PureThreads(f, _) => {
                 let d = f.dataset(p).map_err(e(p))?;
                 Ok(match kind {
                     "i32" => Num::I32(d.read_i32_rows(lo, n).map_err(e(p))?),
@@ -113,7 +195,7 @@ impl Reader {
                     _ => Num::F64(d.read_f64_rows(lo, n).map_err(e(p))?),
                 })
             }
-            Reader::Rh(f) => {
+            Reader::Rh(f) | Reader::RhThreads(f, _, _) => {
                 let d = f.dataset(p).map_err(e(p))?;
                 let (s, c) = ([lo as usize], [n as usize]);
                 Ok(match kind {
@@ -261,7 +343,16 @@ fn main() {
         eprintln!("       h5bench sc <reader> <file> <spec> <full|partial>");
         std::process::exit(2);
     }
-    let label = if a[2] == "rust-hdf5" && cfg!(feature = "par") { "rust-hdf5+parallel".to_string() } else { a[2].clone() };
+    let mut label = a[2].clone();
+    if a[2] == "rust-hdf5" && cfg!(feature = "par") {
+        label.push_str("+parallel");
+    }
+    if a[2].starts_with("hdf5-pure") && cfg!(feature = "zlibrs") {
+        label.push_str("+zlib-rs");
+    }
+    if a[2].ends_with("-threads") {
+        label.push_str(&format!("({})", std::env::var("H5BENCH_THREADS").unwrap_or_else(|_| "8".into())));
+    }
     let r = if a[1] == "kallisto" {
         run_kallisto(&a[2], &a[3], &a[4], a[5].parse().expect("repeats"))
     } else {
