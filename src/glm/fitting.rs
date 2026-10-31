@@ -4,7 +4,9 @@ use ndarray::{Array1, Array2, Array3, ArrayView1};
 use rayon::prelude::*;
 
 use super::design::{create_design_matrix, DesignInfo};
-use super::negative_binomial::{nb_mean, nb_weight, MAX_ETA, MAX_LFC_BETA, MIN_MU};
+use super::negative_binomial::{nb_mean, nb_weight, MAX_LFC_BETA, MIN_MU};
+use crate::optim::nmath::{dnbinom_mu_log, dnorm_log, r_sum};
+use crate::optim::{optim_lbfgsb, LbfgsbControl};
 use crate::data::DESeqDataSet;
 use crate::error::{DeseqError, Result};
 use statrs::function::gamma::ln_gamma;
@@ -274,10 +276,8 @@ pub fn fit_single_gene(
         dev_old = dev;
     }
 
-    // L-BFGS-B fallback when IRLS did not converge (matches R DESeq2 optim fallback)
-    // R: rowsForOptim <- which(!betaConv | !rowStable | !rowVarPositive)
-    // R always stores the optim result: betaMatrix[row,] <- o$par
-    // R sets betaConv[row] <- TRUE if o$convergence == 0
+    // optim() fallback (fitNbinomGLMsOptim) for the rows R selects with
+    // rowsForOptim <- which(!betaConv | !rowStable | !rowVarPositive).
 
     // R: rowStable = all betas are finite
     let row_stable = beta.iter().all(|b| b.is_finite());
@@ -311,241 +311,66 @@ pub fn fit_single_gene(
         None
     };
 
-    let log_likelihood = if needs_optim {
-        let ln2 = std::f64::consts::LN_2;
-        // R: betaRow <- if (rowStable[row] & all(abs(betaMatrix[row,]) < large)) {
-        //        betaMatrix[row,]     # IRLS result in LOG2 scale
+    let optim_fit = if needs_optim {
+        // R: betaMatrix <- log2(exp(1)) * betaRes$beta_mat
+        //    betaRow <- if (rowStable[row] & all(abs(betaMatrix[row,]) < large)) {
+        //        betaMatrix[row,]
         //    } else {
-        //        beta_mat[row,]       # OLS initial in NATURAL LOG, treated as log2!
+        //        beta_mat[row,]
         //    }
-        // R checks betaMatrix (log2 scale) against large=30
-        let beta_log2: Vec<f64> = beta.iter().map(|&b| b / ln2).collect();
-        let betas_within_bounds = beta_log2.iter().all(|&b| b.abs() < 30.0);
-
-        let initial_for_optim = if row_stable && betas_within_bounds {
-            beta_log2  // IRLS result converted to log2 (matches R: betaMatrix[row,])
+        // DESeq2 1.50.2 uses beta_mat (the natural-log OLS start) as is, on the
+        // log2 scale of the objective; later versions multiply it by log2(e).
+        let beta_log2: Vec<f64> = beta.iter().map(|&b| std::f64::consts::LOG2_E * b).collect();
+        let start = if row_stable && beta_log2.iter().all(|&b| b.abs() < 30.0) {
+            beta_log2
         } else {
-            ols_initial_beta.clone()  // OLS in NATURAL LOG, treated as log2 (matches R: beta_mat[row,])
+            ols_initial_beta.clone()
         };
-
         let counts_slice: Vec<f64> = counts.to_vec();
         let sf_slice: Vec<f64> = size_factors.to_vec();
         // R: lambda <- rep(1e-6, ncol(modelMatrix))  (log2 scale)
-        let lambda_log2: Vec<f64> = vec![1e-6; design.ncols()];
-        let optim_result =
-            optim_nb_fallback_fitting(&counts_slice, &sf_slice, alpha, design, &initial_for_optim, &lambda_log2);
-        // Result is already in natural log (converted inside optim function)
-        beta = optim_result.betas;
-        converged = optim_result.optim_converged;
-        let lbfgsb_ll = optim_result.log_likelihood;
-
-        // If L-BFGS-B also didn't converge, try coordinate-wise Newton-Raphson
-        // as a secondary fallback. Use whichever result has better log-likelihood.
-        if !converged {
-            let coord_result = fit_single_gene_optim(
-                counts, design, size_factors, alpha, Some(&beta),
-            );
-            if coord_result.converged && coord_result.log_likelihood > lbfgsb_ll {
-                return coord_result;
-            }
+        let lambda_log2 = vec![1e-6; n_coefs];
+        let fit = optim_nb_fallback_fitting(&counts_slice, &sf_slice, alpha, design, &start, &lambda_log2);
+        // R: betaMatrix[row,] <- o$par (stored here on the natural-log scale)
+        beta = fit.beta_log2.iter().map(|&p| p * std::f64::consts::LN_2).collect();
+        // R: if (o$convergence == 0) betaConv[row] <- TRUE
+        if fit.optim_converged {
+            converged = true;
         }
-
-        lbfgsb_ll
+        Some(fit)
     } else {
-        // IRLS converged. R: logLike <- nbinomLogLike(counts, mu, ...) with the
-        // unclamped mu <- nf * exp(X beta)
-        let size = 1.0 / alpha;
-        (0..n_samples)
-            .map(|i| {
-                let eta: f64 = (0..n_coefs).map(|j| design[[i, j]] * beta[j]).sum();
-                let mu = nb_mean(eta, size_factors[i]);
-                nb_log_likelihood_for_deviance(counts[i], mu, size)
-            })
-            .sum()
+        None
     };
 
-    // Weights (and so SE) use mu clamped at minmu, but the stored mu is the
-    // unclamped nf * exp(X beta), as in R's fitNbinomGLMs; Cook's distances are
-    // computed from it.
     let mut mus = vec![0.0; n_samples];
     let mut weights = vec![0.0; n_samples];
-    for i in 0..n_samples {
-        let eta: f64 = (0..n_coefs).map(|j| design[[i, j]] * beta[j]).sum();
-        let mu = nb_mean(eta, size_factors[i]);
-        mus[i] = mu;
-        weights[i] = nb_weight(mu.max(MIN_MU), alpha);
-    }
-
-    let (standard_errors, final_hat, covariance) = calculate_standard_errors_and_hat(design, &weights);
-    let hat_diagonals = irls_hat.unwrap_or(final_hat);
-
-    GlmFitResult {
-        coefficients: beta,
-        standard_errors,
-        covariance,
-        n_coefs,
-        converged,
-        hat_diagonals,
-        mu: mus,
-        log_likelihood,
-    }
-}
-
-/// R equivalent: fitNbinomGLMsOptim() — coordinate-wise Newton-Raphson fallback.
-///
-/// When both IRLS and the L-BFGS-B optimizer fail to converge, this function
-/// provides a robust coordinate-wise optimization of the NB log-likelihood.
-/// Each coefficient is optimized individually while holding others fixed,
-/// using a Newton step with Armijo line search to guarantee monotone improvement.
-///
-/// NB log-likelihood:
-///   ll = sum_j [ y_j * ln(mu_j) - (y_j + 1/alpha) * ln(mu_j + 1/alpha) ] + const
-///   where mu_j = size_factors[j] * exp(X[j,:] . beta)
-///
-/// Gradient w.r.t. beta_k:
-///   d_ll/d_beta_k = sum_j [ (y_j - mu_j) / (1 + alpha * mu_j) * mu_j * X[j,k] ]
-///
-/// Hessian diagonal:
-///   d2_ll/d_beta_k^2 = -sum_j [ w_j * mu_j^2 * X[j,k]^2 ]
-///   where w_j = 1 / (mu_j + alpha * mu_j^2)
-fn fit_single_gene_optim(
-    counts: ArrayView1<f64>,
-    design: &Array2<f64>,
-    size_factors: ArrayView1<f64>,
-    alpha: f64,
-    initial_beta: Option<&[f64]>,
-) -> GlmFitResult {
-    let n_samples = counts.len();
-    let n_coefs = design.ncols();
-    let max_iter = 5000; // R default for optim fallback
-    let tol = 1e-8;
-
-    // Initialize beta from provided initial values or zeros
-    let mut beta: Vec<f64> = match initial_beta {
-        Some(b) => b.to_vec(),
-        None => {
-            let mut b = vec![0.0; n_coefs];
-            let mean_count: f64 = counts
-                .iter()
-                .zip(size_factors.iter())
-                .map(|(&c, &s)| if s > 0.0 { c / s } else { 0.0 })
-                .sum::<f64>()
-                / n_samples as f64;
-            b[0] = (mean_count.max(0.1)).ln();
-            b
+    let log_likelihood = if let Some(fit) = &optim_fit {
+        // R (fitNbinomGLMsOptim): mu[row,] <- nf * 2^(x %*% o$par) (unclamped);
+        // w <- diag((mu_row^-1 + alpha)^-1) and logLike from mu_row clamped at minmu.
+        mus.copy_from_slice(&fit.mu);
+        for (w, &m) in weights.iter_mut().zip(&fit.mu_clamped) {
+            *w = 1.0 / (1.0 / m + alpha);
         }
-    };
-
-    // Compute NB log-likelihood for current beta
-    let compute_ll = |beta: &[f64]| -> f64 {
+        fit.log_likelihood
+    } else {
+        // Weights (and so SE) use mu clamped at minmu, but the stored mu is the
+        // unclamped nf * exp(X beta), as in R's fitNbinomGLMs; Cook's distances are
+        // computed from it. R: logLike <- nbinomLogLike(counts, mu, ...) with the
+        // unclamped mu.
         let size = 1.0 / alpha;
         let mut ll = 0.0;
         for i in 0..n_samples {
             let eta: f64 = (0..n_coefs).map(|j| design[[i, j]] * beta[j]).sum();
-            let eta_clamped = eta.clamp(-MAX_ETA, MAX_ETA);
-            let mu = (size_factors[i] * eta_clamped.exp()).max(MIN_MU);
+            let mu = nb_mean(eta, size_factors[i]);
+            mus[i] = mu;
+            weights[i] = nb_weight(mu.max(MIN_MU), alpha);
             ll += nb_log_likelihood_for_deviance(counts[i], mu, size);
         }
         ll
     };
 
-    let mut ll_old = compute_ll(&beta);
-    let mut converged = false;
-
-    for _outer in 0..max_iter {
-        let ll_start = ll_old;
-
-        // Coordinate-wise optimization: optimize each beta[j] individually
-        for j in 0..n_coefs {
-            // Compute gradient and Hessian diagonal for coefficient j
-            let mut grad_j = 0.0;
-            let mut hess_jj = 0.0;
-
-            for i in 0..n_samples {
-                let eta: f64 = (0..n_coefs).map(|k| design[[i, k]] * beta[k]).sum();
-                let eta_clamped = eta.clamp(-MAX_ETA, MAX_ETA);
-                let mu = (size_factors[i] * eta_clamped.exp()).max(MIN_MU);
-
-                // Gradient: (y - mu) / (1 + alpha * mu) * mu * X[i,j]
-                // which simplifies to (y - mu) * w * mu * X[i,j] where w = 1/(mu + alpha*mu^2)
-                // but more directly: (y - mu) / (1 + alpha * mu) * X[i,j]
-                // since mu / (1 + alpha * mu) = mu * w_irls
-                let resid_scaled = (counts[i] - mu) / (1.0 + alpha * mu);
-                grad_j += resid_scaled * design[[i, j]];
-
-                // Hessian diagonal: -sum_i [ mu_i / (1 + alpha * mu_i) * X[i,j]^2 ]
-                let w = mu / (1.0 + alpha * mu);
-                hess_jj -= w * design[[i, j]] * design[[i, j]];
-            }
-
-            // Newton step: delta = -grad / hess
-            // Since hess_jj is negative (concave), -grad/hess = grad/|hess|
-            if hess_jj.abs() < 1e-20 {
-                continue; // Skip if Hessian is essentially zero
-            }
-
-            let delta = -grad_j / hess_jj;
-
-            // Skip tiny updates
-            if delta.abs() < 1e-14 {
-                continue;
-            }
-
-            // Armijo line search: find step size that improves log-likelihood
-            let armijo_c = 1e-4;
-            let mut step = 1.0;
-            let beta_j_old = beta[j];
-            let mut improved = false;
-
-            for _ls in 0..30 {
-                beta[j] = beta_j_old + step * delta;
-
-                // Clamp beta to prevent extreme values
-                beta[j] = beta[j].clamp(-MAX_LFC_BETA, MAX_LFC_BETA);
-
-                let ll_new = compute_ll(&beta);
-
-                // Armijo condition: f(x + step*d) >= f(x) + c * step * grad * d
-                // (we are maximizing, so check improvement)
-                if ll_new >= ll_old + armijo_c * step * grad_j * delta {
-                    ll_old = ll_new;
-                    improved = true;
-                    break;
-                }
-
-                step *= 0.5;
-                if step < 1e-20 {
-                    break;
-                }
-            }
-
-            if !improved {
-                beta[j] = beta_j_old; // Revert if no improvement found
-            }
-        }
-
-        // Check convergence: relative change in log-likelihood
-        let ll_change = (ll_old - ll_start).abs() / (ll_old.abs() + 0.1);
-        if ll_change < tol {
-            converged = true;
-            break;
-        }
-    }
-
-    // Compute final mu and weights for SE/hat calculation
-    let mut mus = vec![0.0; n_samples];
-    let mut weights = vec![0.0; n_samples];
-    for i in 0..n_samples {
-        let eta: f64 = (0..n_coefs).map(|j| design[[i, j]] * beta[j]).sum();
-        let mu = nb_mean(eta, size_factors[i]).max(MIN_MU);
-        mus[i] = mu;
-        weights[i] = nb_weight(mu, alpha);
-    }
-
-    let (standard_errors, hat_diagonals, covariance) =
-        calculate_standard_errors_and_hat(design, &weights);
-
-    let log_likelihood = compute_ll(&beta);
+    let (standard_errors, final_hat, covariance) = calculate_standard_errors_and_hat(design, &weights);
+    let hat_diagonals = irls_hat.unwrap_or(final_hat);
 
     GlmFitResult {
         coefficients: beta,
@@ -703,359 +528,109 @@ fn invert_symmetric_matrix(a: &[f64], n: usize) -> Vec<f64> {
 }
 
 // ==========================================================================
-// L-BFGS-B optimizer fallback for IRLS non-convergence
+// optim() fallback for rows where IRLS did not converge (fitNbinomGLMsOptim)
 // ==========================================================================
 
-/// Result from L-BFGS-B optimization fallback.
+/// Result of DESeq2's `fitNbinomGLMsOptim()` for one row.
 struct OptimFallbackResult {
-    betas: Vec<f64>,
-    log_likelihood: f64,
-    /// R: if (o$convergence == 0) { betaConv[row] <- TRUE }
+    /// `o$par`, on the log2 scale (`betaMatrix[row,] <- o$par`).
+    beta_log2: Vec<f64>,
+    /// `o$convergence == 0` (R then sets `betaConv[row] <- TRUE`).
     optim_converged: bool,
+    /// `mu_row <- as.numeric(nf * 2^(x %*% o$par))`, unclamped (`mu[row,]`).
+    mu: Vec<f64>,
+    /// `mu_row[mu_row < minmu] <- minmu`, used for the weights and logLike.
+    mu_clamped: Vec<f64>,
+    /// `logLike[row] <- sum(dnbinom(k, mu = mu_row, size = 1/alpha, log = TRUE))`
+    /// with the clamped `mu_row`.
+    log_likelihood: f64,
 }
 
-/// L-BFGS-B optimizer fallback for NB GLM fitting.
+/// Row `i` of `x %*% p` as R evaluates it (BLAS `dgemv`): a column-ordered
+/// fused multiply-add chain. This is exact for designs of 0/1 indicators; for
+/// continuous covariates OpenBLAS's blocked kernel can round differently in
+/// the last bit.
+fn design_row_times(design: &Array2<f64>, i: usize, p: &[f64]) -> f64 {
+    let mut eta = 0.0f64;
+    for (j, &pj) in p.iter().enumerate() {
+        eta = design[[i, j]].mul_add(pj, eta);
+    }
+    eta
+}
+
+/// `as.numeric(nf * 2^(x %*% p))` of `objectiveFn` in `fitNbinomGLMsOptim`.
+fn optim_mu_row(design: &Array2<f64>, nf: &[f64], p: &[f64]) -> Vec<f64> {
+    (0..nf.len())
+        .map(|i| nf[i] * 2f64.powf(design_row_times(design, i, p)))
+        .collect()
+}
+
+/// R: `fitNbinomGLMsOptim()` (fitNbinomGLMs.R) for a single row, without
+/// weights:
 ///
-/// Matches R DESeq2's `fitNbinomGLMsOptim()` which minimizes:
-///   negLogPost = -(logLike + logPrior)
-/// where logPrior = sum(dnorm(p, 0, sqrt(1/lambda), log=TRUE))
+/// ```r
+/// objectiveFn <- function(p) {
+///   mu_row <- as.numeric(nf * 2^(x %*% p))
+///   logLike <- sum(dnbinom(k, mu = mu_row, size = 1/alpha, log = TRUE))
+///   logPrior <- sum(dnorm(p, 0, sqrt(1/lambda), log = TRUE))
+///   negLogPost <- -1 * (logLike + logPrior)
+///   if (is.finite(negLogPost)) negLogPost else 10^300
+/// }
+/// o <- optim(betaRow, objectiveFn, method = "L-BFGS-B", lower = -large, upper = large)
+/// ```
 ///
-/// Works in **LOG2 scale** exactly like R DESeq2:
-///   mu = nf * 2^(X %*% p), lambda = 1e-6, bounds = [-30, 30]
+/// with `large = 30`, the finite-difference gradient of `optim()` (no `gr`)
+/// and `minmu = 0.5`. `beta_row` and `lambda` are on the log2 scale. The
+/// objective uses the ports of R's `dnbinom`, `dnorm` and `sum` in
+/// [`crate::optim::nmath`], so the L-BFGS-B iterates follow R's.
 ///
-/// `initial_beta` is expected in **LOG2 scale**.
-/// Returns betas converted back to **natural log scale**.
+/// R stops with an error if `optim()` does; that cannot happen here because
+/// non-finite objective values are replaced by 1e300. Should it happen
+/// anyway, the starting values are returned as not converged.
 fn optim_nb_fallback_fitting(
     counts: &[f64],
     size_factors: &[f64],
     alpha: f64,
     design: &Array2<f64>,
-    initial_beta: &[f64],
-    lambda_log2: &[f64],
+    beta_row: &[f64],
+    lambda: &[f64],
 ) -> OptimFallbackResult {
-    let n_samples = counts.len();
-    let n_coefs = design.ncols();
-    let m = 6; // L-BFGS memory size
-    let max_iter = 100;
-    let grad_tol = 1e-8;
-    let f_rel_tol = 1e-12;
+    const LARGE: f64 = 30.0;
+    const MINMU: f64 = MIN_MU;
+    let size = 1.0 / alpha;
+    let sd: Vec<f64> = lambda.iter().map(|&l| (1.0 / l).sqrt()).collect();
 
-    // R: lambda passed from caller (log2 scale)
-    let ln2 = std::f64::consts::LN_2;
-    let lambda: Vec<f64> = lambda_log2.to_vec();
-
-    // R: lower=-large, upper=large where large=30 (log2 scale)
-    let lower: Vec<f64> = vec![-30.0; n_coefs];
-    let upper: Vec<f64> = vec![30.0; n_coefs];
-
-    // Negative log-posterior: -(logLike + logPrior)
-    // R: objectiveFn <- function(p) {
-    //      mu_row <- as.numeric(nf * 2^(x %*% p))
-    //      logLike <- sum(dnbinom(k, mu=mu_row, size=1/alpha, log=TRUE))
-    //      logPrior <- sum(dnorm(p, 0, sqrt(1/lambda), log=TRUE))
-    //      negLogPost <- -1 * (logLike + logPrior)
-    //    }
-    // p is in log2 scale: mu = sf * 2^(X*p) = sf * exp(X*p * ln2)
-    let nll = |p: &[f64]| -> f64 {
-        let mut val = 0.0;
-        for i in 0..n_samples {
-            let eta_log2: f64 = (0..n_coefs).map(|j| design[[i, j]] * p[j]).sum();
-            let eta_nat = eta_log2 * ln2;
-            let eta_nat_clamped = eta_nat.clamp(-MAX_ETA, MAX_ETA);
-            let mu = size_factors[i] * eta_nat_clamped.exp();
-            let size = 1.0 / alpha;
-            val -= nb_log_likelihood_for_deviance(counts[i], mu, size);
-        }
-        // Add prior penalty: 0.5 * sum(lambda_j * p_j^2) (log2 scale)
-        for j in 0..n_coefs {
-            val += 0.5 * lambda[j] * p[j] * p[j];
-        }
-        if val.is_finite() { val } else { 1e300 }
-    };
-
-    // Numerical gradient of negative log-posterior
-    // R's optim() with method="L-BFGS-B" uses central finite differences (ndeps=1e-3)
-    // when no gradient function is provided. We match this behavior exactly.
-    let nll_grad = |p: &[f64], grad: &mut [f64]| {
-        let h = 1e-3; // R default ndeps
-        let mut p_work = p.to_vec();
-        for j in 0..p.len() {
-            let orig = p_work[j];
-            p_work[j] = orig + h;
-            let f_plus = nll(&p_work);
-            p_work[j] = orig - h;
-            let f_minus = nll(&p_work);
-            p_work[j] = orig;
-            grad[j] = (f_plus - f_minus) / (2.0 * h);
-        }
-    };
-
-    let project = |beta: &mut [f64]| {
-        for j in 0..n_coefs {
-            if beta[j] < lower[j] {
-                beta[j] = lower[j];
-            }
-            if beta[j] > upper[j] {
-                beta[j] = upper[j];
-            }
-        }
-    };
-
-    let mut beta = initial_beta.to_vec();
-    project(&mut beta);
-
-    let mut f_val = nll(&beta);
-    let mut grad = vec![0.0; n_coefs];
-    nll_grad(&beta, &mut grad);
-
-    let mut s_hist: Vec<Vec<f64>> = Vec::with_capacity(m);
-    let mut y_hist: Vec<Vec<f64>> = Vec::with_capacity(m);
-    let mut rho_hist: Vec<f64> = Vec::with_capacity(m);
-
-    // Track convergence: R checks o$convergence == 0
-    let mut optim_converged = false;
-
-    for _iter in 0..max_iter {
-        let grad_inf = fitting_projected_gradient_inf(&beta, &grad, &lower, &upper);
-        if grad_inf < grad_tol {
-            optim_converged = true;
-            break;
-        }
-
-        let dir = fitting_lbfgs_direction(&grad, &s_hist, &y_hist, &rho_hist);
-        let mut d: Vec<f64> = dir.iter().map(|&v| -v).collect();
-
-        for j in 0..n_coefs {
-            if (beta[j] <= lower[j] && d[j] < 0.0) || (beta[j] >= upper[j] && d[j] > 0.0) {
-                d[j] = 0.0;
-            }
-        }
-
-        let dg: f64 = grad.iter().zip(d.iter()).map(|(&g, &di)| g * di).sum();
-        if dg >= 0.0 {
-            for j in 0..n_coefs {
-                d[j] = -grad[j];
-            }
-            for j in 0..n_coefs {
-                if (beta[j] <= lower[j] && d[j] < 0.0) || (beta[j] >= upper[j] && d[j] > 0.0) {
-                    d[j] = 0.0;
-                }
-            }
-        }
-
-        let c1 = 1e-4;
-        let c2 = 0.9;
-        let dg_init: f64 = grad.iter().zip(d.iter()).map(|(&g, &di)| g * di).sum();
-
-        if dg_init >= 0.0 {
-            break;
-        }
-
-        let mut step = 1.0;
-        let mut beta_new = vec![0.0; n_coefs];
-        let mut grad_new = vec![0.0; n_coefs];
-        let mut f_new;
-
-        let mut max_step = f64::INFINITY;
-        for j in 0..n_coefs {
-            if d[j] > 0.0 && upper[j].is_finite() {
-                let s = (upper[j] - beta[j]) / d[j];
-                if s < max_step {
-                    max_step = s;
-                }
-            } else if d[j] < 0.0 && lower[j].is_finite() {
-                let s = (lower[j] - beta[j]) / d[j];
-                if s < max_step {
-                    max_step = s;
-                }
-            }
-        }
-        if step > max_step {
-            step = max_step * 0.99;
-        }
-
-        let mut ls_ok = false;
-        for _ls in 0..40 {
-            for j in 0..n_coefs {
-                beta_new[j] = beta[j] + step * d[j];
-            }
-            project(&mut beta_new);
-
-            f_new = nll(&beta_new);
-            nll_grad(&beta_new, &mut grad_new);
-
-            let dg_new: f64 = grad_new.iter().zip(d.iter()).map(|(&g, &di)| g * di).sum();
-
-            if f_new <= f_val + c1 * step * dg_init {
-                if dg_new.abs() <= c2 * dg_init.abs() {
-                    ls_ok = true;
-                    break;
-                }
-                if dg_new > 0.0 {
-                    step *= 0.5;
-                    continue;
-                }
-                ls_ok = true;
-                break;
-            }
-            step *= 0.5;
-            if step < 1e-20 {
-                break;
-            }
-        }
-
-        if !ls_ok {
-            for j in 0..n_coefs {
-                beta_new[j] = beta[j] + step * d[j];
-            }
-            project(&mut beta_new);
-            f_new = nll(&beta_new);
-            nll_grad(&beta_new, &mut grad_new);
-            if f_new >= f_val {
-                break;
-            }
+    let objective = |p: &[f64]| -> f64 {
+        let mu_row = optim_mu_row(design, size_factors, p);
+        let log_like = r_sum((0..counts.len()).map(|i| dnbinom_mu_log(counts[i], size, mu_row[i])));
+        let log_prior = r_sum(p.iter().zip(&sd).map(|(&pj, &s)| dnorm_log(pj, 0.0, s)));
+        // R: -1 * (logLike + logPrior), which is exactly the negation
+        let neg_log_post = -(log_like + log_prior);
+        if neg_log_post.is_finite() {
+            neg_log_post
         } else {
-            f_new = nll(&beta_new);
-            nll_grad(&beta_new, &mut grad_new);
+            1e300
         }
+    };
 
-        let f_rel = (f_val - f_new).abs() / (f_new.abs() + 1.0);
+    let (par, optim_converged) =
+        match optim_lbfgsb(beta_row, objective, None, &[-LARGE], &[LARGE], &LbfgsbControl::default()) {
+            Ok(o) => (o.par, o.convergence == 0),
+            Err(_) => (beta_row.to_vec(), false),
+        };
 
-        let s_vec: Vec<f64> = beta_new
-            .iter()
-            .zip(beta.iter())
-            .map(|(&bn, &bo)| bn - bo)
-            .collect();
-        let y_vec: Vec<f64> = grad_new
-            .iter()
-            .zip(grad.iter())
-            .map(|(&gn, &go)| gn - go)
-            .collect();
-        let sy: f64 = s_vec.iter().zip(y_vec.iter()).map(|(&s, &y)| s * y).sum();
-
-        if sy > 1e-20 {
-            if s_hist.len() == m {
-                s_hist.remove(0);
-                y_hist.remove(0);
-                rho_hist.remove(0);
-            }
-            s_hist.push(s_vec);
-            y_hist.push(y_vec);
-            rho_hist.push(1.0 / sy);
-        }
-
-        beta = beta_new;
-        f_val = f_new;
-        grad = grad_new;
-
-        if f_rel < f_rel_tol {
-            optim_converged = true;
-            break;
-        }
-    }
-
-    // Compute pure log-likelihood (without prior) for comparison
-    // R: logLike[row] <- sum(dnbinom(k, mu=mu_row, size=1/alpha, log=TRUE))
-    // beta (p) is still in log2 scale here; mu = sf * 2^(X*p) = sf * exp(X*p * ln2)
-    let ll: f64 = (0..n_samples)
-        .map(|i| {
-            let eta_log2: f64 = (0..n_coefs).map(|j| design[[i, j]] * beta[j]).sum();
-            let eta_nat = eta_log2 * ln2;
-            let eta_nat_clamped = eta_nat.clamp(-MAX_ETA, MAX_ETA);
-            let mu = size_factors[i] * eta_nat_clamped.exp();
-            let size = 1.0 / alpha;
-            nb_log_likelihood_for_deviance(counts[i], mu, size)
-        })
-        .sum();
-
-    // Convert optimized betas from log2 scale back to natural log scale
-    // R: betaMatrix[row,] = log2(exp(1)) * betaRes$beta_mat  means natlog = log2_val * ln2
-    let betas_natlog: Vec<f64> = beta.iter().map(|&p| p * ln2).collect();
+    let mu = optim_mu_row(design, size_factors, &par);
+    let mu_clamped: Vec<f64> = mu.iter().map(|&m| if m < MINMU { MINMU } else { m }).collect();
+    let log_likelihood = r_sum((0..counts.len()).map(|i| dnbinom_mu_log(counts[i], size, mu_clamped[i])));
 
     OptimFallbackResult {
-        betas: betas_natlog,
-        log_likelihood: ll,
+        beta_log2: par,
         optim_converged,
+        mu,
+        mu_clamped,
+        log_likelihood,
     }
 }
-
-fn fitting_projected_gradient_inf(
-    beta: &[f64],
-    grad: &[f64],
-    lower: &[f64],
-    upper: &[f64],
-) -> f64 {
-    let mut max_val = 0.0f64;
-    for j in 0..beta.len() {
-        let g = if beta[j] <= lower[j] && grad[j] > 0.0 {
-            0.0
-        } else if beta[j] >= upper[j] && grad[j] < 0.0 {
-            0.0
-        } else {
-            grad[j]
-        };
-        if g.abs() > max_val {
-            max_val = g.abs();
-        }
-    }
-    max_val
-}
-
-fn fitting_lbfgs_direction(
-    grad: &[f64],
-    s_hist: &[Vec<f64>],
-    y_hist: &[Vec<f64>],
-    rho_hist: &[f64],
-) -> Vec<f64> {
-    let n = grad.len();
-    let k = s_hist.len();
-
-    let mut q = grad.to_vec();
-
-    if k == 0 {
-        return q;
-    }
-
-    let mut alpha_vals = vec![0.0; k];
-
-    for i in (0..k).rev() {
-        let a: f64 = rho_hist[i]
-            * s_hist[i]
-                .iter()
-                .zip(q.iter())
-                .map(|(&s, &qi)| s * qi)
-                .sum::<f64>();
-        alpha_vals[i] = a;
-        for j in 0..n {
-            q[j] -= a * y_hist[i][j];
-        }
-    }
-
-    let sy: f64 = s_hist[k - 1]
-        .iter()
-        .zip(y_hist[k - 1].iter())
-        .map(|(&s, &y)| s * y)
-        .sum();
-    let yy: f64 = y_hist[k - 1].iter().map(|&y| y * y).sum();
-    let gamma = if yy > 0.0 { sy / yy } else { 1.0 };
-
-    let mut r: Vec<f64> = q.iter().map(|&qi| gamma * qi).collect();
-
-    for i in 0..k {
-        let b: f64 = rho_hist[i]
-            * y_hist[i]
-                .iter()
-                .zip(r.iter())
-                .map(|(&y, &ri)| y * ri)
-                .sum::<f64>();
-        for j in 0..n {
-            r[j] += s_hist[i][j] * (alpha_vals[i] - b);
-        }
-    }
-
-    r
-}
-
 // ==========================================================================
 // GLM re-fit with custom per-coefficient lambda (for LFC shrinkage)
 // ==========================================================================
@@ -1262,7 +837,7 @@ fn fit_single_gene_with_lambda(
         let lambda_log2: Vec<f64> = lambda.iter().map(|&l| l * ln2 * ln2).collect();
 
         // Choose initial values for optim (same logic as fit_single_gene)
-        let beta_log2: Vec<f64> = beta.iter().map(|&b| b / ln2).collect();
+        let beta_log2: Vec<f64> = beta.iter().map(|&b| std::f64::consts::LOG2_E * b).collect();
         let betas_within_bounds = beta_log2.iter().all(|&b| b.abs() < 30.0);
 
         let initial_for_optim = if row_stable && betas_within_bounds {
@@ -1277,8 +852,8 @@ fn fit_single_gene_with_lambda(
             &counts_slice, &sf_slice, alpha, design, &initial_for_optim, &lambda_log2,
         );
 
-        // Use optim result UNCONDITIONALLY (matches R fitNbinomGLMs.R:382)
-        beta = optim_result.betas;
+        // Use optim result UNCONDITIONALLY (R: betaMatrix[row,] <- o$par)
+        beta = optim_result.beta_log2.iter().map(|&p| p * ln2).collect();
     }
 
     // Compute final weights for SE calculation
@@ -1396,4 +971,61 @@ fn calculate_standard_errors_with_lambda(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::excessive_precision)]
+mod tests {
+    use super::*;
+
+    const SF: [f64; 6] = [
+        0.89427455600680239,
+        1.1916654891192604,
+        1.1639976379313646,
+        0.57028785514879077,
+        1.2315086281834942,
+        1.1478657100736156,
+    ];
+
+    fn design_3v3() -> Array2<f64> {
+        Array2::from_shape_fn((6, 2), |(i, j)| if j == 0 || i >= 3 { 1.0 } else { 0.0 })
+    }
+
+    /// `fitNbinomGLMsOptim` on single genes of the validation `poscounts`
+    /// scenario, against R 4.5.3 / DESeq2 1.50.2 (`fitNbinomGLMs(dds[g, ])`
+    /// with `trace(optim)`; printed with `%.17g`).
+    #[test]
+    fn optim_fallback_matches_r() {
+        // (counts, dispersion, betaRow, o$par)
+        type Case = (&'static [f64; 6], f64, [f64; 2], [f64; 2]);
+        let cases: [Case; 3] = [
+            (
+                &[0.0, 0.0, 0.0, 2966.0, 0.0, 5402.0],
+                7.4497229636364546,
+                [-2.3025850929940468, 7.2061381472882697],
+                [-15.672569955307745, 27.361696748687944],
+            ),
+            (
+                &[761.0, 0.0, 0.0, 2049.0, 6583.0, 4544.0],
+                5.8325453627524402,
+                [0.71377437312718983, 7.6377114716374912],
+                [8.1478023470345757, 3.922316996230288],
+            ),
+            (
+                &[0.0, 0.0, 16515.0, 10319.0, 0.0, 9947.0],
+                10.0,
+                [1.651666959965705, 3.8709697428404657],
+                [12.207331837082, 0.91549654179166051],
+            ),
+        ];
+        let x = design_3v3();
+        for (k, alpha, start, r_par) in cases {
+            let fit = optim_nb_fallback_fitting(k, &SF, alpha, &x, &start, &[1e-6, 1e-6]);
+            assert!(fit.optim_converged);
+            for j in 0..2 {
+                let rel = (fit.beta_log2[j] - r_par[j]).abs() / r_par[j].abs();
+                assert!(rel < 1e-12, "counts {k:?}: par {:?} vs R {r_par:?}", fit.beta_log2);
+            }
+        }
+    }
 }
