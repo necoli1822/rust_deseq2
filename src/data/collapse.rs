@@ -56,7 +56,7 @@ pub fn collapse_replicates(
 
     // Sort groups alphabetically to match R's factor level ordering
     let mut group_order: Vec<String> = groups.keys().cloned().collect();
-    group_order.sort();
+    group_order.sort_by(|a, b| super::r_collate(a, b));
 
     let n_new_samples = group_order.len();
 

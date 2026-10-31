@@ -11,4 +11,4 @@ pub use builder::{DESeqDataSetBuilder, DesignMatrixBuilder, DesignMatrixInfo};
 pub use collapse::collapse_replicates;
 pub use count_matrix::CountMatrix;
 pub use dataset::DESeqDataSet;
-pub use metadata::{GeneMetadata, SampleMetadata};
+pub use metadata::{r_collate, GeneMetadata, SampleMetadata};

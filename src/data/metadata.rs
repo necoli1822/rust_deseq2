@@ -104,7 +104,7 @@ impl SampleMetadata {
             .get(condition)
             .map(|values| {
                 let mut unique: Vec<String> = values.iter().cloned().collect();
-                unique.sort();
+                unique.sort_by(|a, b| r_collate(a, b));
                 unique.dedup();
                 unique
             })
@@ -137,7 +137,7 @@ impl SampleMetadata {
     pub fn levels(&self, condition_name: &str) -> Option<Vec<String>> {
         self.conditions.get(condition_name).map(|values| {
             let mut unique: Vec<String> = values.iter().cloned().collect();
-            unique.sort();
+            unique.sort_by(|a, b| r_collate(a, b));
             unique.dedup();
             unique
         })
@@ -246,9 +246,59 @@ impl GeneMetadata {
     }
 }
 
+/// Order factor levels the way R's factor()/sort() does with ICU collation
+/// (the default for R builds with ICU, including the conda/Bioconductor builds):
+/// compare case-insensitively first, punctuation before digits before letters,
+/// then break ties with lower case before upper case. So "abaI" < "abaM" < "WT"
+/// and "att" < "Att" < "att_c", where a byte-wise sort would put "WT" first and
+/// change the reference level.
+///
+/// Covers ASCII exactly as ICU's root collation; other characters sort after
+/// ASCII letters by code point.
+pub fn r_collate(a: &str, b: &str) -> std::cmp::Ordering {
+    // ICU root (CLDR) primary order for ASCII: punctuation and symbols, digits, letters
+    const ORDER: &str = "_-,;:!?.'\"()[]{}@*/\\&#%`^+<=>|~$0123456789abcdefghijklmnopqrstuvwxyz";
+    fn primary(c: char) -> u32 {
+        let l = c.to_ascii_lowercase();
+        match ORDER.find(l) {
+            Some(i) => i as u32,
+            None if c == ' ' => 0,
+            None => 1000 + c as u32,
+        }
+    }
+    let pa: Vec<u32> = a.chars().map(primary).collect();
+    let pb: Vec<u32> = b.chars().map(primary).collect();
+    pa.cmp(&pb).then_with(|| {
+        // tertiary: lower case sorts before upper case
+        let ta: Vec<bool> = a.chars().map(|c| c.is_ascii_uppercase()).collect();
+        let tb: Vec<bool> = b.chars().map(|c| c.is_ascii_uppercase()).collect();
+        ta.cmp(&tb)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_r_collate_matches_r_sort() {
+        // R 4.5.3 (ICU): sort(c("WT","abaI","abaM","att","att_c","Att","b1","B2","a-b","ab",
+        //                     "_x","Z9","z1","heat50","heat42","exp","DMlowP"))
+        let mut x: Vec<&str> = vec![
+            "WT", "abaI", "abaM", "att", "att_c", "Att", "b1", "B2", "a-b", "ab", "_x", "Z9", "z1", "heat50",
+            "heat42", "exp", "DMlowP",
+        ];
+        x.sort_by(|a, b| r_collate(a, b));
+        let r = [
+            "_x", "a-b", "ab", "abaI", "abaM", "att", "Att", "att_c", "b1", "B2", "DMlowP", "exp", "heat42",
+            "heat50", "WT", "z1", "Z9",
+        ];
+        assert_eq!(x, r);
+        // levels(factor(c("control", "Treated", "treated")))
+        let mut y = vec!["control", "Treated", "treated"];
+        y.sort_by(|a, b| r_collate(a, b));
+        assert_eq!(y, ["control", "treated", "Treated"]);
+    }
 
     #[test]
     fn test_sample_metadata() {
