@@ -21,6 +21,11 @@ validation/run.sh "pixi run --manifest-path tool/deseq2/pixi.toml Rscript" /tmp/
 | `compare.py` | Max abs difference per column, NA-pattern and padj < 0.1 mismatches |
 | `worst.py` | Genes with the largest difference in one column of one scenario |
 
+`real/` runs the same comparison on public GEO data (GSE151925, GSE46391, GSE130777,
+GSE100097, GSE55197, GSE220559): `validation/real/run.sh "<Rscript command>" <work dir>`
+downloads the data (`fetch.sh`), builds the R references (`realdata.R`) and runs the CLI
+(`real_run.sh`).
+
 Columns of the `compare.py` table: `dLFC`, `dSE`, `dpadj` are max absolute
 differences; `dlog10p` is the max difference of log10 p-values; `NAmis` counts
 genes whose padj is NA in only one of R and Rust; `sigDis` counts genes called

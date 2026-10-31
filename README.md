@@ -240,6 +240,31 @@ alone vs in the full data set). No p-value or significance call differs.
 ² The local dispersion trend agrees with R's locfit within the data range (~1e-8 relative), but
 differs near and below the smallest mean, where the VST evaluates it; DE results are unaffected.
 
+### Validation on public bacterial RNA-seq data
+
+The same comparison on GEO count data (six of the data sets in the table above), with
+[`validation/real/run.sh`](validation/real/), which downloads the data, builds the R references
+and runs the CLI. No scenario has a padj-NA or significance difference (padj < 0.1).
+
+| Data set (design) | Scenarios | max \|ΔLFC\| | max \|ΔSE\| |
+|---|---|---:|---:|
+| *A. baumannii* GSE151925 (3 groups × 3) | abaI vs WT, abaI vs abaM, LRT, apeglm, ashr, weights | ≤ 1.2e-5 | ≤ 3e-5 |
+| *Salmonella* GSE46391 (3 vs 3) | parametric, local, iterate | 5e-7 | 4.5e-6 |
+| *S. aureus* GSE130777 (3 vs 3) | Wald, poscounts, apeglm | ≤ 1.6e-5 | 3.6e-4 ³ |
+| *M. tuberculosis* GSE100097 (`~phase + carbon`, 12 samples) | Wald, LRT `~phase` | 5e-7 | 5e-7 |
+| *P. aeruginosa* GSE55197 | 2 vs 2, 6 vs 4 | 5e-7 | 5e-7 |
+| *E. coli* GSE220559 (11 groups × 3) | CIP vs CAZ, LRT | 5e-7 | 5e-7 |
+| *Salmonella* transforms | VST, `vst --nsub 1000`, rlog | 5e-7 / 7e-4 ² / 1e-9 | — |
+
+³ A few genes have a log posterior of ~1e5 whose first line-search step is accepted or rejected
+at rounding level, so the outcome depends on the last bits of the inputs. R itself is not stable
+there: refitting the same data in R with only the reference level changed moves these
+dispersions by the same amount (median 9e-5, max 1.9e-3).
+
+Comparing on real data found and fixed issues the simulations did not: factor levels are now
+ordered like R's (ICU) collation (`WT` vs `abaI`), the gene-wise Cox-Reid term no longer has a
+determinant cutoff, `lgamma` is R's, and size factors are computed bit-identically to R's.
+
 ### Known differences from R
 
 - Local-fit (`fitType = "local"`) dispersion trend near the lower end of the data, see ².

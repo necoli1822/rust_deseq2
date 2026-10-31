@@ -58,6 +58,14 @@ names the R function it now follows.
 - **`--sf-type iterate`** re-applied poscounts; it is now R's `estimateSizeFactorsIterate`
   (alternating mean-fit dispersions and an L-BFGS-B maximisation of the trimmed likelihood).
 
+- **Found on public GEO data** (see `validation/real/`): factor levels were sorted byte-wise
+  (`WT` before `abaI`), making a different default reference than R's ICU collation; the
+  gene-wise Cox-Reid term was cut off below det(X'WX) = 1e-10, stopping the dispersion search
+  early for many-group designs (SE off by up to 2.1); statrs's `lgamma` was too coarse at
+  1/alpha ~ 1e8 for the dispersion grid search; size factors differed from R in the last bits,
+  which flipped rounding-level line-search decisions; the ashr weight solver could stall on a
+  suboptimal mixture, and genes ash excludes now get the prior instead of NaN.
+
 ### Added
 - `vst --nsub N`: R's `vst()`, which fits the dispersion trend on N genes (R's default 1000)
   spanning the range of mean counts. Without `--nsub`, `vst` remains
