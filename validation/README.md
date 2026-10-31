@@ -37,3 +37,6 @@ significant (padj < 0.1) by only one; `nSigR` is R's number of significant genes
 Reference versions used for the results in the top-level README: R 4.5.3,
 DESeq2 1.50.2, apeglm 1.32.0, ashr 2.2-63, RcppNumerical 0.7-0, tximport 1.38.2 (without
 readr, so `quant.sf` files are read with `read.delim`).
+
+`h5bench/` compares pure-Rust HDF5 readers on kallisto `abundance.h5` files against rhdf5
+(accuracy, speed, build cost); results and recommendation in `h5bench/README.md`.
