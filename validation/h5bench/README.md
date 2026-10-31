@@ -1,99 +1,162 @@
-# Pure-Rust HDF5 readers on kallisto `abundance.h5`
+# Pure-Rust HDF5 readers: hdf5-pure vs rust-hdf5
 
-Which crate should read kallisto's `abundance.h5` for `--quant-type kallisto`? Four
-pure-Rust candidates (no libhdf5) are compared here on real kallisto output against R's
-`rhdf5`, which is what `tximport(type = "kallisto")` uses (`read_kallisto_h5`). The
-libhdf5 bindings `hdf5` and `hdf5-metno` are excluded because they are not pure Rust.
+Which crate should read HDF5 input: kallisto's `abundance.h5` for `--quant-type kallisto`
+now, and single-cell matrices (10x Cell Ranger `.h5`, AnnData `.h5ad`) later? Two
+pure-Rust readers (no libhdf5) are compared on accuracy, speed, peak memory and build
+cost:
 
-Date: 2026-10-31. rustc 1.99.1 (conda-forge, `tool/rust/`; the system default 1.92 is
-untouched), Intel Xeon Gold 6430. R 4.5.3, rhdf5 2.56.1.
+- `hdf5-pure` 0.47.0, opened two ways: `File::open` (reads the whole file into memory)
+  and `File::open_streaming` (fetches the needed regions on demand);
+- `rust-hdf5` 0.7.9, with and without its `parallel` feature (rayon chunk
+  decompression; all threads, and limited to 8 with `RAYON_NUM_THREADS=8`).
 
-## Test files
+The references are R `rhdf5` (what `tximport(type = "kallisto")` uses) for kallisto and
+h5py (libhdf5) for single-cell files.
 
-kallisto `quant` on simulated paired-end reads (`sim_reads.py`, e.g. `sim_reads.py out 55000 1 400000`;
-transcripts are random sequences, genes have 1-3 isoforms sharing exons):
-
-| File | kallisto | Transcripts | Bootstraps | Size |
-|---|---|---:|---:|---:|
-| small | 0.52.0 | 544 | 5 | 68 KB |
-| large | 0.52.0 | 98,941 | 30 | 5.7 MB |
-| small | 0.46.2 | 544 | 5 | 68 KB |
-| large | 0.46.2 | 98,941 | 30 | 5.8 MB |
-
-Layout of both versions (rhdf5): `aux/ids` fixed-length strings (12 bytes, not
-variable-length), `est_counts`, `aux/eff_lengths` and `bootstrap/bs<k>` float64, all
-chunked with the deflate filter; superblock version 0 in both.
+Date: 2026-10-31. rustc 1.92.0 (the system toolchain; both crates need 1.89), Intel Xeon
+Gold 6430 (128 threads), 250 GB RAM. R 4.5.3 / rhdf5 2.56.1, Python h5py and anndata from
+`tool/h5py/`.
 
 ## Results
 
-What was read: `aux/ids`, `est_counts`, `aux/eff_lengths` (the three datasets tximport
-reads) and every `bootstrap/bs<k>`. Accuracy is an exact comparison of every ID and
-every float64 with rhdf5's values. Times are the median of 20 full open-and-read passes
-(file in page cache).
+### Accuracy
 
-| Crate | Version | All 4 files vs rhdf5 | small (ms) | large 0.52 (ms) | large 0.46 (ms) |
-|---|---|---|---:|---:|---:|
-| `hdf5-pure` | 0.47.0 | identical | **0.24** | 77 | 79 |
-| `rust-hdf5` | 0.7.9 | identical | 0.30 | **35** | **56** |
-| `hdf5-reader` | 0.11.0 | identical | 0.36 | 86 | 89 |
-| `hdf5-rust` | 2.0.0 | identical | 0.85 | 201 | 232 |
-| R `rhdf5` (reference) | 2.56.1 | — | 10 | 135 | 134 |
+Every reader returned identical data in every case:
+- kallisto: every ID and float64 is identical to rhdf5's values;
+- single-cell: every dataset's length and two exact checksums equal h5py's, namely Σx and
+  Σ(i+1)·x over the values as u64 bit patterns, mod 2^64; strings are checksummed over
+  their bytes;
+- this covers fixed-length strings (10x), variable-length strings (`.h5ad`), int32,
+  int64 and float32 arrays, and range reads.
 
-Large file: 98,941 IDs and 3,166,112 float64 values, all identical for every crate.
+### Single-cell files
 
-| Crate | Unique deps | Clean release build | rust-version | License | crates.io downloads (90 days) | Versions since |
-|---|---:|---:|---|---|---:|---|
-| `hdf5-pure` | 8 | 11.8 s | 1.89 | MIT OR Apache-2.0 | 140,522 | 59 since 2026-03 |
-| `rust-hdf5` | 14 | 19.5 s | 1.89 | MIT | 10,856 | 50 since 2026-04 |
-| `hdf5-reader` | 40 | 8.1 s | 1.81 | MIT OR Apache-2.0 | 44,322 | 20 since 2026-03 |
-| `hdf5-rust` | 1 | 1.5 s | 1.99 | MIT OR Apache-2.0 | 807 | 9 since 2026-08 |
+Files:
+- `pbmc_10k_v3`: the public 10x PBMC 10k v3 `filtered_feature_bc_matrix.h5`, written by
+  Cell Ranger 3.0 (11,769 cells, 33,538 genes).
+- `medium`/`large`: synthetic data written by `gen_sc.py` with 20,000 and 150,000 cells,
+  about 2,000 genes per cell (40 M and 300 M non-zeros), each as a Cell Ranger v3 layout
+  `.10x.h5` and an anndata `.h5ad`. Both are gzip level 4.
 
-Every dependency tree is pure Rust: no `-sys`, `cc` or `cmake`; deflate comes from
-`miniz_oxide` (and `zlib-rs` for `rust-hdf5`). `hdf5-reader` pulls in `ndarray` 0.17 (this
-crate uses 0.16, so two ndarray versions would be compiled) and `rayon`/`lz4` by default.
+What is read:
+- **full**: barcodes and gene IDs/names (`.h5ad`: the obs/var indexes), `indptr`, `data`,
+  `indices`.
+- **partial**: the same strings and `indptr`, plus the `data`/`indices` of 1,000 cells from
+  the middle (a range read).
 
-API notes:
-- `hdf5-pure`: `File::open`, `dataset(path)?.read_f64()`, `read_string()`; returns `Vec`s.
-- `rust-hdf5`: `H5File::open`, `dataset(path)?.read_raw::<f64>()`, `read_strings()`.
-- `hdf5-reader`: `Hdf5File::open`, `dataset(path)?.read_array::<f64>()` (an ndarray
-  `ArrayD`), `read_strings()`.
-- `hdf5-rust`: `read_f64` returns IEEE bit patterns (`Vec<u64>`); there is no string-dataset
-  reader, so the IDs were decoded by hand from `read_raw` bytes. Reads the whole file into
-  memory first.
+The time is the median of 3 runs, file in the page cache, timing the read only. Peak RSS
+is measured for runs without the verification step.
 
-## Recommendation
+Seconds:
 
-All four read kallisto's files exactly, so the choice is about cost and maintenance:
+| File | Mode | h5py | hdf5-pure | hdf5-pure stream | rust-hdf5 | rust-hdf5 parallel (128 / 8 threads) |
+|---|---|---:|---:|---:|---:|---:|
+| pbmc_10k_v3 (36 MB) | full | 0.71 | 0.53 | 0.51 | 0.32 | **0.059 / 0.061** |
+| medium.10x.h5 (90 MB) | full | 1.47 | 1.31 | 1.30 | 0.77 | **0.075 / 0.074** |
+| medium.h5ad (98 MB) | full | 1.38 | 1.27 | 1.27 | 0.77 | **0.063 / 0.064** |
+| large.10x.h5 (672 MB) | full | 12.6 | 11.8 | 10.7 | 6.86 | **0.58 / 0.58** |
+| large.h5ad (722 MB) | full | 11.4 | 11.6 | 11.6 | 6.73 | **0.40 / 0.42** |
+| pbmc_10k_v3 | partial | 0.084 | 0.071 | 0.054 | 0.035 | **0.024 / 0.025** |
+| large.10x.h5 | partial | 0.129 | 0.365 | 0.121 | 0.081 | **0.050 / 0.051** |
+| large.h5ad | partial | 0.158 | 0.617 | 0.212 | 0.094 | **0.080 / 0.082** |
 
-- **`hdf5-pure`**: few dependencies (8), the most used (140k downloads in 90 days), a
-  direct `Vec<f64>`/`Vec<String>` API, and fast enough. The large file takes 77 ms, faster
-  than R's 135 ms and negligible next to a DESeq2 run. **Recommended.**
-- `rust-hdf5` is the fastest on the large file (35-56 ms, about 1.5-2x `hdf5-pure`), but
-  the gain is about 40 ms per file (about 4 s for 100 samples). It has more dependencies (14)
-  and the longest build (19.5 s), and is used about 13x less. A reasonable choice if
-  thousands of files are read per run.
-- `hdf5-reader` is fine but brings 40 dependencies, including a second ndarray.
-- `hdf5-rust` has almost no dependencies, but it is the slowest, its API is low-level, and
-  it is very new (807 downloads).
+Peak RSS (MB):
 
-Both `hdf5-pure` (59 releases since 2026-03) and `rust-hdf5` (50 since 2026-04) release often
-and are 0.x, so minor versions may break the API: pin the minor version (e.g.
-`hdf5-pure = "~0.47"`) and re-run this benchmark when upgrading.
+| File | Mode | h5py | hdf5-pure | hdf5-pure stream | rust-hdf5 | rust-hdf5 parallel (128 / 8) |
+|---|---|---:|---:|---:|---:|---:|
+| large.10x.h5 | full | 3,513 | 4,125 | 3,454 | 3,452 | 3,491 / 3,494 |
+| large.h5ad | full | 2,401 | 3,032 | 2,311 | 2,316 | 2,346 / 2,343 |
+| large.10x.h5 | partial | 87 | 730 | 58 | **45** | 50 / 50 |
+| large.h5ad | partial | 93 | 766 | 44 | **43** | 47 / 47 |
 
-Caveat: these files are what kallisto writes (superblock 0, fixed-length strings,
-deflate). Other HDF5 layouts (superblock 2/3, variable-length strings, other filters)
-were not tested, and tximport only needs kallisto's.
+Full reads hold the decoded arrays (3.4 GB for `large.10x.h5`), so every reader is close
+to that. `hdf5-pure`'s `File::open` adds the whole compressed file (+0.7 GB) and keeps it
+for partial reads too (730 MB to read 1,000 cells). Its streaming open and `rust-hdf5` read
+only what is asked for.
+
+### kallisto `abundance.h5`
+
+kallisto 0.52.0 and 0.46.2 output on simulated reads: 544 or 98,941 transcripts, 5 or 30
+bootstraps, files of 68 KB to 5.8 MB, superblock 0, deflate, fixed-length IDs. Times are the
+median of 20 passes, in ms:
+
+| File | rhdf5 | hdf5-pure | hdf5-pure stream | rust-hdf5 | rust-hdf5 parallel |
+|---|---:|---:|---:|---:|---:|
+| small 0.52 | 8 | 0.25 | 0.36 | 0.26 | 0.35 |
+| large 0.52 | 121 | 70.7 | 64.9 | **36.4** | 38.4 |
+| small 0.46 | 9 | 0.26 | 0.33 | 0.29 | 0.36 |
+| large 0.46 | 121 | 69.6 | 71.6 | **45.2** | 44.0 |
+
+`parallel` does not help here: the datasets are small.
+
+### Build cost
+
+| | Unique deps | Clean release build | rust-version | License |
+|---|---:|---:|---|---|
+| `hdf5-pure` | 8 | 12.0 s | 1.89 | MIT OR Apache-2.0 |
+| `rust-hdf5` | 14 | 18.3 s | 1.89 | MIT |
+| `rust-hdf5` + `parallel` | 20 | 18.6 s | 1.89 | MIT |
+
+Both trees are pure Rust: no `-sys`, `cc` or `cmake`. Deflate comes from `miniz_oxide`
+(and `zlib-rs` for `rust-hdf5`). `hdf5-pure`'s `fast-deflate` feature would add zlib-ng, which
+is C, and was not used. The `parallel` feature adds rayon, which `rust_deseq2` already depends
+on.
+
+crates.io (2026-10-31):
+- `hdf5-pure`: 140,522 downloads in 90 days, 59 versions since 2026-03.
+- `rust-hdf5`: 10,856 downloads in 90 days, 50 versions since 2026-04.
+
+Both are 0.x and release often, so either one must be pinned (`~0.x`) and re-checked with
+this harness when upgraded.
+
+## Recommendation: `rust-hdf5` with `parallel`
+
+For single-cell-sized files the difference is large and consistent:
+- **Speed:** single-threaded, `rust-hdf5` is 1.6-1.8x faster than `hdf5-pure`. With
+  `parallel` it reads the 672 MB 10x file in 0.58 s, where `hdf5-pure` takes 10.7-11.8 s
+  and h5py (libhdf5) 12.6 s. That is a 20x gain, the same with 8 threads as with 128.
+- **Memory:** `rust-hdf5` reads only what is needed (45 MB for a 1,000-cell range read).
+- **Cost:** the extra build cost is small: 6 s and 12 more dependencies, one of which
+  (rayon) this crate already uses.
+
+`hdf5-pure`'s advantages are lighter: fewer dependencies, a dual license and more users.
+Its `File::open` loads the whole file. If it were chosen, `open_streaming` would be
+needed, and that mode is still 1.3-2.3x slower than `rust-hdf5` single-threaded.
+
+For kallisto files both are fast enough (≤ 72 ms for 99k transcripts vs rhdf5's 121 ms),
+and `rust-hdf5` is again the faster of the two.
+
+Not covered:
+- Other compression filters: Blosc, LZ4 and zstd appear in some single-cell files;
+  `rust-hdf5` supports them behind features, `hdf5-pure` only through custom code.
+- Superblock 2/3 files.
+- Cold-cache (disk-bound) reads.
+
+## First round (4 crates, kallisto files only)
+
+`hdf5-reader` 0.11 and `hdf5-rust` 2.0 were also tested on the kallisto files. Both read
+them exactly, but they were dropped:
+- `hdf5-reader`: 40 dependencies including a second ndarray (0.17), 86-89 ms on the large
+  file;
+- `hdf5-rust`: needs Rust 1.99, has no string-dataset reader, reads the whole file into
+  memory, and took 201-232 ms on the large file.
+
+Their code and builds were removed.
 
 ## Reproduce
 
 ```bash
-# the harness: rhdf5 reference + timing, then each crate (accuracy and timing)
-CARGO_TARGET_DIR=/tmp/h5bench-target pixi run --manifest-path tool/rust/pixi.toml \
-  cargo build --release --manifest-path validation/h5bench/Cargo.toml
-REPEATS=20 bash validation/h5bench/run.sh /tmp/h5bench-target/release/h5bench /tmp/h5out \
+# h5bench with and without rust-hdf5's parallel feature
+cargo build --release --manifest-path validation/h5bench/Cargo.toml --target-dir /tmp/h5b
+cargo build --release --manifest-path validation/h5bench/Cargo.toml --target-dir /tmp/h5b-par --features par
+# single-cell files (tool/h5py: python, h5py, anndata, numpy, scipy)
+pixi run --manifest-path tool/h5py/pixi.toml python validation/h5bench/gen_sc.py /tmp/sc 150000 2000 large
+REPEATS=3 bash validation/h5bench/run_sc.sh /tmp/h5b/release/h5bench /tmp/h5b-par/release/h5bench /tmp/scout \
+  /tmp/sc/large.10x.h5:10x /tmp/sc/large.h5ad:h5ad
+# kallisto files (tool/kallisto 0.52.0, tool/kallisto-0.46 0.46.2; reads from sim_reads.py)
+REPEATS=20 bash validation/h5bench/run.sh /tmp/h5b/release/h5bench /tmp/h5b-par/release/h5bench /tmp/kout \
   path/to/abundance.h5 ...
-# build cost and native-dependency check (cargo from tool/rust)
-pixi run --manifest-path tool/rust/pixi.toml bash validation/h5bench/build_cost.sh /tmp/h5cost
-pixi run --manifest-path tool/rust/pixi.toml bash validation/h5bench/native_deps.sh /tmp/h5cost
+# build cost and native-dependency check
+bash validation/h5bench/build_cost.sh /tmp/h5cost
+bash validation/h5bench/native_deps.sh /tmp/h5cost
 ```
-kallisto: `tool/kallisto/` (0.52.0) and `tool/kallisto-0.46/` (0.46.2) pixi environments.
