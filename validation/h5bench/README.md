@@ -68,11 +68,17 @@ All four read kallisto's files exactly, so the choice is about cost and maintena
 - **`hdf5-pure`**: few dependencies (8), the most used (140k downloads in 90 days), a
   direct `Vec<f64>`/`Vec<String>` API, and fast enough. The large file takes 77 ms, faster
   than R's 135 ms and negligible next to a DESeq2 run. **Recommended.**
-- `rust-hdf5` is the fastest on the large file (35-56 ms) but has the longest build
-  (19.5 s), is MIT-only, and had 50 releases in 7 months, so its API changes often.
+- `rust-hdf5` is the fastest on the large file (35-56 ms, about 1.5-2x `hdf5-pure`), but
+  the gain is about 40 ms per file (about 4 s for 100 samples). It has more dependencies (14)
+  and the longest build (19.5 s), and is used about 13x less. A reasonable choice if
+  thousands of files are read per run.
 - `hdf5-reader` is fine but brings 40 dependencies, including a second ndarray.
 - `hdf5-rust` has almost no dependencies, but it is the slowest, its API is low-level, and
   it is very new (807 downloads).
+
+Both `hdf5-pure` (59 releases since 2026-03) and `rust-hdf5` (50 since 2026-04) release often
+and are 0.x, so minor versions may break the API: pin the minor version (e.g.
+`hdf5-pure = "~0.47"`) and re-run this benchmark when upgrading.
 
 Caveat: these files are what kallisto writes (superblock 0, fixed-length strings,
 deflate). Other HDF5 layouts (superblock 2/3, variable-length strings, other filters)
