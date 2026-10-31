@@ -143,9 +143,12 @@ pub fn shrink_lfc_ashr(results: &DESeqResults, params: &AshrParams) -> AshrFit {
     let (posterior_mean_valid, posterior_sd_valid, lfsr_valid) =
         compute_posterior_stats(&betahat, &sebetahat, &sigma, &pi);
 
-    // Map back to full results
-    let mut posterior_mean = vec![f64::NAN; n];
-    let mut posterior_sd = vec![f64::NAN; n];
+    // Map back to full results. Observations ash excludes (NA estimate or SE, SE 0
+    // or Inf, e.g. all-zero genes) get the prior instead of a posterior, as ashr's
+    // calc_pm/calc_psd do: the mixture mean (0) and sd sqrt(sum(pi * sigma^2)).
+    let mix_sd = pi.iter().zip(&sigma).map(|(p, s)| p * s * s).sum::<f64>().sqrt();
+    let mut posterior_mean = vec![0.0; n];
+    let mut posterior_sd = vec![mix_sd; n];
     let mut lfsr = vec![f64::NAN; n];
 
     for (idx, &i) in valid_indices.iter().enumerate() {
@@ -336,6 +339,7 @@ fn fit_mixture_weights(log_lik: &[Vec<f64>], k: usize, max_iter: usize, tol: f64
 
     let mut pi = vec![1.0 / k as f64; k];
     let mut obj = objective(&pi);
+    let mut newton_stalled = false;
     for iter in 0..max_iter {
         let (g, h) = derivatives(&pi);
 
@@ -351,8 +355,13 @@ fn fit_mixture_weights(log_lik: &[Vec<f64>], k: usize, max_iter: usize, tol: f64
             break;
         }
 
+        // Work on the larger KKT violation. A Newton step on the free set can stall
+        // at rounding level just above `tol` while a zero component still wants to
+        // be released; then (or when the last Newton step made no progress) take the
+        // release step instead of repeating a step that cannot improve.
+        let release_first = release.is_some() && (worst_bound > worst_free || newton_stalled);
         let mut d = vec![0.0; k];
-        if worst_free >= tol {
+        if worst_free >= tol && !release_first {
             // Newton step on the free components: maximise g'd + d'Hd/2 subject to
             // 1'd = 0, via the KKT system [-H 1; 1' 0] [d; mu] = [g; 0]. Every free
             // component is positive, so some positive step is always feasible.
@@ -419,12 +428,16 @@ fn fit_mixture_weights(log_lik: &[Vec<f64>], k: usize, max_iter: usize, tol: f64
             }
             t *= 0.5;
         }
+        let was_newton = worst_free >= tol && !release_first;
         match accepted {
             Some((cand, cand_obj)) => {
+                newton_stalled = was_newton && cand_obj <= obj;
                 pi = cand;
                 obj = cand_obj;
             }
-            // No ascent possible at floating-point resolution
+            // No ascent at floating-point resolution: if a Newton step failed but a
+            // component can still be released, try that next; otherwise stop.
+            None if was_newton && release.is_some() => newton_stalled = true,
             None => break,
         }
     }
