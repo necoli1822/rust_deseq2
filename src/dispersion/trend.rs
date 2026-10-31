@@ -5,6 +5,8 @@ use ndarray::Array1;
 use crate::data::DESeqDataSet;
 use crate::error::{DeseqError, Result};
 
+use super::locfit::Locfit;
+
 /// Method for fitting the dispersion-mean trend
 /// R equivalent: fitType parameter in estimateDispersionsFit() in core.R
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,14 +51,17 @@ impl DispersionTrend {
 
 /// A fitted local dispersion trend (see [`DispersionTrend::Local`])
 #[derive(Debug, Clone)]
-pub struct LocalTrend(LocfitTree);
+pub struct LocalTrend(Locfit);
 
 impl LocalTrend {
+    /// R: dispFunction <- function(means) exp(predict(fit, data.frame(logMeans=log(means))))
+    /// (no lower bound: far outside the data the prediction follows locfit's
+    /// global quadratic and can be very small, as in R)
     fn eval(&self, mean: f64) -> f64 {
         if mean <= 0.0 {
             return 0.1;
         }
-        self.0.predict(mean.ln()).exp().max(1e-8)
+        self.0.predict(mean.ln()).exp()
     }
 }
 
@@ -333,13 +338,11 @@ fn fit_gamma_glm_identity_with_start(data: &[(f64, f64)], start: (f64, f64)) -> 
 }
 
 
-/// Locfit-style local regression with tree-based evaluation and Hermite interpolation
-///
-/// This implementation exactly matches R locfit's behavior:
-/// - DESeq2 uses: locfit(logDisps ~ logMeans, weights=means)
-/// - Default parameters: deg=2 (local quadratic), nn=0.7, cut=0.8
-/// - Tree-based adaptive evaluation
-/// - Hermite cubic interpolation between evaluation points
+/// Local regression of log dispersion on log mean
+/// R equivalent: localDispersionFit() in core.R,
+///   locfit(logDisps ~ logMeans, data = d[disps >= minDisp*10, ], weights = means)
+/// with locfit's defaults (see [`super::locfit`]). The genes are kept in their
+/// original order, as locfit's sums run in data order.
 fn fit_local_trend(means: &[f64], dispersions: &[f64]) -> Result<(Array1<f64>, DispersionTrend)> {
     let n = means.len();
     let min_disp = 1e-8;
@@ -350,324 +353,33 @@ fn fit_local_trend(means: &[f64], dispersions: &[f64]) -> Result<(Array1<f64>, D
         });
     }
 
-    // Filter valid values and work in log scale
-    // R uses: useForFit <- dispGeneEst > 100 * minDisp (i.e. > 1e-6)
-    let mut valid_data: Vec<(f64, f64, f64)> = means
+    // R uses: useForFit <- dispGeneEst > 100 * minDisp (i.e. > 1e-6), then
+    // localDispersionFit keeps disps >= 10 * minDisp, which is implied
+    let valid: Vec<(f64, f64)> = means
         .iter()
         .zip(dispersions.iter())
         .filter(|(&m, &d)| m > 0.0 && d > min_disp * 100.0 && d.is_finite())
-        .map(|(&m, &d)| (m.ln(), d.ln(), m))  // (log_mean, log_disp, weight=mean)
+        .map(|(&m, &d)| (m, d))
         .collect();
 
-    if valid_data.len() < 5 {
+    if valid.len() < 5 {
         let mean_disp = dispersions.iter().filter(|d| d.is_finite()).sum::<f64>()
             / dispersions.iter().filter(|d| d.is_finite()).count() as f64;
         return Ok((Array1::from_elem(n, mean_disp), DispersionTrend::Mean(mean_disp)));
     }
 
-    // Sort by log_mean
-    valid_data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let xd: Vec<f64> = valid.iter().map(|(m, _)| m.ln()).collect();
+    let yd: Vec<f64> = valid.iter().map(|(_, d)| d.ln()).collect();
+    let obs_weights: Vec<f64> = valid.iter().map(|(m, _)| *m).collect();
 
-    let xd: Vec<f64> = valid_data.iter().map(|(m, _, _)| *m).collect();
-    let yd: Vec<f64> = valid_data.iter().map(|(_, d, _)| *d).collect();
-    let obs_weights: Vec<f64> = valid_data.iter().map(|(_, _, w)| *w).collect();
+    let fit = Locfit::fit(&xd, &yd, &obs_weights, 0.7, 0.8)
+        .map_err(|e| DeseqError::TrendFittingFailed { reason: e.to_string() })?;
 
-    // Create locfit tree structure with deg=2 (local quadratic)
-    let locfit = LocfitTree::build(&xd, &yd, &obs_weights, 0.7, 0.8);
-
-    // Predict for all genes
-    let trend = LocalTrend(locfit);
+    let trend = LocalTrend(fit);
     let trended: Vec<f64> = means.iter().map(|&mean| trend.eval(mean)).collect();
 
     Ok((Array1::from_vec(trended), DispersionTrend::Local(trend)))
 }
-
-/// Evaluation point in the locfit tree
-/// Stores fitted value and derivative for Hermite interpolation
-#[derive(Debug, Clone)]
-struct EvalPoint {
-    x: f64,           // evaluation x location
-    value: f64,       // fitted value (β₀)
-    deriv: f64,       // derivative (β₁)
-    h: f64,           // local bandwidth
-}
-
-/// Locfit tree structure for 1D local regression with interpolation
-#[derive(Debug, Clone)]
-struct LocfitTree {
-    eval_points: Vec<EvalPoint>,
-    xd: Vec<f64>,
-    yd: Vec<f64>,
-    obs_weights: Vec<f64>,
-    k: usize,
-}
-
-impl LocfitTree {
-    /// Build locfit tree with adaptive evaluation points
-    fn build(xd: &[f64], yd: &[f64], obs_weights: &[f64], nn: f64, cut: f64) -> Self {
-        let n = xd.len();
-        let k = ((n as f64 * nn + 1e-12) as usize).max(3).min(n);
-
-        let xd = xd.to_vec();
-        let yd = yd.to_vec();
-        let obs_weights = obs_weights.to_vec();
-
-        let mut tree = LocfitTree {
-            eval_points: Vec::new(),
-            xd,
-            yd,
-            obs_weights,
-            k,
-        };
-
-        // Get data range
-        let x_min = tree.xd[0];
-        let x_max = tree.xd[tree.xd.len() - 1];
-
-        // Fit at boundary points first (locfit atree_start)
-        let ep0 = tree.fit_at_point(x_min);
-        let ep1 = tree.fit_at_point(x_max);
-
-        tree.eval_points.push(ep0);
-        tree.eval_points.push(ep1);
-
-        // Recursively split cells that are too large relative to bandwidth
-        tree.split_cell(0, 1, cut);
-
-        // Sort evaluation points by x for binary search
-        tree.eval_points.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
-
-        tree
-    }
-
-    /// Fit local QUADRATIC regression (deg=2) at point x
-    /// Returns (value, derivative, bandwidth)
-    ///
-    /// Uses locfit's basis: [1, dx, dx²/2]
-    fn fit_at_point(&self, x: f64) -> EvalPoint {
-        let n = self.xd.len();
-
-        // === locfit nbhd1() algorithm: find k nearest neighbors in sorted 1D data ===
-        let z = match self.xd.binary_search_by(|v| v.partial_cmp(&x).unwrap()) {
-            Ok(idx) => idx,
-            Err(idx) => {
-                if idx == 0 { 0 }
-                else if idx >= n { n - 1 }
-                else if (x - self.xd[idx - 1]).abs() <= (self.xd[idx] - x).abs() { idx - 1 }
-                else { idx }
-            }
-        };
-
-        let mut l = z;
-        let mut r = z;
-
-        if l == 0 { r = (self.k - 1).min(n - 1); }
-        if r == n - 1 { l = n.saturating_sub(self.k); }
-
-        while r - l < self.k - 1 {
-            let can_go_left = l > 0;
-            let can_go_right = r < n - 1;
-
-            if can_go_left && can_go_right {
-                if (x - self.xd[l - 1]).abs() < (self.xd[r + 1] - x).abs() {
-                    l -= 1;
-                } else {
-                    r += 1;
-                }
-            } else if can_go_left {
-                l -= 1;
-            } else if can_go_right {
-                r += 1;
-            } else {
-                break;
-            }
-
-            if l == 0 { r = (self.k - 1).min(n - 1); }
-            if r == n - 1 { l = n.saturating_sub(self.k); }
-        }
-
-        let h_left = (x - self.xd[l]).abs();
-        let h_right = (self.xd[r] - x).abs();
-        let h = h_left.max(h_right).max(1e-10);
-
-        // === Local QUADRATIC regression (deg=2): basis [1, dx, dx²/2] ===
-        // Solves weighted least squares: y = β₀ + β₁*dx + β₂*(dx²/2)
-        let mut sum_w = 0.0_f64;
-        let mut sum_wx1 = 0.0_f64;
-        let mut sum_wx2 = 0.0_f64;
-        let mut sum_wy = 0.0_f64;
-        let mut sum_wx1x1 = 0.0_f64;
-        let mut sum_wx1x2 = 0.0_f64;
-        let mut sum_wx2x2 = 0.0_f64;
-        let mut sum_wx1y = 0.0_f64;
-        let mut sum_wx2y = 0.0_f64;
-
-        for j in 0..n {
-            let dx = self.xd[j] - x;
-            let u = dx.abs() / h;
-
-            if u >= 1.0 {
-                continue;
-            }
-
-            // Tricube kernel
-            let u3 = u * u * u;
-            let kernel_w = {
-                let t = 1.0 - u3;
-                t * t * t
-            };
-
-            let w = kernel_w * self.obs_weights[j];
-
-            // Basis functions (locfit style)
-            let f1 = dx;              // dx
-            let f2 = dx * dx / 2.0;   // dx²/2
-
-            sum_w += w;
-            sum_wx1 += w * f1;
-            sum_wx2 += w * f2;
-            sum_wy += w * self.yd[j];
-            sum_wx1x1 += w * f1 * f1;
-            sum_wx1x2 += w * f1 * f2;
-            sum_wx2x2 += w * f2 * f2;
-            sum_wx1y += w * f1 * self.yd[j];
-            sum_wx2y += w * f2 * self.yd[j];
-        }
-
-        // Solve 3x3 system for [β₀, β₁, β₂]
-        let (value, deriv) = solve_for_value_and_deriv(
-            sum_w, sum_wx1, sum_wx2,
-            sum_wx1x1, sum_wx1x2, sum_wx2x2,
-            sum_wy, sum_wx1y, sum_wx2y
-        );
-
-        EvalPoint { x, value, deriv, h }
-    }
-
-    /// Recursively split cells that are too large (locfit atree_grow)
-    fn split_cell(&mut self, left_idx: usize, right_idx: usize, cut: f64) {
-        let left = &self.eval_points[left_idx];
-        let right = &self.eval_points[right_idx];
-
-        let cell_width = right.x - left.x;
-        let min_h = left.h.min(right.h);
-
-        // Check if cell needs splitting: cell_width / min_h > cut
-        if cell_width / min_h <= cut || cell_width < 1e-10 {
-            return;
-        }
-
-        // Split at midpoint
-        let mid_x = (left.x + right.x) / 2.0;
-        let mid_ep = self.fit_at_point(mid_x);
-
-        let mid_idx = self.eval_points.len();
-        self.eval_points.push(mid_ep);
-
-        // Recursively split sub-cells
-        self.split_cell(left_idx, mid_idx, cut);
-        self.split_cell(mid_idx, right_idx, cut);
-    }
-
-    /// Predict at point x using Hermite interpolation
-    fn predict(&self, x: f64) -> f64 {
-        let n_eval = self.eval_points.len();
-
-        if n_eval == 0 {
-            return 0.0;
-        }
-
-        if n_eval == 1 {
-            let ep = &self.eval_points[0];
-            return ep.value + ep.deriv * (x - ep.x);
-        }
-
-        // Find containing cell (binary search for left endpoint)
-        let mut left_idx = 0;
-        let mut right_idx = n_eval - 1;
-
-        // Handle extrapolation
-        if x <= self.eval_points[0].x {
-            // Extrapolate from leftmost point using its local polynomial
-            let ep = &self.eval_points[0];
-            return ep.value + ep.deriv * (x - ep.x);
-        }
-        if x >= self.eval_points[n_eval - 1].x {
-            // Extrapolate from rightmost point
-            let ep = &self.eval_points[n_eval - 1];
-            return ep.value + ep.deriv * (x - ep.x);
-        }
-
-        // Binary search for containing cell
-        while right_idx - left_idx > 1 {
-            let mid = (left_idx + right_idx) / 2;
-            if x < self.eval_points[mid].x {
-                right_idx = mid;
-            } else {
-                left_idx = mid;
-            }
-        }
-
-        // Hermite cubic interpolation (locfit hermite2 + rectcell_interp)
-        let left = &self.eval_points[left_idx];
-        let right = &self.eval_points[right_idx];
-
-        let d = right.x - left.x;  // cell width
-        if d.abs() < 1e-15 {
-            return left.value;
-        }
-
-        let t = (x - left.x) / d;  // normalized position [0, 1]
-
-        // Hermite basis functions (from locfit ev_interp.c:hermite2)
-        // phi[0] = weight for left value
-        // phi[1] = weight for right value
-        // phi[2] = weight for left derivative * d
-        // phi[3] = weight for right derivative * d
-        let phi1 = t * t * (3.0 - 2.0 * t);      // right value weight
-        let phi0 = 1.0 - phi1;                    // left value weight
-        let phi2 = t * (1.0 - t) * (1.0 - t);    // left deriv weight
-        let phi3 = t * t * (t - 1.0);            // right deriv weight
-
-        // Interpolate: f(x) = phi0*f_L + phi1*f_R + d*(phi2*d_L + phi3*d_R)
-        phi0 * left.value + phi1 * right.value + d * (phi2 * left.deriv + phi3 * right.deriv)
-    }
-}
-
-/// Solve 3x3 symmetric positive definite system for value (β₀) and derivative (β₁)
-fn solve_for_value_and_deriv(
-    m00: f64, m01: f64, m02: f64,
-    m11: f64, m12: f64, m22: f64,
-    b0: f64, b1: f64, b2: f64,
-) -> (f64, f64) {
-    // Check for near-singular matrix
-    let det = m00 * (m11 * m22 - m12 * m12)
-            - m01 * (m01 * m22 - m12 * m02)
-            + m02 * (m01 * m12 - m11 * m02);
-
-    if det.abs() < 1e-15 * m00.max(1.0) * m11.max(1.0) * m22.max(1.0) {
-        // Matrix is singular, fall back to weighted mean
-        if m00 > 1e-10 {
-            return (b0 / m00, 0.0);
-        } else {
-            return (0.0, 0.0);
-        }
-    }
-
-    // Cramer's rule for β₀ and β₁
-    // β₀ = det(M with first column replaced by b) / det(M)
-    let det_a0 = b0 * (m11 * m22 - m12 * m12)
-               - m01 * (b1 * m22 - m12 * b2)
-               + m02 * (b1 * m12 - m11 * b2);
-
-    // β₁ = det(M with second column replaced by b) / det(M)
-    let det_a1 = m00 * (b1 * m22 - m12 * b2)
-               - b0 * (m01 * m22 - m12 * m02)
-               + m02 * (m01 * b2 - b1 * m02);
-
-    (det_a0 / det, det_a1 / det)
-}
-
 
 #[cfg(test)]
 mod tests {
@@ -705,20 +417,62 @@ mod tests {
         assert!(trended.iter().all(|&v| v > 0.0), "All trended values should be positive");
     }
 
-    #[test]
-    fn test_hermite_interpolation() {
-        // Test that Hermite interpolation preserves endpoint values
-        let xd: Vec<f64> = (0..10).map(|i| i as f64).collect();
-        let yd: Vec<f64> = xd.iter().map(|x| x.sin()).collect();
-        let weights: Vec<f64> = vec![1.0; 10];
+    /// Unsorted (mean, dispersion) pairs; the smallest mean is 0.22313 and the
+    /// largest 43477.6
+    const LOCFIT_MEANS: [f64; 30] = [
+        0.22313, 4.2207, 79.838, 1510.2, 28566.8, 1.82212, 34.4669, 651.971, 12332.6, 0.786628,
+        14.8797, 281.463, 5324.11, 0.339596, 6.42374, 121.51, 2298.47, 43477.6, 2.77319, 52.4573,
+        992.275, 18769.7, 1.19722, 22.6464, 428.375, 8103.08, 0.516851, 9.77668, 184.934, 3498.19,
+    ];
+    const LOCFIT_DISPS: [f64; 30] = [
+        8.10705, 0.374204, 0.0548772, 0.0408124, 0.0400529, 1.30394, 0.110499, 0.0435081, 0.040157,
+        1.58678, 0.120265, 0.0450843, 0.0403429, 7.1801, 0.404472, 0.0566752, 0.0407024, 0.0400295,
+        0.530078, 0.0730089, 0.0421499, 0.0401275, 1.80349, 0.115338, 0.0431307, 0.0401447,
+        3.21114, 0.249677, 0.0527286, 0.0406921,
+    ];
+    /// Below, at and above the data range
+    const LOCFIT_PROBES: [f64; 12] =
+        [1e-3, 0.05, 0.2, 0.22313, 0.5, 1.0, 7.5, 100.0, 1000.0, 50000.0, 66000.0, 1e6];
 
-        let tree = LocfitTree::build(&xd, &yd, &weights, 0.7, 0.8);
-
-        // At evaluation points, prediction should be close to fitted value
-        for ep in &tree.eval_points {
-            let pred = tree.predict(ep.x);
-            assert!((pred - ep.value).abs() < 0.01,
-                "Prediction at eval point should match: {} vs {}", pred, ep.value);
+    fn check_local_trend(means: &[f64], disps: &[f64], expected: &[f64]) {
+        let (_, trend) = fit_local_trend(means, disps).unwrap();
+        for (&m, &want) in LOCFIT_PROBES.iter().zip(expected) {
+            let got = trend.eval(m);
+            let rel = ((got - want) / want).abs();
+            assert!(rel < 1e-13, "mean {}: {} vs R {} (rel {:e})", m, got, want, rel);
         }
+    }
+
+    /// R (locfit 1.5-9.12):
+    ///   fit <- locfit(log(disps) ~ log(means), weights = means)
+    ///   exp(predict(fit, data.frame(logMeans = log(probes))))
+    /// The values below the smallest mean follow the linear extrapolation of
+    /// the residual from locfit's parametric component plus that global
+    /// quadratic.
+    #[test]
+    fn test_local_trend_matches_r_locfit() {
+        let expected = [
+            49028.635345649353, 113.4253285836247, 15.100658316098947, 12.917082631097028,
+            4.3499753925336897, 1.8776104360250319, 0.25872949116560312, 0.061380883701299058,
+            0.04279795708644063, 0.040207535306937665, 0.04044807273371042, 0.049761942049015635,
+        ];
+        check_local_trend(&LOCFIT_MEANS, &LOCFIT_DISPS, &expected);
+    }
+
+    /// Sorted input takes locfit's ordered-data neighbourhood search (nbhd1),
+    /// which also changes the summation order; R's values differ from the
+    /// unsorted fit around 1e-12.
+    #[test]
+    fn test_local_trend_matches_r_locfit_sorted() {
+        let mut pairs: Vec<(f64, f64)> = LOCFIT_MEANS.iter().copied().zip(LOCFIT_DISPS.iter().copied()).collect();
+        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let means: Vec<f64> = pairs.iter().map(|p| p.0).collect();
+        let disps: Vec<f64> = pairs.iter().map(|p| p.1).collect();
+        let expected = [
+            49028.635345848008, 113.42532858367638, 15.100658316100665, 12.91708263109841,
+            4.3499753925339917, 1.8776104360250976, 0.25872949116560251, 0.061380883701299134,
+            0.04279795708644063, 0.040207535306937756, 0.040448072733711302, 0.049761942049077759,
+        ];
+        check_local_trend(&means, &disps, &expected);
     }
 }
