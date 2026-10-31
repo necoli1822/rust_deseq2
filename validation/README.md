@@ -19,6 +19,7 @@ validation/run.sh "pixi run --manifest-path tool/deseq2/pixi.toml Rscript" /tmp/
 | `gen6.R` | Observation weights (4 vs 4, `useT`, `~batch + condition`) and `sfType = "iterate"` |
 | `gen7.R` | `--htseq` input: htseq-count files with counter rows and an `--additional-attr` column, read by `DESeqDataSetFromHTSeqCount` (`~batch + condition`, VST, normalized counts) |
 | `gen8.R` | tximport and normalization factors: simulated salmon `quant.sf` files (isoforms, genes without reads in some or all samples, a transcript missing from tx2gene) through `tximport` + `DESeqDataSetFromTximport` (`--salmon`; the same txi as `-c --avg-tx-length`, with `poscounts`; `lengthScaledTPM` counts with `--tximport`), and a 7 vs 7 data set with Cook's outliers and a `normalizationFactors` matrix (`--norm-factors`: Wald with outlier replacement, LRT, apeglm and normal shrinkage, `local`, `--weights`, `~batch + condition`); VST (parametric, local, `nsub`), rlog and normalized counts for both |
+| `gen9.R` | `--quant-type` kallisto, RSEM (isoforms with effective lengths below 1, and genes.results), StringTie (`readLength = 100`), piscem and oarfish files of one simulated data set through `tximport` + `DESeqDataSetFromTximport` |
 | `run_rust.sh` | Runs the CLI on every scenario |
 | `compare.py` | Max abs difference per column, NA-pattern and padj < 0.1 mismatches; max abs difference of every `r_<name>.tsv` matrix (VST, rlog, normalized counts) with its `rust_<name>_<tag>.tsv` |
 | `worst.py` | Genes with the largest difference in one column of one scenario |

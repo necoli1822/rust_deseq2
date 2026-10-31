@@ -80,3 +80,12 @@ for ft in parametric local mean; do
   "$B" vst -c $TD/counts.csv -m $TD/metadata.csv -d condition --method $ft --nsub 1000 --blind -o $TD/rust_fastvst${ft}_TRUE_$T.tsv >/dev/null 2>&1 || echo "fast vst $ft blind FAILED"
   "$B" vst -c $TD/counts.csv -m $TD/metadata.csv -d condition --method $ft --nsub 1000 -o $TD/rust_fastvst${ft}_FALSE_$T.tsv >/dev/null 2>&1 || echo "fast vst $ft FAILED"
 done
+
+# gen9.R: --quant from other quantifiers
+quant() { local s=$1; shift; local QD=$D/$s; [ -d "$QD" ] || return; "$B" run --quant $QD/sample_table.csv --quant-dir $QD/files $W -o $QD/rust_$T.tsv "$@" > $QD/rust_$T.log 2>&1 || echo "$s: FAILED ($(tail -1 $QD/rust_$T.log))"; }
+quant quant_kallisto --quant-type kallisto --tx2gene $D/quant_kallisto/tx2gene.csv
+quant quant_rsem --quant-type rsem --tx2gene $D/quant_rsem/tx2gene.csv
+quant quant_rsem_genes --quant-type rsem
+quant quant_stringtie --quant-type stringtie --read-length 100 --tx2gene $D/quant_stringtie/tx2gene.csv
+quant quant_piscem --quant-type piscem --tx2gene $D/quant_piscem/tx2gene.csv
+quant quant_oarfish --quant-type oarfish --tx2gene $D/quant_oarfish/tx2gene.csv

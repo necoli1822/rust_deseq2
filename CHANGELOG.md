@@ -87,6 +87,12 @@ names the R function it now follows.
   rejects them unless they are tximport counts (`--tximport`, `--avg-tx-length`).
 
 ### Added
+- tximport input from other quantifiers: `--quant <SAMPLE_TABLE> --quant-type <TYPE>` (`--salmon`
+  and `--salmon-dir` remain as aliases of `--quant`, `--quant-dir`) reads kallisto
+  `abundance.tsv`, RSEM `isoforms.results` (lengths below 1 set to 1) and `genes.results` (gene
+  level, no tx2gene, chosen as tximport does from the first file name), StringTie `t_data.ctab`
+  (counts = cov × length / `--read-length`), sailfish, piscem and oarfish files, with tximport's
+  column choices (`io::read_quant`, `io::tximport::tximport`, `QuantType`).
 - tximport input. `--salmon <SAMPLE_TABLE> --salmon-dir <DIR> --tx2gene <FILE>` reads salmon
   `quant.sf` files and summarizes them to genes as `tximport(type = "salmon")` does
   (`io::tximport`: sums, abundance-weighted lengths, `replaceMissingLength`, transcripts missing

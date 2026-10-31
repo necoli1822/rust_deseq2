@@ -52,8 +52,8 @@ Examples:
   rust_deseq2 run -c counts.csv -m metadata.csv -d condition \\
     --numerator treated --denominator control --fit-type local --use-t
 
-  # salmon quantifications summarized to genes (tximport + DESeqDataSetFromTximport)
-  rust_deseq2 run --salmon samples.csv --salmon-dir quants --tx2gene tx2gene.csv \\
+  # salmon/kallisto/RSEM/StringTie quantifications summarized to genes (--quant-type)
+  rust_deseq2 run --quant samples.csv --quant-dir quants --tx2gene tx2gene.csv \\
     -d condition --numerator treated --denominator control"
     )]
     Run {
@@ -257,7 +257,7 @@ Examples:
     )]
     Normalize {
         /// Path to count matrix CSV file
-        #[arg(short, long, required_unless_present_any = ["htseq", "salmon"], conflicts_with = "htseq")]
+        #[arg(short, long, required_unless_present_any = ["htseq", "quant"], conflicts_with = "htseq")]
         counts: Option<String>,
 
         /// HTSeq sample table (sample name, file name, ...); counts are read from the files
@@ -366,11 +366,11 @@ Examples:
 }
 
 /// Count and sample inputs: a count matrix with a metadata table, htseq-count files,
-/// or salmon quantifications
+/// or transcript quantifications (tximport)
 #[derive(Args, Clone, Debug)]
 pub struct InputArgs {
     /// Path to count matrix CSV file
-    #[arg(short, long, required_unless_present_any = ["htseq", "salmon"], conflicts_with = "htseq",
+    #[arg(short, long, required_unless_present_any = ["htseq", "quant"], conflicts_with = "htseq",
         requires = "metadata",
         long_help = "Path to count matrix CSV file.\n\
             Format: first column = gene IDs, remaining columns = raw counts per sample.\n\
@@ -406,32 +406,54 @@ pub struct InputArgs {
 /// tximport input and normalization factors
 #[derive(Args, Clone, Debug)]
 pub struct TximportArgs {
-    /// salmon sample table (sample name, quant.sf path, variables); replaces -c and -m
-    #[arg(long, value_name = "SAMPLE_TABLE", conflicts_with_all = ["counts", "metadata", "htseq"],
-        requires = "tx2gene",
-        long_help = "Read salmon quant.sf files and summarize them to genes, as\n\
-            tximport(files, type = \"salmon\", tx2gene) does with its defaults\n\
-            (countsFromAbundance = \"no\"), then build the dataset as\n\
+    /// Quantification sample table (sample name, file path, variables); replaces -c and -m
+    #[arg(long, visible_alias = "salmon", value_name = "SAMPLE_TABLE", conflicts_with_all = ["counts", "metadata", "htseq"],
+        long_help = "Read transcript quantifications (salmon, kallisto, RSEM, StringTie, ...) and\n\
+            summarize them to genes, as tximport(files, type = <--quant-type>, tx2gene)\n\
+            does with its defaults (countsFromAbundance = \"no\"), then build the dataset as\n\
             DESeqDataSetFromTximport() does: counts are rounded and the average\n\
             transcript lengths become normalization factors.\n\
             SAMPLE_TABLE is a CSV/TSV with a header: column 1 = sample name, column 2 =\n\
-            path of the sample's quant.sf (relative to --salmon-dir), remaining columns =\n\
-            sample variables used by the design. Requires --tx2gene.")]
-    pub salmon: Option<String>,
+            path of the sample's file (relative to --quant-dir), remaining columns =\n\
+            sample variables used by the design. Needs --tx2gene, except for RSEM\n\
+            genes.results files. `--salmon` is an alias.")]
+    pub quant: Option<String>,
 
-    /// Directory the quant.sf paths of the salmon sample table are relative to
-    #[arg(long, value_name = "DIR", default_value = ".", requires = "salmon")]
-    pub salmon_dir: String,
+    /// Quantifier that wrote the --quant files
+    #[arg(long, value_name = "TYPE", default_value = "salmon", requires = "quant",
+        value_parser = ["salmon", "sailfish", "kallisto", "rsem", "stringtie", "piscem", "oarfish"],
+        long_help = "Quantifier that wrote the --quant files (R: tximport(type = ...)):\n\
+            salmon, sailfish: quant.sf (Name, TPM, NumReads, EffectiveLength)\n\
+            kallisto:  abundance.tsv (target_id, tpm, est_counts, eff_length); abundance.h5\n\
+                       is not read\n\
+            rsem:      *.isoforms.results (transcript_id, TPM, expected_count,\n\
+                       effective_length; lengths below 1 set to 1), or, if the first\n\
+                       file's path contains \"genes\", *.genes.results read at gene level\n\
+                       without --tx2gene, as tximport does\n\
+            stringtie: t_data.ctab (t_name, FPKM, cov, length); counts = cov * length /\n\
+                       --read-length\n\
+            piscem:    .quant (target_name, tpm, ecount, eelen)\n\
+            oarfish:   .quant (tname, num_reads, len)")]
+    pub quant_type: String,
 
-    /// Transcript-to-gene table for --salmon (columns 1-2: transcript, gene)
-    #[arg(long, value_name = "FILE", requires = "salmon",
-        long_help = "Transcript-to-gene table (CSV/TSV) for --salmon: column 1 = transcript ID as in\n\
-            quant.sf, column 2 = gene ID; further columns are ignored. A header row is\n\
-            optional. Transcripts missing from the table are dropped, as tximport does.")]
+    /// Directory the paths of the --quant sample table are relative to
+    #[arg(long, visible_alias = "salmon-dir", value_name = "DIR", default_value = ".", requires = "quant")]
+    pub quant_dir: String,
+
+    /// Transcript-to-gene table for --quant (columns 1-2: transcript, gene)
+    #[arg(long, value_name = "FILE", requires = "quant",
+        long_help = "Transcript-to-gene table (CSV/TSV) for --quant: column 1 = transcript ID as in\n\
+            the quantification files, column 2 = gene ID; further columns are ignored. A\n\
+            header row is optional. Transcripts missing from the table are dropped, as\n\
+            tximport does.")]
     pub tx2gene: Option<String>,
 
+    /// Read length for --quant-type stringtie (R: tximport(readLength = 75))
+    #[arg(long, value_name = "N", default_value_t = 75.0, requires = "quant")]
+    pub read_length: f64,
+
     /// tximport average transcript lengths (txi$length) for the -c count matrix
-    #[arg(long, value_name = "FILE", conflicts_with_all = ["htseq", "salmon"],
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["htseq", "quant"],
         long_help = "Average transcript lengths from tximport (txi$length), a CSV/TSV matrix in the\n\
             layout of the count matrix, whose -c holds txi$counts. As in\n\
             DESeqDataSetFromTximport(), the counts are rounded and size factor estimation\n\
@@ -440,12 +462,12 @@ pub struct TximportArgs {
     pub avg_tx_length: Option<String>,
 
     /// The -c counts are tximport estimated counts: round them
-    #[arg(long, conflicts_with_all = ["htseq", "salmon"],
+    #[arg(long, conflicts_with_all = ["htseq", "quant"],
         long_help = "The -c matrix holds tximport counts (txi$counts), which may be non-integer:\n\
             round them (halves to even) as DESeqDataSetFromTximport() does. Without\n\
             --avg-tx-length this is the countsFromAbundance = \"scaledTPM\" /\n\
             \"lengthScaledTPM\" case, where R uses just the counts. Without this flag\n\
-            (or --avg-tx-length, --salmon) non-integer counts are an error, as in R.")]
+            (or --avg-tx-length, --quant) non-integer counts are an error, as in R.")]
     pub tximport: bool,
 
     /// Normalization factors matrix (genes x samples), used instead of size factors

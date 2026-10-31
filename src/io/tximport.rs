@@ -1,8 +1,10 @@
 //! Transcript-level quantifications summarized to genes (tximport)
 //!
-//! R equivalent: tximport::tximport(files, type = "salmon", tx2gene = tx2gene) with
+//! R equivalent: tximport::tximport(files, type = <type>, tx2gene = tx2gene) with
 //! its defaults (countsFromAbundance = "no", txOut = FALSE, ignoreTxVersion = FALSE),
-//! followed by DESeqDataSetFromTximport(txi, colData, design).
+//! followed by DESeqDataSetFromTximport(txi, colData, design). Supported types:
+//! salmon, sailfish, kallisto (abundance.tsv), rsem (isoforms.results, or
+//! genes.results without tx2gene), stringtie (t_data.ctab), piscem and oarfish.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -30,18 +32,91 @@ pub struct Txi {
     pub length: Array2<f64>,
 }
 
-/// One salmon `quant.sf` file
+/// The quantifier that wrote the files
+/// R equivalent: tximport(type = ...)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantType {
+    /// salmon `quant.sf`
+    Salmon,
+    /// sailfish `quant.sf` (same layout as salmon)
+    Sailfish,
+    /// kallisto `abundance.tsv` (abundance.h5 is not read)
+    Kallisto,
+    /// RSEM `*.isoforms.results`, or `*.genes.results` (gene level, no tx2gene)
+    Rsem,
+    /// StringTie `t_data.ctab`
+    Stringtie,
+    /// piscem `.quant`
+    Piscem,
+    /// oarfish `.quant`
+    Oarfish,
+}
+
+impl QuantType {
+    /// Parse a tximport `type` name
+    pub fn parse(name: &str) -> Result<Self> {
+        Ok(match name.to_ascii_lowercase().as_str() {
+            "salmon" => QuantType::Salmon,
+            "sailfish" => QuantType::Sailfish,
+            "kallisto" => QuantType::Kallisto,
+            "rsem" => QuantType::Rsem,
+            "stringtie" => QuantType::Stringtie,
+            "piscem" => QuantType::Piscem,
+            "oarfish" => QuantType::Oarfish,
+            _ => {
+                return Err(DeseqError::InvalidInput {
+                    reason: format!(
+                        "unknown quantification type '{}' (salmon, sailfish, kallisto, rsem, stringtie, piscem, oarfish)",
+                        name
+                    ),
+                })
+            }
+        })
+    }
+
+    /// Columns (ID, abundance, counts, length) read from transcript-level files
+    /// R equivalent: txIdCol, abundanceCol, countsCol, lengthCol set in tximport()
+    pub fn columns(self) -> QuantColumns {
+        let c = |id, abundance, counts, length| QuantColumns { id, abundance, counts, length };
+        match self {
+            QuantType::Salmon | QuantType::Sailfish => c("Name", "TPM", "NumReads", "EffectiveLength"),
+            QuantType::Kallisto => c("target_id", "tpm", "est_counts", "eff_length"),
+            QuantType::Rsem => c("transcript_id", "TPM", "expected_count", "effective_length"),
+            QuantType::Stringtie => c("t_name", "FPKM", "cov", "length"),
+            QuantType::Piscem => c("target_name", "tpm", "ecount", "eelen"),
+            QuantType::Oarfish => c("tname", "num_reads", "num_reads", "len"),
+        }
+    }
+}
+
+/// Column names of a quantification file
+#[derive(Debug, Clone, Copy)]
+pub struct QuantColumns {
+    /// Feature ID column (txIdCol, or geneIdCol for RSEM gene level)
+    pub id: &'static str,
+    /// abundanceCol
+    pub abundance: &'static str,
+    /// countsCol
+    pub counts: &'static str,
+    /// lengthCol
+    pub length: &'static str,
+}
+
+/// One quantification file: per feature ID, abundance, counts and length
 #[derive(Debug, Clone)]
-pub struct SalmonQuant {
-    /// Name column
+pub struct QuantFile {
+    /// ID column
     pub names: Vec<String>,
-    /// EffectiveLength column
+    /// length column (effective length)
     pub effective_length: Vec<f64>,
-    /// TPM column
+    /// abundance column (TPM, or FPKM for StringTie)
     pub tpm: Vec<f64>,
-    /// NumReads column
+    /// counts column
     pub num_reads: Vec<f64>,
 }
+
+/// One salmon `quant.sf` file (kept for the salmon-only API)
+pub type SalmonQuant = QuantFile;
 
 /// R's round(x) (digits = 0): the nearest integer, halves to even
 pub fn r_round(x: f64) -> f64 {
@@ -209,9 +284,15 @@ fn long_double_quotient(num: u128, den: u128) -> f64 {
 /// txIdCol = "Name", abundanceCol = "TPM", countsCol = "NumReads",
 /// lengthCol = "EffectiveLength" (columns found by name)
 pub fn read_salmon_quant<P: AsRef<Path>>(path: P) -> Result<SalmonQuant> {
+    read_quant_file(path, QuantType::Salmon.columns())
+}
+
+/// Read one tab-separated quantification file, taking the given columns by name
+/// R equivalent: tximport's importer read.delim(file) and raw[[txIdCol]], ...
+pub fn read_quant_file<P: AsRef<Path>>(path: P, cols: QuantColumns) -> Result<QuantFile> {
     let path = path.as_ref();
     let text = fs::read_to_string(path).map_err(|e| DeseqError::InvalidInput {
-        reason: format!("Cannot read salmon quantification {}: {}", path.display(), e),
+        reason: format!("Cannot read quantification file {}: {}", path.display(), e),
     })?;
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     let header: Vec<&str> = lines
@@ -222,11 +303,11 @@ pub fn read_salmon_quant<P: AsRef<Path>>(path: P) -> Result<SalmonQuant> {
         .collect();
     let col = |name: &str| -> Result<usize> {
         header.iter().position(|&h| h == name).ok_or_else(|| DeseqError::InvalidInput {
-            reason: format!("{}: no '{}' column (salmon quant.sf expected)", path.display(), name),
+            reason: format!("{}: no '{}' column (wrong --quant-type?)", path.display(), name),
         })
     };
-    let (c_name, c_len, c_tpm, c_reads) = (col("Name")?, col("EffectiveLength")?, col("TPM")?, col("NumReads")?);
-    let mut q = SalmonQuant { names: Vec::new(), effective_length: Vec::new(), tpm: Vec::new(), num_reads: Vec::new() };
+    let (c_name, c_len, c_tpm, c_reads) = (col(cols.id)?, col(cols.length)?, col(cols.abundance)?, col(cols.counts)?);
+    let mut q = QuantFile { names: Vec::new(), effective_length: Vec::new(), tpm: Vec::new(), num_reads: Vec::new() };
     for line in lines {
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() != header.len() {
@@ -373,27 +454,75 @@ pub fn summarize_to_gene(
 
 /// Import salmon quantifications and summarize them to genes
 /// R equivalent: tximport(files, type = "salmon", tx2gene = tx2gene)
-///
-/// Every file must list the same transcripts in the same order
-/// (R: stopifnot(all(txId == raw[[txIdCol]]))).
 pub fn tximport_salmon<P: AsRef<Path>>(files: &[P], sample_ids: Vec<String>, tx2gene: &[(String, String)]) -> Result<Txi> {
+    tximport(files, sample_ids, QuantType::Salmon, Some(tx2gene), 75.0)
+}
+
+/// Whether tximport reads RSEM files at gene level
+/// R equivalent: `type == "rsem" & txIn & grepl("genes", files[1])` sets txIn = FALSE
+pub fn is_rsem_gene_level<P: AsRef<Path>>(quant_type: QuantType, files: &[P]) -> bool {
+    quant_type == QuantType::Rsem && files.first().map_or(false, |f| f.as_ref().to_string_lossy().contains("genes"))
+}
+
+/// Read the files into feature x sample matrices (abundance, counts, length)
+fn read_quant_matrices<P: AsRef<Path>>(files: &[P], cols: QuantColumns) -> Result<(Vec<String>, [Array2<f64>; 3])> {
     if files.is_empty() {
-        return Err(DeseqError::EmptyData { reason: "no salmon quantification files".to_string() });
+        return Err(DeseqError::EmptyData { reason: "no quantification files".to_string() });
     }
-    let quants: Vec<SalmonQuant> = files.iter().map(read_salmon_quant).collect::<Result<_>>()?;
-    let tx_ids = quants[0].names.clone();
+    let quants: Vec<QuantFile> = files.iter().map(|f| read_quant_file(f, cols)).collect::<Result<_>>()?;
+    let ids = quants[0].names.clone();
     for (q, f) in quants.iter().zip(files) {
-        if q.names != tx_ids {
+        // R: stopifnot(all(txId == raw[[txIdCol]])); for RSEM genes.results R does not
+        // check, but rows are matched by position there too, so differing IDs are an error
+        if q.names != ids {
             return Err(DeseqError::InvalidInput {
-                reason: format!("{}: transcripts differ from the first file", f.as_ref().display()),
+                reason: format!("{}: feature IDs differ from the first file", f.as_ref().display()),
             });
         }
     }
-    let n_tx = tx_ids.len();
-    let n = quants.len();
+    let (n_tx, n) = (ids.len(), quants.len());
     let abundance = Array2::from_shape_fn((n_tx, n), |(t, j)| quants[j].tpm[t]);
     let counts = Array2::from_shape_fn((n_tx, n), |(t, j)| quants[j].num_reads[t]);
     let length = Array2::from_shape_fn((n_tx, n), |(t, j)| quants[j].effective_length[t]);
+    Ok((ids, [abundance, counts, length]))
+}
+
+/// Import quantification files and summarize them to genes
+/// R equivalent: tximport(files, type = quant_type, tx2gene = tx2gene,
+/// readLength = read_length) with countsFromAbundance = "no"
+///
+/// Every file must list the same transcripts in the same order
+/// (R: stopifnot(all(txId == raw[[txIdCol]]))). Type-specific steps, as in R:
+/// - RSEM: if the first file's path contains "genes", the files are gene-level
+///   `genes.results` (gene_id, TPM, expected_count, effective_length) and are used
+///   as they are, without tx2gene (computeRsemGeneLevel); otherwise transcript
+///   lengths below 1 are set to 1 before summarizing;
+/// - StringTie: counts are cov * length / readLength (R's default readLength 75).
+pub fn tximport<P: AsRef<Path>>(
+    files: &[P],
+    sample_ids: Vec<String>,
+    quant_type: QuantType,
+    tx2gene: Option<&[(String, String)]>,
+    read_length: f64,
+) -> Result<Txi> {
+    if is_rsem_gene_level(quant_type, files) {
+        // computeRsemGeneLevel()
+        let cols = QuantColumns { id: "gene_id", abundance: "TPM", counts: "expected_count", length: "effective_length" };
+        let (ids, [abundance, counts, length]) = read_quant_matrices(files, cols)?;
+        log::info!("RSEM genes.results files: read at gene level (tx2gene not used)");
+        return Ok(Txi { gene_ids: ids, sample_ids, abundance, counts, length });
+    }
+    let tx2gene = tx2gene.ok_or_else(|| DeseqError::InvalidInput {
+        reason: "transcript-level quantifications need a tx2gene table (--tx2gene)".to_string(),
+    })?;
+    let (tx_ids, [abundance, mut counts, mut length]) = read_quant_matrices(files, quant_type.columns())?;
+    match quant_type {
+        // txi$counts <- txi$counts * txi$length / readLength
+        QuantType::Stringtie => counts.zip_mut_with(&length, |c, &l| *c = *c * l / read_length),
+        // txi$length[txi$length < 1] <- 1
+        QuantType::Rsem => length.mapv_inplace(|l| if l < 1.0 { 1.0 } else { l }),
+        _ => {}
+    }
     summarize_to_gene(&tx_ids, &abundance, &counts, &length, tx2gene, sample_ids)
 }
 
@@ -411,19 +540,36 @@ pub fn read_salmon<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     directory: Q,
     tx2gene: R,
 ) -> Result<(Txi, SampleMetadata)> {
+    read_quant(sample_table, directory, QuantType::Salmon, Some(tx2gene), 75.0)
+}
+
+/// Read quantification files of any supported type listed in a sample table and
+/// summarize them to genes; the sample table is as for [`read_salmon`]
+/// R equivalent: tximport(file.path(directory, sampleTable[, 2]), type = quant_type,
+/// tx2gene = tx2gene, readLength = read_length); colData is sampleTable[, -(1:2)]
+pub fn read_quant<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
+    sample_table: P,
+    directory: Q,
+    quant_type: QuantType,
+    tx2gene: Option<R>,
+    read_length: f64,
+) -> Result<(Txi, SampleMetadata)> {
     let (header, rows) = super::htseq::read_table(sample_table.as_ref())?;
     if header.len() < 2 {
         return Err(DeseqError::InvalidMetadata {
-            reason: "Salmon sample table needs at least two columns: sample name and quant.sf path".to_string(),
+            reason: "Quantification sample table needs at least two columns: sample name and file path".to_string(),
         });
     }
     if rows.is_empty() {
-        return Err(DeseqError::EmptyData { reason: "Salmon sample table lists no samples".to_string() });
+        return Err(DeseqError::EmptyData { reason: "Quantification sample table lists no samples".to_string() });
     }
     let sample_names: Vec<String> = rows.iter().map(|r| r[0].clone()).collect();
     let files: Vec<std::path::PathBuf> = rows.iter().map(|r| directory.as_ref().join(&r[1])).collect();
-    let map = read_tx2gene(tx2gene)?;
-    let txi = tximport_salmon(&files, sample_names.clone(), &map)?;
+    let map = match tx2gene {
+        Some(t) => Some(read_tx2gene(t)?),
+        None => None,
+    };
+    let txi = tximport(&files, sample_names.clone(), quant_type, map.as_deref(), read_length)?;
 
     let mut metadata = SampleMetadata::new(sample_names);
     for (c, name) in header.iter().enumerate().skip(2) {
@@ -465,6 +611,52 @@ mod tests {
         }
         assert_ne!(r_strtod("77.919041"), "77.919041".parse::<f64>().ok());
         assert!(r_strtod("abc").is_none());
+    }
+
+    #[test]
+    fn test_tximport_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |n: &str| dir.path().join(n);
+        let t2g: Vec<(String, String)> =
+            [("t1", "g1"), ("t2", "g1"), ("t3", "g2")].iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        let s = vec!["a".to_string()];
+
+        // StringTie: counts = cov * length / readLength
+        fs::write(p("t_data.ctab"), "t_id\tt_name\tlength\tcov\tFPKM\n1\tt1\t1000\t10\t5\n2\tt2\t500\t4\t5\n3\tt3\t200\t1\t1\n").unwrap();
+        let txi = tximport(&[p("t_data.ctab")], s.clone(), QuantType::Stringtie, Some(&t2g), 100.0).unwrap();
+        assert_eq!(txi.counts[[0, 0]], 10.0 * 1000.0 / 100.0 + 4.0 * 500.0 / 100.0);
+        assert_eq!(txi.length[[0, 0]], 750.0);
+
+        // RSEM isoforms: effective lengths below 1 become 1
+        fs::write(
+            p("s.isoforms.results"),
+            "transcript_id\tgene_id\tlength\teffective_length\texpected_count\tTPM\n\
+             t1\tg1\t100\t0.5\t0\t2\nt2\tg1\t900\t800\t40\t2\nt3\tg2\t300\t150\t9\t1\n",
+        )
+        .unwrap();
+        let files = [p("s.isoforms.results")];
+        assert!(!is_rsem_gene_level(QuantType::Rsem, &files));
+        let txi = tximport(&files, s.clone(), QuantType::Rsem, Some(&t2g), 75.0).unwrap();
+        assert_eq!(txi.length[[0, 0]], (2.0 * 1.0 + 2.0 * 800.0) / 4.0);
+
+        // RSEM genes.results: gene level, in file order, no tx2gene
+        fs::write(
+            p("s.genes.results"),
+            "gene_id\ttranscript_id(s)\tlength\teffective_length\texpected_count\tTPM\tFPKM\n\
+             gZ\tt9\t900\t700\t12.5\t3\t1\ngA\tt8\t500\t300\t2\t1\t1\n",
+        )
+        .unwrap();
+        let files = [p("s.genes.results")];
+        assert!(is_rsem_gene_level(QuantType::Rsem, &files));
+        let txi = tximport(&files, s.clone(), QuantType::Rsem, None, 75.0).unwrap();
+        assert_eq!(txi.gene_ids, vec!["gZ".to_string(), "gA".to_string()]);
+        assert_eq!(txi.counts[[0, 0]], 12.5);
+        assert_eq!(txi.length[[1, 0]], 300.0);
+
+        // transcript-level input without tx2gene is an error; wrong type names a missing column
+        assert!(tximport(&[p("t_data.ctab")], s.clone(), QuantType::Stringtie, None, 75.0).is_err());
+        assert!(tximport(&[p("t_data.ctab")], s, QuantType::Kallisto, Some(&t2g), 75.0).is_err());
+        assert!(QuantType::parse("Kallisto").is_ok() && QuantType::parse("alevin").is_err());
     }
 
     #[test]

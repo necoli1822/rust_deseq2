@@ -18,8 +18,9 @@ A pure Rust implementation of the [DESeq2](https://bioconductor.org/packages/rel
 - **Transformations**: VST (Variance Stabilizing Transformation), rlog (Regularized Log)
 - **Normalization**: median-of-ratios, positive counts, iterative methods; gene- and
   sample-specific normalization factors (`normalizationFactors`) in every fit
-- **Input**: count matrix, htseq-count files, salmon quantifications summarized to genes
-  (tximport) or tximport matrices
+- **Input**: count matrix, htseq-count files, transcript quantifications from salmon,
+  kallisto, RSEM, StringTie, sailfish, piscem or oarfish summarized to genes (tximport), or
+  tximport matrices
 - **Convenience functions**: fpkm, fpm, collapseReplicates
 - **100% significance agreement** with R DESeq2 across all validated datasets
 - **8-12x faster**, **~90x less memory** than R DESeq2
@@ -74,8 +75,12 @@ rust_deseq2 run --htseq sample_table.csv --htseq-dir counts/ -d condition \
   --numerator treated --denominator control
 
 # salmon quant.sf files (R: tximport(type = "salmon") + DESeqDataSetFromTximport)
-rust_deseq2 run --salmon samples.csv --salmon-dir quants/ --tx2gene tx2gene.csv \
+rust_deseq2 run --quant samples.csv --quant-dir quants/ --tx2gene tx2gene.csv \
   -d condition --numerator treated --denominator control
+
+# kallisto abundance.tsv (or --quant-type rsem / stringtie / sailfish / piscem / oarfish)
+rust_deseq2 run --quant samples.csv --quant-dir kallisto/ --quant-type kallisto \
+  --tx2gene tx2gene.csv -d condition --numerator treated --denominator control
 
 # tximport matrices written from R (txi$counts, txi$length)
 rust_deseq2 run -c txi_counts.csv -m metadata.csv --avg-tx-length txi_length.csv \
@@ -96,9 +101,11 @@ rust_deseq2 run -c counts.csv -m metadata.csv --norm-factors nf.csv \
 | `-m, --metadata` | Sample metadata CSV file | *required* ³ |
 | `--htseq <SAMPLE_TABLE>` | htseq-count files listed in a sample table, instead of `-c`/`-m` (see [Input File Format](#input-file-format)) | — |
 | `--htseq-dir <DIR>` | Directory of the files named in the sample table | `.` |
-| `--salmon <SAMPLE_TABLE>` | salmon `quant.sf` files listed in a sample table, summarized to genes as `tximport(type = "salmon")` does, instead of `-c`/`-m` (needs `--tx2gene`) | — |
-| `--salmon-dir <DIR>` | Directory the `quant.sf` paths of the sample table are relative to | `.` |
-| `--tx2gene <FILE>` | Transcript-to-gene table for `--salmon` (columns 1-2: transcript, gene) | — |
+| `--quant <SAMPLE_TABLE>` | Quantification files listed in a sample table, summarized to genes as `tximport(type = <--quant-type>)` does, instead of `-c`/`-m` (alias `--salmon`) | — |
+| `--quant-type <TYPE>` | `salmon`, `sailfish`, `kallisto`, `rsem`, `stringtie`, `piscem`, `oarfish` (see [Input File Format](#input-file-format)) | `salmon` |
+| `--quant-dir <DIR>` | Directory the file paths of the sample table are relative to (alias `--salmon-dir`) | `.` |
+| `--tx2gene <FILE>` | Transcript-to-gene table for `--quant` (columns 1-2: transcript, gene); not used for RSEM `genes.results` | — |
+| `--read-length <N>` | Read length for `--quant-type stringtie` (R: `tximport(readLength = 75)`) | `75` |
 | `--avg-tx-length <FILE>` | tximport `txi$length`, a genes × samples matrix, for a `-c` matrix of `txi$counts`: counts are rounded and the lengths give normalization factors (implies `--tximport`) | — |
 | `--tximport` | The `-c` counts are tximport counts: round them (without lengths: `countsFromAbundance = "scaledTPM"`/`"lengthScaledTPM"`) | `false` |
 | `--norm-factors <FILE>` | Normalization factors, a genes × samples matrix in the count-matrix layout, used instead of size factors (R: `normalizationFactors(dds) <- nf`; `--sf-type` is then ignored) | — |
@@ -128,8 +135,8 @@ rust_deseq2 run -c counts.csv -m metadata.csv --norm-factors nf.csv \
 | `--upper-quantile` | Upper quantile for beta prior variance | `0.05` |
 | `-t, --threads` | Number of threads (0 = auto) | `0` |
 
-³ Unless `--htseq` or `--salmon` is given. `vst` and `rlog` take the input options
-(`--htseq`, `--salmon`, `--avg-tx-length`, `--tximport`, `--norm-factors`) the same way, and
+³ Unless `--htseq` or `--quant` is given. `vst` and `rlog` take the input options
+(`--htseq`, `--quant`, `--avg-tx-length`, `--tximport`, `--norm-factors`) the same way, and
 `normalize` takes them in place of `-c` (without `-m`). Non-integer `-c` counts are an error, as
 in R's `DESeqDataSetFromMatrix()`, unless `--tximport` or `--avg-tx-length` is given.
 
@@ -199,12 +206,12 @@ In each file the first column is the gene ID and the last the count, so files wr
 counter rows (IDs starting with `_`, such as `__no_feature`, and the pre-0.6 names `no_feature`,
 `ambiguous`, `too_low_aQual`, `not_aligned`, `alignment_not_unique`) are dropped.
 
-### salmon quantifications (`--salmon`)
-R's `tximport(files, type = "salmon", tx2gene = tx2gene)` with its defaults
+### Transcript quantifications (`--quant`, `--quant-type`)
+R's `tximport(files, type = <--quant-type>, tx2gene = tx2gene)` with its defaults
 (`countsFromAbundance = "no"`, `txOut = FALSE`, `ignoreTxVersion = FALSE`), followed by
 `DESeqDataSetFromTximport(txi, colData, design)`. The sample table names the sample in column 1
-and its `quant.sf` (relative to `--salmon-dir`) in column 2; the remaining columns are the sample
-variables:
+and its quantification file (relative to `--quant-dir`) in column 2; the remaining columns are
+the sample variables:
 ```
 sample,file,condition
 sample1,sample1/quant.sf,control
@@ -213,9 +220,19 @@ sample3,sample3/quant.sf,treated
 ```
 The `--tx2gene` table (CSV or TSV) maps the transcript in column 1 to the gene in column 2, by
 position; a header row is optional and further columns are ignored. As in tximport:
-- `quant.sf` columns are found by name: `Name`, `EffectiveLength`, `TPM`, `NumReads`, and every
-  file must list the same transcripts in the same order; numbers are parsed as R's
-  `read.delim()` parses them;
+- the columns are found by name, per `--quant-type`, and every file must list the same
+  transcripts in the same order; numbers are parsed as R's `read.delim()` parses them:
+
+  | `--quant-type` | File | ID, abundance, counts, length columns |
+  |---|---|---|
+  | `salmon`, `sailfish` | `quant.sf` | `Name`, `TPM`, `NumReads`, `EffectiveLength` |
+  | `kallisto` | `abundance.tsv` (`abundance.h5` is not read) | `target_id`, `tpm`, `est_counts`, `eff_length` |
+  | `rsem` | `*.isoforms.results` | `transcript_id`, `TPM`, `expected_count`, `effective_length` (lengths below 1 set to 1) |
+  | `rsem` | `*.genes.results`: when the first file's path contains `genes`, read at gene level without tx2gene, as tximport does | `gene_id`, `TPM`, `expected_count`, `effective_length` |
+  | `stringtie` | `t_data.ctab` | `t_name`, `FPKM`, `cov`, `length`; counts = `cov × length / --read-length` |
+  | `piscem` | `.quant` | `target_name`, `tpm`, `ecount`, `eelen` |
+  | `oarfish` | `.quant` | `tname`, `num_reads` (abundance and counts), `len` |
+
 - transcripts missing from tx2gene are dropped, and for a transcript listed twice the first row
   is used; genes are sorted as R sorts factor levels;
 - gene counts and abundances are the sums over the gene's transcripts, and the gene length is
@@ -229,7 +246,7 @@ produces normalization factors, `estimateNormFactors(counts, normMatrix = avgTxL
 exp(rowMeans(log(avgTxLength))))`; `--sf-type iterate` ignores the lengths, as in R.
 
 ### tximport matrices (`--avg-tx-length`, `--tximport`)
-For other quantifiers, or to import in R and analyse here, write `txi$counts` as the `-c` count
+For a tximport run in R (e.g. `kallisto` `abundance.h5`, or custom columns), write `txi$counts` as the `-c` count
 matrix and `txi$length` as a matrix of the same layout for `--avg-tx-length`. With
 `countsFromAbundance = "scaledTPM"` or `"lengthScaledTPM"`, R's `DESeqDataSetFromTximport()`
 uses just the counts: pass `-c` with `--tximport`.
@@ -316,7 +333,9 @@ release 0.1.0; "sig." counts genes called significant (padj < 0.1) by only one o
 | `--sf-type iterate`, 30% zeros | different algorithm | 8e-5 | 0 |
 | `--weights` (4 vs 4, `--use-t`, `~batch + condition`) | not supported | 5e-7 | 0 |
 | `--htseq` input (`~batch + condition`, VST, normalize) | not supported | 5e-7 | 0 |
-| `--salmon` input (tximport, Wald, VST `parametric` / `local` / `--nsub`, rlog, normalize) | not supported | 5e-7 | 0 |
+| `--quant` salmon input (tximport, Wald, VST `parametric` / `local` / `--nsub`, rlog, normalize) | not supported | 5e-7 | 0 |
+| `--quant-type` `rsem` (isoforms, genes) / `stringtie` / `oarfish` | not supported | 5e-7 / 6e-7 / 1.3e-6 / 5e-7 | 0 |
+| `--quant-type` `kallisto` / `piscem` | not supported | 1.2e-5 ⁴ | 0 |
 | `-c --avg-tx-length` (`ratio`, `poscounts`), `-c --tximport` (`lengthScaledTPM`) | not supported | 5e-7 | 0 |
 | `--norm-factors`, 7 vs 7 with outlier replacement (Wald, LRT, `local`, `--weights`, `~batch + condition`, VST, rlog) | not used in the fits | 5e-7 | 0 |
 | shrinkage `normal` / `apeglm` after outlier replacement | fitted the replaced counts (ΔLFC up to 4.4) | 5e-7 / 8e-7 | 0 |
@@ -362,14 +381,20 @@ Comparing on real data found and fixed issues the simulations did not: factor le
 ordered like R's (ICU) collation (`WT` vs `abaI`), the gene-wise Cox-Reid term no longer has a
 determinant cutoff, `lgamma` is R's, and size factors are computed bit-identically to R's.
 
+⁴ One gene with 3 of 8 samples zero and dispersion 9.2 (lfcSE 3.1). The imported txi is identical
+to R's (the run equals `-c --avg-tx-length` with R's `txi` written exactly), and R itself moves
+that gene's LFC by up to 4.7e-6 when the normalization factors are scaled by 1 ± 1e-12: the IRLS
+stopping point on this flat likelihood is a rounding-level knife edge.
+
 ### Known differences from R
 
 - Shrinkage with `--weights`: `normal` and `apeglm` stop with an error (weighted `lfcShrink` is
   not ported); `ashr` is allowed. VST and rlog do not take weights.
 - `betaPrior = TRUE`, expanded model matrices and interaction terms in the CLI are not supported.
-- tximport: only salmon `quant.sf` files are read directly, with `countsFromAbundance = "no"`;
-  inferential replicates are not read (they do not change the counts, abundances or lengths).
-  `quant.sf` numbers are parsed as `read.delim()` does (R's `R_strtod`), which is what tximport
+- tximport: kallisto's `abundance.h5` (HDF5), alevin and custom importer columns are not read
+  directly (use the `abundance.tsv` kallisto also writes, or `-c --avg-tx-length`); files are read
+  with `countsFromAbundance = "no"`; inferential replicates are not read (they do not change the
+  counts, abundances or lengths). Numbers are parsed as `read.delim()` does (R's `R_strtod`), which is what tximport
   uses without the readr package; with readr installed tximport parses with `readr::read_tsv`,
   which was not compared and may differ in the last bit.
 
@@ -402,8 +427,8 @@ Key equivalences between R DESeq2 and RustDESeq2:
 | `lfcShrink(type="apeglm")` | `shrink_lfc_apeglm()` | Apeglm shrinkage |
 | `lfcShrink(type="ashr")` | `apply_ashr_shrinkage()` | Ashr shrinkage |
 | `DESeqDataSetFromHTSeqCount()` | `io::read_htseq_count()` / CLI `--htseq` | Counts from htseq-count files |
-| `tximport(type = "salmon")` | `io::read_salmon()`, `io::tximport::tximport_salmon()` / CLI `--salmon` | salmon quantifications summarized to genes |
-| `DESeqDataSetFromTximport()` | `DESeqDataSet::set_avg_tx_length()` / CLI `--salmon`, `--avg-tx-length`, `--tximport` | Rounded counts and `avgTxLength` |
+| `tximport(type = ...)` | `io::read_quant()`, `io::tximport::tximport()` / CLI `--quant`, `--quant-type` | salmon, sailfish, kallisto, RSEM, StringTie, piscem, oarfish quantifications summarized to genes |
+| `DESeqDataSetFromTximport()` | `DESeqDataSet::set_avg_tx_length()` / CLI `--quant`, `--avg-tx-length`, `--tximport` | Rounded counts and `avgTxLength` |
 | `estimateNormFactors()` | `normalization::estimate_norm_factors()` | Normalization factors from `avgTxLength` |
 | `normalizationFactors<-` | `DESeqDataSet::set_normalization_factors()` / CLI `--norm-factors` | Gene- and sample-specific normalization factors |
 | `varianceStabilizingTransformation()` | `vst()` | VST |

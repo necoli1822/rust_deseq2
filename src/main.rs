@@ -239,9 +239,9 @@ fn load_input(input: &InputArgs) -> Result<(CountMatrix, SampleMetadata, Option<
     Ok((loaded.counts, metadata, loaded.avg_tx_length))
 }
 
-/// Read counts from -c (with -m), --htseq or --salmon.
+/// Read counts from -c (with -m), --htseq or --quant.
 /// R: DESeqDataSetFromMatrix() rejects non-integer counts ("some values in assay are
-/// not integers"); tximport counts (--salmon, --avg-tx-length, --tximport) are
+/// not integers"); tximport counts (--quant, --avg-tx-length, --tximport) are
 /// rounded first, as DESeqDataSetFromTximport() does with round(txi$counts).
 fn load_counts(
     counts_path: Option<&str>,
@@ -251,10 +251,14 @@ fn load_counts(
     tx: &TximportArgs,
 ) -> Result<LoadedInput> {
     use rust_deseq2::io::tximport::r_round;
-    if let Some(table) = &tx.salmon {
-        let tx2gene = tx.tx2gene.as_deref().expect("clap requires --tx2gene with --salmon");
-        info!("Loading salmon quantifications listed in {} (directory {}, tx2gene {})", table, tx.salmon_dir, tx2gene);
-        let (txi, metadata) = rust_deseq2::io::read_salmon(table, &tx.salmon_dir, tx2gene)?;
+    if let Some(table) = &tx.quant {
+        let quant_type = rust_deseq2::io::QuantType::parse(&tx.quant_type)?;
+        info!(
+            "Loading {} quantifications listed in {} (directory {}, tx2gene {:?})",
+            tx.quant_type, table, tx.quant_dir, tx.tx2gene
+        );
+        let (txi, metadata) =
+            rust_deseq2::io::read_quant(table, &tx.quant_dir, quant_type, tx.tx2gene.as_deref(), tx.read_length)?;
         info!("  {} genes, {} samples (tximport, countsFromAbundance = \"no\")", txi.gene_ids.len(), txi.sample_ids.len());
         let counts = CountMatrix::new(txi.counts.mapv(r_round), txi.gene_ids, txi.sample_ids)?;
         return Ok(LoadedInput { counts, metadata: Some(metadata), avg_tx_length: Some(txi.length) });
@@ -284,7 +288,7 @@ fn load_counts(
             };
             (counts, metadata)
         }
-        (None, None) => unreachable!("clap requires --counts, --htseq or --salmon"),
+        (None, None) => unreachable!("clap requires --counts, --htseq or --quant"),
     };
     // R: DESeqDataSetFromMatrix() stops with "some values in assay are not integers"
     if counts.counts().iter().any(|&x| x != r_round(x)) {
