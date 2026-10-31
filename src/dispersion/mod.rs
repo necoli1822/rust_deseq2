@@ -1,6 +1,7 @@
 //! Dispersion estimation for negative binomial models
 
 mod gene_wise;
+mod loess;
 mod map;
 mod trend;
 

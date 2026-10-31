@@ -253,7 +253,8 @@ fn estimate_prior_var_kl_divergence(log_residuals: &[f64], df: f64) -> f64 {
     let obs_density = normalize_histogram(&obs_hist, obs_dist.len());
 
     // Grid of candidate prior variances (0 to 8, 200 points)
-    let obs_var_grid: Vec<f64> = (0..200).map(|i| i as f64 * 8.0 / 199.0).collect();
+    // R: obsVarGrid <- seq(from=0, to=8, length=200)
+    let obs_var_grid = r_seq_length_out(0.0, 8.0, 200);
 
     // Calculate KL divergence for each candidate using R-compatible RNG
     let n_sim = 10000;
@@ -307,12 +308,11 @@ fn estimate_prior_var_kl_divergence(log_residuals: &[f64], df: f64) -> f64 {
         })
         .collect();
 
-    // Loess smoothing with span=0.2 (matches DESeq2)
-    let _smoothed = loess_smooth(&obs_var_grid, &kl_divs, 0.2);
-
-    // Find argmin on fine grid (predict using loess on fine grid)
-    let fine_grid: Vec<f64> = (0..1000).map(|i| i as f64 * 8.0 / 999.0).collect();
-    let fine_smoothed = loess_predict(&obs_var_grid, &kl_divs, &fine_grid, 0.2);
+    // R: lofit <- loess(klDivs ~ obsVarGrid, span=.2)
+    //    obsVarFineGrid <- seq(from=0,to=8,length.out=1000)
+    //    lofitFitted <- predict(lofit, obsVarFineGrid)
+    let fine_grid = r_seq_length_out(0.0, 8.0, 1000);
+    let fine_smoothed = super::loess::loess_interpolate(&obs_var_grid, &kl_divs, 0.2, &fine_grid);
 
     let (argmin_idx, _) = fine_smoothed
         .iter()
@@ -328,6 +328,16 @@ fn estimate_prior_var_kl_divergence(log_residuals: &[f64], df: f64) -> f64 {
     );
 
     argmin_kl.max(0.25)
+}
+
+/// R's `seq(from, to, length.out = n)` for n > 2 and from != to:
+/// `c(from, from + seq_len(n - 2) * ((to - from) / (n - 1)), to)` (seq.default).
+fn r_seq_length_out(from: f64, to: f64, n: usize) -> Vec<f64> {
+    let by = (to - from) / (n - 1) as f64;
+    let mut out: Vec<f64> = (0..n).map(|i| from + i as f64 * by).collect();
+    out[0] = from;
+    out[n - 1] = to;
+    out
 }
 
 /// Create histogram counts for given breaks
@@ -356,226 +366,6 @@ fn normalize_histogram(counts: &[usize], total: usize) -> Vec<f64> {
     counts
         .iter()
         .map(|&c| c as f64 / (total as f64 * bin_width))
-        .collect()
-}
-
-/// Loess smoothing (Locally Estimated Scatterplot Smoothing)
-/// Matches R's loess with span=0.2 and degree=2 (quadratic)
-fn loess_smooth(x: &[f64], y: &[f64], span: f64) -> Vec<f64> {
-    let n = x.len();
-    if n == 0 {
-        return vec![];
-    }
-
-    // Number of points to use in each local fit
-    let k = ((n as f64 * span).round() as usize).max(3).min(n);
-
-    (0..n)
-        .map(|i| {
-            let x_i = x[i];
-
-            // Find k nearest neighbors
-            let mut distances: Vec<(usize, f64)> = (0..n)
-                .filter(|&j| y[j].is_finite() && y[j] < f64::MAX)
-                .map(|j| (j, (x[j] - x_i).abs()))
-                .collect();
-
-            distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            let neighbors: Vec<(usize, f64)> = distances.into_iter().take(k).collect();
-
-            if neighbors.is_empty() {
-                return y[i];
-            }
-
-            // Maximum distance among neighbors
-            let max_dist = neighbors.iter().map(|(_, d)| *d).fold(0.0_f64, |a, b| a.max(b));
-            let max_dist = if max_dist < 1e-10 { 1.0 } else { max_dist };
-
-            // Tricube weights: w(u) = (1 - |u|^3)^3 for |u| < 1
-            let weights: Vec<f64> = neighbors.iter()
-                .map(|(_, d)| {
-                    let u = d / max_dist;
-                    if u < 1.0 {
-                        let t = 1.0 - u.powi(3);
-                        t.powi(3)
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
-
-            // Weighted local quadratic regression: y = a + b*x + c*x^2
-            // Using weighted least squares
-            let x_vals: Vec<f64> = neighbors.iter().map(|(j, _)| x[*j]).collect();
-            let y_vals: Vec<f64> = neighbors.iter().map(|(j, _)| y[*j]).collect();
-
-            // Center x for numerical stability
-            let x_center = x_vals.iter().sum::<f64>() / x_vals.len() as f64;
-            let x_centered: Vec<f64> = x_vals.iter().map(|&xj| xj - x_center).collect();
-            let x_i_centered = x_i - x_center;
-
-            // Weighted sums for normal equations
-            let mut sum_w = 0.0;
-            let mut sum_wx = 0.0;
-            let mut sum_wx2 = 0.0;
-            let mut sum_wx3 = 0.0;
-            let mut sum_wx4 = 0.0;
-            let mut sum_wy = 0.0;
-            let mut sum_wxy = 0.0;
-            let mut sum_wx2y = 0.0;
-
-            for (idx, &w) in weights.iter().enumerate() {
-                let xc = x_centered[idx];
-                let yv = y_vals[idx];
-                sum_w += w;
-                sum_wx += w * xc;
-                sum_wx2 += w * xc * xc;
-                sum_wx3 += w * xc * xc * xc;
-                sum_wx4 += w * xc * xc * xc * xc;
-                sum_wy += w * yv;
-                sum_wxy += w * xc * yv;
-                sum_wx2y += w * xc * xc * yv;
-            }
-
-            // Solve 3x3 system for quadratic fit: [a, b, c]
-            // |sum_w    sum_wx   sum_wx2 | |a|   |sum_wy  |
-            // |sum_wx   sum_wx2  sum_wx3 | |b| = |sum_wxy |
-            // |sum_wx2  sum_wx3  sum_wx4 | |c|   |sum_wx2y|
-
-            let det = sum_w * (sum_wx2 * sum_wx4 - sum_wx3 * sum_wx3)
-                    - sum_wx * (sum_wx * sum_wx4 - sum_wx3 * sum_wx2)
-                    + sum_wx2 * (sum_wx * sum_wx3 - sum_wx2 * sum_wx2);
-
-            if det.abs() < 1e-10 {
-                // Fall back to weighted mean
-                return sum_wy / sum_w.max(1e-10);
-            }
-
-            // Cramer's rule for a
-            let det_a = sum_wy * (sum_wx2 * sum_wx4 - sum_wx3 * sum_wx3)
-                      - sum_wx * (sum_wxy * sum_wx4 - sum_wx3 * sum_wx2y)
-                      + sum_wx2 * (sum_wxy * sum_wx3 - sum_wx2 * sum_wx2y);
-
-            // Cramer's rule for b
-            let det_b = sum_w * (sum_wxy * sum_wx4 - sum_wx3 * sum_wx2y)
-                      - sum_wy * (sum_wx * sum_wx4 - sum_wx3 * sum_wx2)
-                      + sum_wx2 * (sum_wx * sum_wx2y - sum_wxy * sum_wx2);
-
-            // Cramer's rule for c
-            let det_c = sum_w * (sum_wx2 * sum_wx2y - sum_wxy * sum_wx3)
-                      - sum_wx * (sum_wx * sum_wx2y - sum_wxy * sum_wx2)
-                      + sum_wy * (sum_wx * sum_wx3 - sum_wx2 * sum_wx2);
-
-            let a = det_a / det;
-            let b = det_b / det;
-            let c = det_c / det;
-
-            // Predict at x_i
-            a + b * x_i_centered + c * x_i_centered * x_i_centered
-        })
-        .collect()
-}
-
-/// Loess prediction at new x values
-/// Predicts y values at new_x using loess fitted on (x, y)
-fn loess_predict(x: &[f64], y: &[f64], new_x: &[f64], span: f64) -> Vec<f64> {
-    let n = x.len();
-    if n == 0 {
-        return vec![f64::NAN; new_x.len()];
-    }
-
-    // Number of points to use in each local fit
-    let k = ((n as f64 * span).round() as usize).max(3).min(n);
-
-    new_x.iter()
-        .map(|&x_i| {
-            // Find k nearest neighbors from original data
-            let mut distances: Vec<(usize, f64)> = (0..n)
-                .filter(|&j| y[j].is_finite() && y[j] < f64::MAX)
-                .map(|j| (j, (x[j] - x_i).abs()))
-                .collect();
-
-            distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            let neighbors: Vec<(usize, f64)> = distances.into_iter().take(k).collect();
-
-            if neighbors.is_empty() {
-                return f64::NAN;
-            }
-
-            // Maximum distance among neighbors
-            let max_dist = neighbors.iter().map(|(_, d)| *d).fold(0.0_f64, |a, b| a.max(b));
-            let max_dist = if max_dist < 1e-10 { 1.0 } else { max_dist };
-
-            // Tricube weights
-            let weights: Vec<f64> = neighbors.iter()
-                .map(|(_, d)| {
-                    let u = d / max_dist;
-                    if u < 1.0 {
-                        let t = 1.0 - u.powi(3);
-                        t.powi(3)
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
-
-            // Weighted local quadratic regression
-            let x_vals: Vec<f64> = neighbors.iter().map(|(j, _)| x[*j]).collect();
-            let y_vals: Vec<f64> = neighbors.iter().map(|(j, _)| y[*j]).collect();
-
-            // Center x for numerical stability
-            let x_center = x_vals.iter().sum::<f64>() / x_vals.len() as f64;
-            let x_centered: Vec<f64> = x_vals.iter().map(|&xj| xj - x_center).collect();
-            let x_i_centered = x_i - x_center;
-
-            // Weighted sums
-            let mut sum_w = 0.0;
-            let mut sum_wx = 0.0;
-            let mut sum_wx2 = 0.0;
-            let mut sum_wx3 = 0.0;
-            let mut sum_wx4 = 0.0;
-            let mut sum_wy = 0.0;
-            let mut sum_wxy = 0.0;
-            let mut sum_wx2y = 0.0;
-
-            for (idx, &w) in weights.iter().enumerate() {
-                let xc = x_centered[idx];
-                let yv = y_vals[idx];
-                sum_w += w;
-                sum_wx += w * xc;
-                sum_wx2 += w * xc * xc;
-                sum_wx3 += w * xc * xc * xc;
-                sum_wx4 += w * xc * xc * xc * xc;
-                sum_wy += w * yv;
-                sum_wxy += w * xc * yv;
-                sum_wx2y += w * xc * xc * yv;
-            }
-
-            // Solve 3x3 system
-            let det = sum_w * (sum_wx2 * sum_wx4 - sum_wx3 * sum_wx3)
-                    - sum_wx * (sum_wx * sum_wx4 - sum_wx3 * sum_wx2)
-                    + sum_wx2 * (sum_wx * sum_wx3 - sum_wx2 * sum_wx2);
-
-            if det.abs() < 1e-10 {
-                return sum_wy / sum_w.max(1e-10);
-            }
-
-            let det_a = sum_wy * (sum_wx2 * sum_wx4 - sum_wx3 * sum_wx3)
-                      - sum_wx * (sum_wxy * sum_wx4 - sum_wx3 * sum_wx2y)
-                      + sum_wx2 * (sum_wxy * sum_wx3 - sum_wx2 * sum_wx2y);
-            let det_b = sum_w * (sum_wxy * sum_wx4 - sum_wx3 * sum_wx2y)
-                      - sum_wy * (sum_wx * sum_wx4 - sum_wx3 * sum_wx2)
-                      + sum_wx2 * (sum_wx * sum_wx2y - sum_wxy * sum_wx2);
-            let det_c = sum_w * (sum_wx2 * sum_wx2y - sum_wxy * sum_wx3)
-                      - sum_wx * (sum_wx * sum_wx2y - sum_wxy * sum_wx2)
-                      + sum_wy * (sum_wx * sum_wx3 - sum_wx2 * sum_wx2);
-
-            let a = det_a / det;
-            let b = det_b / det;
-            let c = det_c / det;
-
-            a + b * x_i_centered + c * x_i_centered * x_i_centered
-        })
         .collect()
 }
 
