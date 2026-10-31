@@ -41,16 +41,14 @@ fn estimate_size_factors_ratio(counts: ArrayView2<f64>) -> Result<Array1<f64>> {
         });
     }
 
-    // Step 1: Calculate geometric mean for each gene across all samples
-    let mut geo_means = Vec::with_capacity(n_genes);
+    // Step 1: log geometric mean of each gene, R: loggeomeans <- rowMeans(log(counts))
+    // (rowMeans accumulates in long double; genes with a zero get -Inf and are skipped)
+    let mut log_geo_means = Vec::with_capacity(n_genes);
     let mut valid_genes = Vec::new();
 
     for (i, row) in counts.axis_iter(Axis(0)).enumerate() {
-        // Check if all counts are positive (skip genes with zeros)
         if row.iter().all(|&x| x > 0.0) {
-            let log_sum: f64 = row.iter().map(|&x| x.ln()).sum();
-            let geo_mean = (log_sum / n_samples as f64).exp();
-            geo_means.push(geo_mean);
+            log_geo_means.push(ld_mean(row.iter().map(|&x| x.ln())));
             valid_genes.push(i);
         }
     }
@@ -64,35 +62,32 @@ fn estimate_size_factors_ratio(counts: ArrayView2<f64>) -> Result<Array1<f64>> {
     // Step 2: For each sample, calculate ratios and take median
     let mut size_factors = Array1::zeros(n_samples);
 
+    // R: exp(median((log(cnts) - loggeomeans)[is.finite(loggeomeans) & cnts > 0]))
+    // The median is on the log scale; size factors feed every later step, so they
+    // are computed the way R does down to the last bit.
     for j in 0..n_samples {
-        let mut ratios: Vec<f64> = valid_genes
+        let mut log_ratios: Vec<f64> = valid_genes
             .iter()
-            .zip(geo_means.iter())
-            .filter_map(|(&i, &geo_mean)| {
-                let count = counts[[i, j]];
-                if count > 0.0 && geo_mean > 0.0 {
-                    Some(count / geo_mean)
-                } else {
-                    None
-                }
-            })
+            .zip(log_geo_means.iter())
+            .filter(|(&i, _)| counts[[i, j]] > 0.0)
+            .map(|(&i, &lg)| counts[[i, j]].ln() - lg)
             .collect();
 
-        if ratios.is_empty() {
+        if log_ratios.is_empty() {
             return Err(DeseqError::SizeFactorFailed {
                 reason: format!("No valid ratios for sample {}", j),
             });
         }
 
-        // Calculate median
-        ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = if ratios.len() % 2 == 0 {
-            (ratios[ratios.len() / 2 - 1] + ratios[ratios.len() / 2]) / 2.0
+        log_ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let m = log_ratios.len();
+        let median = if m % 2 == 0 {
+            (log_ratios[m / 2 - 1] + log_ratios[m / 2]) / 2.0
         } else {
-            ratios[ratios.len() / 2]
+            log_ratios[m / 2]
         };
 
-        size_factors[j] = median;
+        size_factors[j] = median.exp();
     }
 
     // Validate size factors
@@ -124,7 +119,8 @@ fn estimate_size_factors_poscounts(counts: ArrayView2<f64>) -> Result<Array1<f64
 
         if !positive_counts.is_empty() {
             // R: exp(sum(log(x[x > 0])) / length(x)) — divide by TOTAL samples, not just positive
-            let log_sum: f64 = positive_counts.iter().map(|&x| x.ln()).sum();
+            // R's sum() accumulates in long double
+            let log_sum = crate::optim::nmath::r_sum(positive_counts.iter().map(|&x| x.ln()));
             let geo_mean = (log_sum / n_samples as f64).exp();
             geo_means.push(geo_mean);
             valid_genes.push(i);
@@ -176,10 +172,32 @@ fn estimate_size_factors_poscounts(counts: ArrayView2<f64>) -> Result<Array1<f64
 
     // R passes the poscounts geometric means in as `geoMeans`, and incoming geoMeans
     // trigger: sf <- sf / exp(mean(log(sf))), i.e. size factors with geometric mean 1.
-    let log_geo_mean_sf = size_factors.iter().map(|s: &f64| s.ln()).sum::<f64>() / n_samples as f64;
+    let log_geo_mean_sf = ld_mean(size_factors.iter().map(|s: &f64| s.ln()));
     size_factors.mapv_inplace(|s| s / log_geo_mean_sf.exp());
 
     Ok(size_factors)
+}
+
+/// Mean as R's rowMeans()/mean() compute it: a long-double accumulation divided
+/// by n, rounded once to double. Emulated with a compensated (double-double) sum
+/// and an exact remainder for the division, which gives the correctly rounded mean.
+fn ld_mean(values: impl IntoIterator<Item = f64>) -> f64 {
+    let (mut hi, mut lo, mut n) = (0.0f64, 0.0f64, 0usize);
+    for v in values {
+        let s = hi + v;
+        let bb = s - hi;
+        lo += (hi - (s - bb)) + (v - bb);
+        hi = s;
+        n += 1;
+    }
+    if !hi.is_finite() {
+        return hi / n as f64;
+    }
+    let nf = n as f64;
+    let q = hi / nf;
+    // remainder of (hi + lo) - q * n, exactly via fused multiply-add
+    let r = (-q).mul_add(nf, hi) + lo;
+    q + r / nf
 }
 
 /// Iterative size factor estimation for data where every gene has a zero
