@@ -649,6 +649,7 @@ dependencies = [
  "clap",
  "csv",
  "env_logger",
+ "libm",
  "log",
  "ndarray",
  "ndarray-stats",

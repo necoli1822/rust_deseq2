@@ -21,10 +21,13 @@ const M_LN_2PI: f64 = 1.837_877_066_409_345_483_560_659_472_811;
 /// log(sqrt(2*pi)). R: M_LN_SQRT_2PI
 const M_LN_SQRT_2PI: f64 = 0.918_938_533_204_672_741_780_329_736_406;
 
-extern "C" {
-    /// The C library's `lgamma`, which R's `stirlerr()` calls directly
-    /// (it is not R's `lgammafn`).
-    fn lgamma(x: f64) -> f64;
+/// The C library's `lgamma`, which R's `stirlerr()` calls directly (it is not
+/// R's `lgammafn`). Uses the pure-Rust fdlibm/musl port in the `libm` crate rather
+/// than calling the platform C library, so the crate stays free of FFI; glibc's
+/// own result already varies by CPU (FMA variants), and libm agrees with it to
+/// <= 2 ulp on [1, 5.25], the range stirlerr uses.
+fn lgamma(x: f64) -> f64 {
+    libm::lgamma(x)
 }
 
 /// C `nearbyint()` in the default rounding mode (ties to even). R: `R_forceint`.
@@ -143,8 +146,7 @@ pub fn lgammafn(x: f64) -> f64 {
         return x;
     }
     if x <= 0.0 {
-        // SAFETY: plain libm call on a finite/infinite double.
-        return unsafe { lgamma(x) };
+        return lgamma(x);
     }
     const XMAX: f64 = 2.532_737_276_080_075_8e+305;
     let y = x;
@@ -347,8 +349,7 @@ pub fn stirlerr(n: f64) -> f64 {
         if n <= 5.25 {
             if n >= 1.0 {
                 let l_n = n.ln();
-                // SAFETY: plain libm call.
-                return unsafe { lgamma(n) } + n * (1.0 - l_n) + (l_n - M_LN_2PI) * 0.5;
+                return lgamma(n) + n * (1.0 - l_n) + (l_n - M_LN_2PI) * 0.5;
             } else {
                 return lgamma1p(n) - (n + 0.5) * n.ln() + n - M_LN_SQRT_2PI;
             }
