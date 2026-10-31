@@ -221,7 +221,7 @@ release 0.1.0; "sig." counts genes called significant (padj < 0.1) by only one o
 | 16 samples, batch 4/4, outliers | max \|ΔLFC\| 3.56 | 5e-7 | 0 |
 | 2 vs 5 with outliers | 19 sig., 75 padj-NA differences | 5e-7 | 0 |
 | 2 vs 2, 2 vs 3 with dispersion scatter | 3 sig. / 116 padj-NA differences | 5e-7 / 7e-7 | 0 |
-| `--sf-type poscounts`, 30% zeros | 2 sig., 75 padj-NA differences | 1.2e-2 ¹ | 0 |
+| `--sf-type poscounts`, 30% zeros | 2 sig., 75 padj-NA differences | 1.6e-3 ¹ | 0 |
 | `--sf-type iterate`, 30% zeros | different algorithm | 8e-5 | 0 |
 | `--weights` (4 vs 4, `--use-t`, `~batch + condition`) | not supported | 5e-7 | 0 |
 | shrinkage `normal` / `apeglm` / `ashr` | 5e-7 / 4.2e-2 / 5.9e-2 | 5e-7 / 1.5e-6 / 1.8e-5 | 0 |
