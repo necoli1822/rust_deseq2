@@ -30,6 +30,7 @@ pub mod filter;
 pub mod glm;
 pub mod io;
 pub mod normalization;
+pub mod optim;
 pub mod rng;
 pub mod shrinkage;
 pub mod stats;
