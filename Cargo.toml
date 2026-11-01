@@ -34,9 +34,9 @@ path = "src/main.rs"
 ndarray = { version = "0.16", features = ["rayon"] }
 
 # Statistics
-statrs = "0.18"
+statrs = { version = "0.19", default-features = false, features = ["std"] }
 # Pure-Rust port of the fdlibm/musl math library, already in the tree through
-# statrs; used for the C-library lgamma that R's stirlerr() calls.
+# num-traits (statrs, ndarray); used for the C-library lgamma that R's stirlerr() calls.
 libm = "0.2"
 
 # Parallel processing
