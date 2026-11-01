@@ -34,10 +34,11 @@ R 쪽 목록은 `getNamespaceExports("DESeq2")`와 주요 함수의 `formals()`�
 
 | R 기능 | 상태 | 비고 |
 |---|---|---|
-| 임의 formula (`~ a + b + a:b`, `~ a * b`, `~ 0 + a` 등) | **구현됨** | `--formula`(`run`, `vst`, `rlog`), 라이브러리 `builder().formula()`. 연산자 `+ : * - / %in% ^`, 괄호, `0 +`/`- 1`. R `model.matrix()`의 열 순서·코딩(주효과가 없는 상호작용의 marginality 규칙 포함)과 DESeq2의 `resultsNames`를 따른다. 숫자 변수는 `--continuous`로 지정(R은 colData 열의 형으로 정함). `log(x)`, `I()` 등 함수는 미지원. `validation/gen12.R` 22개 시나리오 |
+| 임의 formula (`~ a + b + a:b`, `~ a * b`, `~ 0 + a` 등) | **구현됨** | `--formula`(`run`, `vst`, `rlog`), 라이브러리 `builder().formula()`. 연산자 `+ : * - / %in% ^`, 괄호, `0 +`/`- 1`. R `model.matrix()`의 열 순서·코딩(주효과가 없는 상호작용의 marginality 규칙 포함)과 DESeq2의 `resultsNames`를 따른다. 숫자 변수는 `--continuous`로 지정(R은 colData 열의 형으로 정함), 값이 모두 `TRUE`/`FALSE`인 열은 R처럼 logical(`flagTRUE`, 이름 바꿈 없음). `.`은 R `DESeqDataSet()`처럼 오류. `validation/gen12.R` 22개 시나리오 |
+| formula 안의 함수 | **구현됨** | R `model.frame()`처럼 평가: `factor()`, `as.factor()`, `relevel()`, `ordered()`(`contr.poly` 다항 대비), `as.numeric()`/`as.integer()`, `log()`(`base`), `log2`, `log10`, `log1p`, `exp`, `expm1`, `sqrt`, `abs`, `scale()`, `I()`(사칙연산·`^`·`%%`·비교·`%in%`), `poly()`(직교: LINPACK `dqrdc2` QR, `raw = TRUE`), `splines::ns()`/`bs()`(`splineDesign()`, type 7 분위수 매듭, 자연 스플라인 QR 제약), `offset()`(DESeq2처럼 무시). 열 이름은 R `deparse()` + `make.names()`(`poly.x..2.1`), `_vs_` 이름 바꿈은 `all.vars(design)`의 colData factor만(`factor.dose.2`는 그대로). `--contrast-var`는 R처럼 colData factor여야 함. 모형 행렬 124개가 R과 4e-16까지 같음(`validation/gen_formula_cases.R`), `validation/gen13.R` 30개 시나리오. 미지원: 그 밖의 R 함수와 사용자 정의 함수(R 코드를 실행하지 않음, 오류 메시지에 지원 함수 목록), `polym`(`poly()`에 변수 여러 개), `poly(coefs =)`, `factor(exclude =, nmax =)`, `NA` |
 | 상호작용 항 | **구현됨** | `--formula`로. 계수 이름은 R과 같은 `batchb2.conditionB`. builder의 `.interaction()`도 같은 경로를 쓴다(예전 이름 `f1_l1_x_f2_l2`와 dispersion에서 상호작용 열을 빼던 문제 수정). 상호작용이 있으면 normal 수축은 R처럼 오류 |
 | 절편 없는 설계 (`~ 0 + a`) | **구현됨** | 열 이름을 바꾸지 않음(`conditionA`), `--numerator`/`--denominator`는 R `cleanContrast()`의 규칙(`noInterceptPullCoef` 포함), 기본 대비는 R처럼 `c(마지막 변수, 마지막 수준, 첫 수준)` |
-| LRT 축소 모형 | **구현됨** | `--reduced`가 같은 파서를 쓰고 R `checkLRT()`(축소식 변수는 전체식에 있어야 함)와 자유도 검사. full rank가 아닌 축소 모형은 오류(R은 그대로 적합) |
+| LRT 축소 모형 | **구현됨** | `--reduced`가 같은 파서를 쓰고 R `checkLRT()`(축소식 변수는 전체식에 있어야 함)와 자유도 검사. full rank가 아닌 축소 모형도 R `fitNbinomGLMs()`처럼 적합(절편은 `log(baseMean)`, 나머지 0에서 시작, 절편이 없으면 모두 1; ridge 벌점) |
 | `DESeqDataSetFromMatrix(ignoreRank = TRUE)` | 미지원 | 계수 행렬이 full rank가 아니면 오류 |
 
 ### `results()`

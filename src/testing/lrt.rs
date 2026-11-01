@@ -20,7 +20,7 @@ use statrs::function::gamma::ln_gamma;
 use super::fdr::benjamini_hochberg;
 use crate::data::DESeqDataSet;
 use crate::error::{DeseqError, Result};
-use crate::glm::{fit_single_gene_weighted, GlmFitParams};
+use crate::glm::{fit_single_gene_from, fit_single_gene_weighted, GlmFitParams};
 use crate::io::{Contrast, DESeqResults};
 
 /// Negative binomial log-likelihood for a single observation.
@@ -67,6 +67,23 @@ pub fn likelihood_ratio_test(
     design_full: &Array2<f64>,
     design_reduced: &Array2<f64>,
 ) -> Result<DESeqResults> {
+    // R names the intercept column of a formula's model matrix "Intercept"; here a
+    // first column of ones stands for it
+    let intercept = design_reduced.ncols() > 0 && design_reduced.column(0).iter().all(|&v| v == 1.0);
+    likelihood_ratio_test_reduced(dds, design_full, design_reduced, intercept)
+}
+
+/// [`likelihood_ratio_test`] with the reduced model's intercept given: R starts the fit
+/// of a reduced model matrix that is not full rank (qr()$rank < ncol) from
+/// log(rowMeans(normalized counts)) for the Intercept column and 0 elsewhere, or from
+/// 1 for every column if `reduced_has_intercept` is false (fitNbinomGLMs())
+/// R equivalent: nbinomLRT(object, full, reduced) with formulas
+pub fn likelihood_ratio_test_reduced(
+    dds: &DESeqDataSet,
+    design_full: &Array2<f64>,
+    design_reduced: &Array2<f64>,
+    reduced_has_intercept: bool,
+) -> Result<DESeqResults> {
     let counts = dds.counts().counts();
     if !dds.has_size_or_norm_factors() {
         return Err(DeseqError::InvalidContrast {
@@ -104,6 +121,8 @@ pub fn likelihood_ratio_test(
         });
     }
     let df = (df_full - df_reduced) as f64;
+    // R: qrx <- qr(modelMatrix); if (qrx$rank == ncol(modelMatrix)) least-squares start
+    let reduced_full_rank = crate::glm::rfuns::Qr::new(design_reduced).rank == design_reduced.ncols();
 
     // Determine if the reduced model is intercept-only (single column of 1s)
     let is_intercept_only = design_reduced.ncols() == 1 && {
@@ -228,7 +247,20 @@ pub fn likelihood_ratio_test(
             } else {
                 let gene_view = ndarray::ArrayView1::from(&gene_counts[..]);
                 let sf_view = ndarray::ArrayView1::from(&sf[..]);
-                fit_single_gene_weighted(gene_view, design_reduced, sf_view, alpha, &GlmFitParams::default(), gene_w)
+                // R (fitNbinomGLMs, model matrix not full rank): beta_mat starts at 0 with
+                // log(rowMeans(counts(object, normalized = TRUE))) for the Intercept,
+                // or at 1 without an intercept
+                let start: Option<Vec<f64>> = (!reduced_full_rank).then(|| {
+                    if reduced_has_intercept {
+                        let norm: Vec<f64> = gene_counts.iter().zip(&sf).map(|(&c, &s)| c / s).collect();
+                        let mut b = vec![0.0; design_reduced.ncols()];
+                        b[0] = (crate::optim::nmath::r_sum(norm.iter().copied()) / n_samples as f64).ln();
+                        b
+                    } else {
+                        vec![1.0; design_reduced.ncols()]
+                    }
+                });
+                fit_single_gene_from(gene_view, design_reduced, sf_view, alpha, &GlmFitParams::default(), gene_w, start.as_deref())
                     .log_likelihood
             };
 

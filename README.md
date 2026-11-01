@@ -15,7 +15,9 @@ A pure Rust implementation of the [DESeq2](https://bioconductor.org/packages/rel
 - **Outlier handling**: Cook's distance detection and replacement
 - **Multi-factor designs**: batch correction with categorical and continuous covariates, or any
   R design formula (`--formula "~ genotype * treatment"`): interactions, designs without an
-  intercept, nested factors, with R's model matrix and `resultsNames`
+  intercept, nested factors, and functions of metadata columns (`factor()`, `relevel()`,
+  `ordered()`, `log()`, `scale()`, `I(x^2)`, `poly()`, `splines::ns()`/`bs()`, `offset()`), with
+  R's model matrix and `resultsNames`
 - **t-distribution p-values**: more conservative testing for small samples (`--use-t`)
 - **Transformations**: VST (Variance Stabilizing Transformation), rlog (Regularized Log)
 - **Normalization**: median-of-ratios, positive counts, iterative methods; gene- and
@@ -121,7 +123,7 @@ rust_deseq2 run -c counts.csv -m metadata.csv --norm-factors nf.csv \
 | `--tximport` | The `-c` counts are tximport counts: round them (without lengths: `countsFromAbundance = "scaledTPM"`/`"lengthScaledTPM"`) | `false` |
 | `--norm-factors <FILE>` | Normalization factors, a genes × samples matrix in the count-matrix layout, used instead of size factors (R: `normalizationFactors(dds) <- nf`; `--sf-type` is then ignored) | — |
 | `-d, --design` | Design variable (column in metadata); the design is `~ covariates + continuous + design` | *required* unless `--formula` |
-| `--formula <FORMULA>` | R design formula instead of `-d`/`--covariate`, e.g. `"~ batch + condition + batch:condition"`, `"~ genotype * treatment"`, `"~ 0 + condition"` (see below) | — |
+| `--formula <FORMULA>` | R design formula instead of `-d`/`--covariate`, e.g. `"~ batch + condition + batch:condition"`, `"~ genotype * treatment"`, `"~ 0 + condition"`, `"~ condition + poly(age, 2)"` (see below) | — |
 | `--covariate` | Categorical covariate for batch correction (not with `--formula`) | — |
 | `--continuous` | Continuous covariate; with `--formula`, the formula variables that are numeric | — |
 | `--reference` | Reference level (format: factor=level) | alphabetical |
@@ -155,6 +157,32 @@ matrix column otherwise (`batchb2.conditionB`, `x.conditionB`); without an inter
 their model matrix names (`conditionA`, `conditionB`), and `--numerator`/`--denominator` use them
 as R's `results()` does. A model matrix that is not full rank is an error, with R's
 `checkFullRank()` messages.
+
+Formula variables can be R expressions of metadata columns, evaluated as R's `model.frame()`
+does: `factor(x)` / `as.factor(x)` (also with `levels =` and `labels =`), `relevel(x, ref = "B")`,
+`ordered(x)` (coded by R's polynomial contrasts `contr.poly`: `.L`, `.Q`, `.C`, `^4`, ...),
+`as.numeric(x)` / `as.integer(x)`, `log(x)` (with `base =`), `log2`, `log10`, `log1p`, `exp`,
+`expm1`, `sqrt`, `abs`, `scale(x, center =, scale =)`, `I(...)` with `+ - * / ^ %% %/%`,
+comparisons, `!`, `&`, `|` and `%in%`, `poly(x, degree)` (orthogonal, by R's QR algorithm) and
+`poly(x, degree, raw = TRUE)`, `ns(x, df =, knots =, intercept =, Boundary.knots =)` and
+`bs(x, df =, knots =, degree =, ...)` (also as `splines::ns` / `splines::bs`; knots at R's type-7
+quantiles, R's B-spline recursion and the natural-spline QR constraint), and `offset(x)`, which
+DESeq2 ignores (the model matrix has no offset column). Arguments are matched as R matches them.
+Columns are named as `model.matrix()` names them (`log(age)`, `poly(x, 2)1`, `ns(x, df = 3)2`,
+`relevel(cond, ref = "B")A`, `ordered(cond).L`) and then by DESeq2: `make.names()`
+(`log.age.`, `poly.x..2.1`, `ns.x..df...3.2`), with `_vs_` renaming only for the colData factors
+of `all.vars(design)` — so `factor(dose)2` stays `factor.dose.2`. Functions that need numbers
+(`log`, `poly`, `ns`, `scale`, ...) need a `--continuous` column; `factor(x)` of a `--continuous`
+column is a factor, as in R. As in R's `results()`, `--contrast-var` must be a factor column of the
+metadata (a `--continuous` column used as `factor(x)` is not one: use `--name`), and logical
+columns (all values `TRUE`/`FALSE`, as `read.csv()` reads them) are coded as R codes logicals
+(`flagTRUE`, not renamed, not a `--contrast-var`). R's errors are kept: `~ .` fails as in
+`DESeqDataSet()` (all variables in the design formula must be columns in colData), `T`/`F` are
+names (use `TRUE`/`FALSE`), `log()` of a factor, `relevel()` of a numeric or ordered variable,
+NaN/Inf values. Other R functions, including user-defined ones, cannot be evaluated (rust_deseq2
+does not run R code); the error lists the supported functions. An LRT reduced model that is not
+full rank is fitted as R fits it (no error; from `log(baseMean)` for the intercept and 0
+elsewhere, or 1 for every coefficient without an intercept, with DESeq2's ridge penalty).
 | `--reduced` | Reduced model formula for LRT (e.g., `~1`, `"~ genotype + treatment"`), in the `--formula` syntax; its variables must be in the full design and it must have fewer columns (R: `checkLRT()`) | `~1` |
 | `--fit-type` | Dispersion fit: `parametric`, `local`, `mean` | `parametric` |
 | `--use-t` | Use t-distribution for Wald test p-values | `false` |
@@ -376,6 +404,7 @@ release 0.1.0; "sig." counts genes called significant (padj < 0.1) by only one o
 | `--weights` (4 vs 4, `--use-t`, `~batch + condition`) | not supported | 5e-7 | 0 |
 | Contrasts on `~batch + age + condition`: `--name` (slope, covariate), `--contrast-var`, numeric, list (with `listValues`), default, `--use-t`, `--lfc-threshold`, LRT, normal/apeglm of a chosen coefficient | `--numerator`/`--denominator` of `-d` only | 5e-7 (numeric/list 1.2e-6, apeglm 2.7e-6) | 0 |
 | `--formula`: `~batch + condition + batch:condition` (default, interaction `--name`, main-effect contrast, LRT `~batch + condition`, apeglm, VST and rlog not blind), `~condition + condition:batch`, `~genotype * treatment` 7 per cell with outlier replacement (list contrast main + interaction, genotype contrast, LRT), `~x + condition + x:condition` (`--continuous x`), `~0 + condition`, `~0 + batch + condition` (default and `--numerator`/`--denominator` on either factor), `~batch * condition * genotype` (Wald, LRT `~(batch + condition + genotype)^2`) | not supported | 5e-7 (apeglm 3.8e-6) | 0 |
+| `--formula` functions: `factor(dose)`, `relevel()`, `ordered()`, `log(conc)`, `scale(age)`, `I(x^2)`, `poly(x, 2)` (orthogonal and raw; Wald, LRT, apeglm), `ns(x, df = 3)` (Wald, LRT, VST), `bs(x, df = 4)`, `cond * poly(x, 2)`, `cond:ns(x, df = 2)`, LRTs with reduced models that are not full rank (with and without intercept), `offset()`, levels needing `make.names()`, a logical column, numeric-only and no-intercept designs, normal shrinkage on `~log(conc) + cond` | not supported | 7e-7 (apeglm 4.9e-6) ⁵ | 0 |
 | `--htseq` input (`~batch + condition`, VST, normalize) | not supported | 5e-7 | 0 |
 | `--quant` salmon input (tximport, Wald, VST `parametric` / `local` / `--nsub`, rlog, normalize) | not supported | 5e-7 | 0 |
 | `--quant-type` `rsem` (isoforms, genes) / `stringtie` / `oarfish` | not supported | 5e-7 / 6e-7 / 1.3e-6 / 5e-7 | 0 |
@@ -432,15 +461,30 @@ that gene's LFC by up to 4.7e-6 when the normalization factors are scaled by 1 �
 stopping point on this flat likelihood is a rounding-level knife edge. The `abundance.h5` row is
 the same case (one gene, dispersion 8.9; the imported txi is again identical to R's).
 
+⁵ `--formula` functions (validation/gen13.R): the largest lfcSE differences (1.2e-5, 4.3e-6) are
+one gene with counts ~1e5 in `~cond * poly(x, 2)` and `~cond + cond:ns(x, df = 2)` whose MAP
+dispersion is a line-search knife edge: Rust's dispersion trend at that gene differs from R's by
+1.7e-10 (relative), and scaling R's own trend by 1 - 1.7e-10 moves R's MAP dispersion from
+0.15611634 to 0.15611761 (Rust: 0.15611888; from R's inputs Rust's MAP equals R's to 3e-14),
+while R does not move under a 1e-12 change of the size factors. The largest p-value differences
+of the logical and normal-shrinkage scenarios (relative 5e-6 / 1.5e-5) are genes whose p-values
+R itself moves by 5.5e-6 / 7.6e-6 when the size factors are scaled by 1 + 1e-12. `dlog10p` 0.3 of
+the `~0 + factor(dose)` scenario is a p-value of 1e-323 (two subnormal units).
+
 ### Known differences from R
 
 - Shrinkage with `--weights`: `normal` and `apeglm` stop with an error (weighted `lfcShrink` is
   not ported); `ashr` is allowed. VST and rlog do not take weights.
 - `betaPrior = TRUE` and expanded model matrices are not supported.
-- `--formula`: variables and formula operators only — no functions (`log(x)`, `I(x^2)`,
-  `factor(x)`, `offset()`), no `.`; numeric variables are those given with `--continuous` rather than
-  those stored as numbers. A reduced LRT model that is not full rank is an error (R fits it from a
-  different starting point).
+- `--formula`: numeric variables are the `--continuous` columns rather than those stored as
+  numbers, and logical ones are the columns whose values are all `TRUE`/`FALSE` (as `read.csv()`
+  reads them); an ordered factor column cannot be given (DESeq2 rejects one anyway; `ordered()` in
+  the formula works). Only the R functions listed above are evaluated — no other base R or package
+  functions and no user-defined ones (rust_deseq2 does not run R code), no `poly()` of several
+  variables (`polym`) or with `coefs =`, no `factor(exclude =, nmax =)`, no `NA` values. `factor()`
+  of numbers names the levels with 15 significant digits (R 4.5 writes integer-valued numbers
+  above 1e15 in full). Inside `I()`, `%%` and `%/%` are computed in double rather than R's long
+  double precision.
 - tximport: alevin and custom importer columns are not read directly (use
   `-c --avg-tx-length`); files are read
   with `countsFromAbundance = "no"`; inferential replicates are not read (they do not change the

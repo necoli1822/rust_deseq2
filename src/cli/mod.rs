@@ -83,13 +83,20 @@ Examples:
                 -d/--covariate: terms a + b, interactions a:b, a*b (= a + b + a:b), a*b*c,\n\
                 (a + b + c)^2, a/b, a %in% b, and 0 + / - 1 for no intercept. Variables are\n\
                 factors (treatment contrasts, levels sorted, --reference to change the\n\
-                reference) unless listed with --continuous; R makes numeric metadata\n\
-                columns numeric, here --continuous says which are. The model matrix,\n\
-                its column order and resultsNames follow R's model.matrix() and DESeq2:\n\
-                \"Intercept\", \"<factor>_<level>_vs_<ref>\", interaction columns as\n\
-                \"batchb2.conditionB\" (no renaming without an intercept: \"conditionB\").\n\
+                reference) unless listed with --continuous, or logical if all values are\n\
+                TRUE/FALSE; R makes numeric metadata columns numeric, here --continuous\n\
+                says which are. Variables can be R expressions, evaluated as model.frame()\n\
+                does: factor(), as.factor(), relevel(x, ref = ), ordered() (contr.poly),\n\
+                as.numeric(), as.integer(), log(), log2(), log10(), log1p(), exp(), expm1(),\n\
+                sqrt(), abs(), scale(), I() with arithmetic, poly(x, degree[, raw = TRUE]),\n\
+                ns()/bs() (also splines::ns/bs) and offset() (ignored, as by DESeq2); other\n\
+                R functions are an error. The model matrix, its column order and\n\
+                resultsNames follow R's model.matrix() and DESeq2: \"Intercept\",\n\
+                \"<factor>_<level>_vs_<ref>\" (factor columns only), interaction columns as\n\
+                \"batchb2.conditionB\", functions by make.names() (\"poly.x..2.1\", \"log.age.\"),\n\
+                no renaming without an intercept (\"conditionB\").\n\
                 --numerator/--denominator then need --contrast-var.\n\
-                Example: --formula \"~ genotype * treatment\"")]
+                Example: --formula \"~ genotype * treatment\", --formula \"~ batch + ns(age, df = 3)\"")]
         formula: Option<String>,
 
         /// Additional categorical covariate
@@ -102,7 +109,8 @@ Examples:
         #[arg(long, value_name = "VAR",
             long_help = "Continuous covariates.\n\
                 Can be specified multiple times: --continuous age --continuous weight\n\
-                With --formula: the formula variables that are numeric (all others are factors).\n\
+                With --formula: the metadata columns that are numeric (all others are factors\n\
+                or logical); functions such as log(), poly(), ns() need numeric columns.\n\
                 Centre and scale them, as R recommends.")]
         continuous: Vec<String>,
 

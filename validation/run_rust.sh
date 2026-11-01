@@ -137,3 +137,40 @@ if [ -d "$D/inter_default" ]; then
   run threeway_default --formula "~ batch * condition * genotype"
   run threeway_lrt --formula "~ batch * condition * genotype" --test lrt --reduced "~ (batch + condition + genotype)^2"
 fi
+# gen13.R: functions in design formulas (factor, relevel, ordered, log, scale, I, poly, ns, bs, offset)
+if [ -d "$D/fdose_default" ]; then
+  run fdose_default --formula "~ batch + factor(dose)" --continuous dose
+  run fdose_name --formula "~ batch + factor(dose)" --continuous dose --name factor.dose.2
+  run relevel_default --formula '~ batch + relevel(cond, ref = "B")'
+  run relevel_fdose_lrt --formula '~ batch + relevel(factor(dose), "2")' --continuous dose --test lrt --reduced "~ batch"
+  run logconc_name --formula "~ cond + log(conc)" --continuous conc --name log.conc.
+  run scaleage_name --formula "~ cond + scale(age)" --continuous age --name scale.age.
+  run isq_name --formula "~ cond + x + I(x^2)" --continuous x --name I.x.2.
+  P="--formula ~cond+poly(x,2) --continuous x"
+  run poly_name $P --name poly.x..2.2
+  run shr_apeglm_poly $P --name poly.x..2.1 --shrinkage --shrinkage-method apeglm
+  run poly_lrt $P --test lrt --reduced "~ cond"
+  run polyraw_lrt --formula "~ cond + poly(x, 2, raw = TRUE)" --continuous x --test lrt --reduced "~ cond"
+  S="--formula ~cond+ns(x,df=3) --continuous x"
+  run ns_name $S --name ns.x..df...3.2
+  ND=$D/ns_name
+  "$B" vst -c $ND/counts.csv -m $ND/metadata.csv $S -o $ND/rust_vst_$T.tsv > /dev/null 2>&1 || echo "ns vst: FAILED"
+  run ns_lrt $S --test lrt --reduced "~ cond"
+  run bs_name --formula "~ cond + bs(x, df = 4)" --continuous x --name bs.x..df...4.3
+  run bs_lrt --formula "~ cond + bs(x, df = 4)" --continuous x --test lrt --reduced "~ cond"
+  run condpoly_name --formula "~ cond * poly(x, 2)" --continuous x --name condB.poly.x..2.1
+  run condpoly_lrt --formula "~ cond * poly(x, 2)" --continuous x --test lrt --reduced "~ cond + poly(x, 2)"
+  run condns_name --formula "~ cond + cond:ns(x, df = 2)" --continuous x --name condC.ns.x..df...2.2
+  run ordered_default --formula "~ batch + ordered(cond)"
+  run ordered_L --formula "~ batch + ordered(cond)" --name ordered.cond..L
+  run rankdef_lrt $P --test lrt --reduced "~ x + poly(x, 2)"
+  run rankdef0_lrt --formula "~ 0 + cond + poly(x, 3)" --continuous x --test lrt --reduced "~ 0 + cond + x + scale(x)"
+  run offset_default --formula "~ cond + offset(conc)" --continuous conc
+  run mknames_cvar --formula "~ batch + geno" --contrast-var geno --numerator KO-2 --denominator "wild type"
+  run mknames_default --formula "~ batch + geno"
+  run logical_name --formula "~ flag + cond" --name flagTRUE
+  run logical_default --formula "~ flag + cond"
+  run numeric_only --formula "~ x + scale(age)" --continuous x --continuous age
+  run noint_fdose --formula "~ 0 + factor(dose)" --continuous dose
+  run shr_normal_logconc --formula "~ log(conc) + cond" --continuous conc --name cond_C_vs_A --shrinkage --shrinkage-method normal
+fi

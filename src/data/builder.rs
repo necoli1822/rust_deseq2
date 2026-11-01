@@ -88,9 +88,11 @@ impl DESeqDataSetBuilder {
         self
     }
 
-    /// Use an R design formula, e.g. `"~ genotype * treatment"` or `"~ 0 + condition"`
-    /// (R: DESeqDataSetFromMatrix(design = ...)). Variables are factors unless they
-    /// are continuous columns of the metadata (`SampleMetadata::add_continuous`).
+    /// Use an R design formula, e.g. `"~ genotype * treatment"`, `"~ 0 + condition"` or
+    /// `"~ batch + poly(age, 2)"` (R: DESeqDataSetFromMatrix(design = ...)). Metadata
+    /// columns are factors unless they are continuous columns of the metadata
+    /// (`SampleMetadata::add_continuous`) or all TRUE/FALSE (logical); the functions of
+    /// [`crate::glm::model_frame`] can be used on them.
     /// The main effect, factors and continuous covariates are then not used for the
     /// design; reference levels still apply.
     pub fn formula(mut self, formula: &str) -> Self {
@@ -236,16 +238,22 @@ fn build_with_formula(
     for factor in reference_levels.keys() {
         if !info.reference_levels.contains_key(factor) {
             return Err(DeseqError::InvalidInput {
-                reason: format!("Reference level set for '{}', which is not a factor of the design formula", factor),
+                reason: format!(
+                    "Reference level set for '{}', which is not a factor column of the design formula (numeric \
+                     and logical TRUE/FALSE columns have no reference level; use e.g. relevel(factor({}), ref = \"...\") \
+                     in the formula)",
+                    factor, factor
+                ),
             });
         }
     }
     // The dataset's main variable: the given one, else the last factor of the formula
-    // (R's default contrast variable), else any variable; `~ 1` gets a constant column.
+    // (R's default contrast variable), else any metadata column of the formula; `~ 1`
+    // and designs of numeric columns only get a constant column.
     let main = match main_effect {
         Some(m) => m.to_string(),
         None if !info.design_variable.is_empty() => info.design_variable.clone(),
-        None => match formula.variables.first() {
+        None => match formula.all_vars.iter().find(|v| metadata.has_condition(v)) {
             Some(v) => v.clone(),
             None => {
                 let n = metadata.n_samples();

@@ -390,13 +390,14 @@ fn formula_dataset(
     let formula = rust_deseq2::glm::Formula::parse(text)?;
     info!("Creating DESeqDataSet with design: {}", formula.display());
     for name in continuous_vars {
-        if !formula.variables.contains(name) {
+        if !formula.all_vars.contains(name) {
             return Err(DeseqError::InvalidInput {
                 reason: format!("--continuous {} is not a variable of the formula {}", name, formula.display()),
             });
         }
     }
-    let numeric: Vec<&String> = formula.variables.iter().filter(|v| metadata.has_continuous(v)).collect();
+    // R: DESeqDataSet() looks at the numeric colData columns of all.vars(design)
+    let numeric: Vec<&String> = formula.all_vars.iter().filter(|v| metadata.has_continuous(v)).collect();
     let values = |v: &str| (0..metadata.n_samples()).map(|i| metadata.get_continuous_value(v, i).unwrap()).collect::<Vec<f64>>();
     if numeric.iter().any(|v| values(v).iter().all(|x| *x == x.round())) {
         log::warn!(
@@ -465,7 +466,7 @@ fn run_analysis(
     weights_path: Option<&str>,
     cooks_cutoff_override: Option<f64>,
 ) -> Result<()> {
-    use rust_deseq2::testing::likelihood_ratio_test;
+    use rust_deseq2::testing::likelihood_ratio_test_reduced;
 
     // Configure thread pool
     if threads > 0 {
@@ -631,7 +632,7 @@ fn run_analysis(
             reason: "Design matrix not available after GLM fit".to_string(),
         })?.clone();
 
-        let design_reduced = build_reduced_design(&dds, &design_info, reduced_formula)?;
+        let (design_reduced, reduced_intercept) = build_reduced_design(&dds, &design_info, reduced_formula)?;
 
         let df_full = design_full.ncols();
         let df_reduced = design_reduced.ncols();
@@ -642,7 +643,7 @@ fn run_analysis(
             df_full - df_reduced
         );
 
-        let mut lrt = likelihood_ratio_test(&dds, &design_full, &design_reduced)?;
+        let mut lrt = likelihood_ratio_test_reduced(&dds, &design_full, &design_reduced, reduced_intercept)?;
         if explicit_contrast {
             lrt_contrast_columns(&dds, &design_info, &contrast_spec, &mut lrt)?;
         }
@@ -713,8 +714,8 @@ fn run_analysis(
                 let design_full = dds.design_matrix().ok_or_else(|| DeseqError::InvalidInput {
                     reason: "Design matrix not available after refit".to_string(),
                 })?.clone();
-                let design_reduced = build_reduced_design(&dds, &design_info, reduced_formula)?;
-                let mut lrt = likelihood_ratio_test(&dds, &design_full, &design_reduced)?;
+                let (design_reduced, reduced_intercept) = build_reduced_design(&dds, &design_info, reduced_formula)?;
+                let mut lrt = likelihood_ratio_test_reduced(&dds, &design_full, &design_reduced, reduced_intercept)?;
                 if explicit_contrast {
                     lrt_contrast_columns(&dds, &design_info, &contrast_spec, &mut lrt)?;
                 }
@@ -918,10 +919,23 @@ fn resolve_contrast(
                      (R: contrast = c(factor, numerator, denominator))"
                 .to_string(),
         })?;
+        // R cleanContrast(): the contrast variable must be a factor column of colData
         let meta = dds.sample_metadata();
-        if meta.has_continuous(variable) || !meta.has_condition(variable) {
+        if !meta.has_condition(variable) && !meta.has_continuous(variable) {
             return Err(DeseqError::InvalidContrast {
-                reason: format!("{} should be the name of a factor in the metadata (see --contrast-var)", variable),
+                reason: format!(
+                    "{} should be the name of a factor in the colData of the DESeqDataSet (see --contrast-var)",
+                    variable
+                ),
+            });
+        }
+        if meta.has_continuous(variable) {
+            return Err(DeseqError::InvalidContrast {
+                reason: format!(
+                    "{} is not a factor, see ?results (it is a --continuous column; a formula term such as \
+                     factor({}) does not make the column a factor, use --name with resultsNames instead)",
+                    variable, variable
+                ),
             });
         }
         // R checkContrast(): the two levels must differ
@@ -1026,11 +1040,13 @@ fn build_reduced_design(
     dds: &DESeqDataSet,
     info: &rust_deseq2::glm::DesignInfo,
     reduced_formula: Option<&str>,
-) -> Result<ndarray::Array2<f64>> {
+) -> Result<(ndarray::Array2<f64>, bool)> {
     let reduced = rust_deseq2::glm::Formula::parse(reduced_formula.unwrap_or("~1"))?;
     info!("Reduced model: {}", reduced.display());
     let full_columns = dds.design_matrix().map(|m| m.ncols()).unwrap_or(info.coef_names.len());
-    rust_deseq2::glm::reduced_design(&reduced, &info.design_vars, full_columns, dds.sample_metadata(), dds.reference_levels())
+    let matrix =
+        rust_deseq2::glm::reduced_design(&reduced, &info.design_vars, full_columns, dds.sample_metadata(), dds.reference_levels())?;
+    Ok((matrix, reduced.intercept))
 }
 
 fn run_normalize(

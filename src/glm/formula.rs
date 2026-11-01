@@ -1,45 +1,56 @@
-//! R model formulas (`~ a + b + a:b`, `~ 0 + a`, `~ a * b * c`, ...) and the model
-//! matrices R builds from them
+//! R model formulas (`~ a + b + a:b`, `~ 0 + a`, `~ a * b * c`, `~ poly(x, 2) + log(age)`,
+//! ...) and the model matrices R builds from them
 //!
-//! Variables are factors unless they are numeric (continuous) columns of the
-//! sample metadata. Factors use treatment contrasts, as `model.matrix()` does with
-//! R's default `contrasts` option.
+//! A formula variable is a column of the sample metadata or an R expression of
+//! columns (`factor(x)`, `log(age)`, `I(x^2)`, `poly(x, 2)`, `ns(x, df = 3)`, ...,
+//! evaluated as R's `model.frame()` does, see [`super::model_frame`]). Columns are
+//! factors unless they are numeric (continuous) columns of the sample metadata, or
+//! logical (all values TRUE/FALSE). Factors use treatment contrasts and ordered
+//! factors polynomial contrasts, as `model.matrix()` does with R's default
+//! `contrasts` option.
 
 use std::collections::HashMap;
 
 use ndarray::Array2;
 
 use super::design::{check_full_rank, DesignInfo};
+use super::model_frame::{Column, FrameValue, ModelFrame};
+use super::rfuns::format_real15;
 use crate::data::SampleMetadata;
 use crate::error::{DeseqError, Result};
 
 /// The right-hand side of a model formula
-/// R equivalent: terms.formula() (variables, term.labels, order, intercept)
+/// R equivalent: terms.formula() (variables, term.labels, order, intercept, offset)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Formula {
-    /// The variables in order of first appearance, including any removed by `-`
-    /// (R: all.vars(formula))
+    /// The variables (R: attr(terms(formula), "variables")) in order of first
+    /// appearance, including any removed by `-` and offsets, as R deparses them:
+    /// `batch`, `log(age)`, `poly(x, 2)`, `` `my var` `` is `my var`
     pub variables: Vec<String>,
+    /// The expression of each variable
+    pub(crate) exprs: Vec<Ex>,
     /// The terms as bit sets over `variables`, ordered by degree and, within a degree,
     /// by their position in the formula (R: terms(keep.order = FALSE))
     pub terms: Vec<u64>,
     /// Whether the model has an intercept (R: attr(terms(formula), "intercept"))
     pub intercept: bool,
+    /// The variables that are `offset(...)` terms (R: attr(terms, "offset")); they are
+    /// not columns of the model matrix
+    pub offsets: Vec<usize>,
+    /// The names in the formula, in order of first appearance (R: all.vars(formula)):
+    /// the metadata columns it uses
+    pub all_vars: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
-    Name(String),
+    /// A name; `true` if it was backquoted
+    Name(String, bool),
     Number(String),
-    Plus,
-    Minus,
-    Star,
-    Slash,
-    Colon,
-    Caret,
-    In,
-    LParen,
-    RParen,
+    Str(String),
+    Op(&'static str),
+    /// `%op%`, with the text between the percent signs
+    Special(String),
 }
 
 fn formula_error(text: &str, reason: impl std::fmt::Display) -> DeseqError {
@@ -50,73 +61,126 @@ fn formula_error(text: &str, reason: impl std::fmt::Display) -> DeseqError {
 
 /// Split a formula into tokens; a leading `~` is optional
 fn tokenize(text: &str) -> Result<Vec<Token>> {
-    let mut chars = text.trim().chars().peekable();
-    if chars.peek() == Some(&'~') {
-        chars.next();
+    let chars: Vec<char> = text.trim().chars().collect();
+    let mut i = 0;
+    if chars.first() == Some(&'~') {
+        i = 1;
     }
     let mut tokens = Vec::new();
-    while let Some(&c) = chars.peek() {
-        match c {
-            c if c.is_whitespace() => {
-                chars.next();
+    const TWO: [&str; 7] = ["==", "!=", "<=", ">=", "&&", "||", "::"];
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if let Some(n) = next {
+            let pair: String = [c, n].iter().collect();
+            if let Some(op) = TWO.iter().find(|op| **op == pair) {
+                i += 2;
+                if *op == "::" && chars.get(i) == Some(&':') {
+                    i += 1;
+                }
+                tokens.push(Token::Op(op));
+                continue;
             }
-            '+' | '-' | '*' | '/' | ':' | '^' | '(' | ')' => {
-                chars.next();
-                tokens.push(match c {
-                    '+' => Token::Plus,
-                    '-' => Token::Minus,
-                    '*' => Token::Star,
-                    '/' => Token::Slash,
-                    ':' => Token::Colon,
-                    '^' => Token::Caret,
-                    '(' => Token::LParen,
-                    _ => Token::RParen,
-                });
+        }
+        match c {
+            '+' | '-' | '*' | '/' | ':' | '^' | '(' | ')' | ',' | '=' | '<' | '>' | '!' | '&' | '|' => {
+                i += 1;
+                tokens.push(Token::Op(match c {
+                    '+' => "+",
+                    '-' => "-",
+                    '*' => "*",
+                    '/' => "/",
+                    ':' => ":",
+                    '^' => "^",
+                    '(' => "(",
+                    ')' => ")",
+                    ',' => ",",
+                    '=' => "=",
+                    '<' => "<",
+                    '>' => ">",
+                    '!' => "!",
+                    '&' => "&",
+                    _ => "|",
+                }));
             }
             '%' => {
-                chars.next();
-                let op: String = chars.by_ref().take_while(|&c| c != '%').collect();
-                if op == "in" {
-                    tokens.push(Token::In);
-                } else {
-                    return Err(formula_error(text, format!("operator %{}% is not supported", op)));
+                i += 1;
+                let start = i;
+                while i < chars.len() && chars[i] != '%' {
+                    i += 1;
                 }
+                if i == chars.len() {
+                    return Err(formula_error(text, "unterminated %operator%"));
+                }
+                tokens.push(Token::Special(chars[start..i].iter().collect()));
+                i += 1;
             }
-            '`' => {
-                chars.next();
-                let mut name = String::new();
+            '`' | '"' | '\'' => {
+                i += 1;
+                let mut s = String::new();
                 loop {
-                    match chars.next() {
-                        Some('`') => break,
-                        Some(c) => name.push(c),
-                        None => return Err(formula_error(text, "unterminated backquoted name")),
+                    match chars.get(i) {
+                        None => return Err(formula_error(text, "unterminated quoted name or string")),
+                        Some(&q) if q == c => {
+                            i += 1;
+                            break;
+                        }
+                        Some('\\') => {
+                            let e = chars.get(i + 1).copied().ok_or_else(|| formula_error(text, "bad escape"))?;
+                            s.push(match e {
+                                'n' => '\n',
+                                't' => '\t',
+                                other => other,
+                            });
+                            i += 2;
+                        }
+                        Some(&ch) => {
+                            s.push(ch);
+                            i += 1;
+                        }
                     }
                 }
-                tokens.push(Token::Name(name));
+                tokens.push(if c == '`' { Token::Name(s, true) } else { Token::Str(s) });
             }
-            c if c.is_ascii_digit() => {
-                let mut num = String::new();
-                while let Some(&d) = chars.peek() {
-                    if d.is_ascii_digit() || d == '.' {
-                        num.push(d);
-                        chars.next();
-                    } else {
-                        break;
+            c if c.is_ascii_digit() || (c == '.' && next.is_some_and(|d| d.is_ascii_digit())) => {
+                let start = i;
+                if c == '0' && matches!(next, Some('x' | 'X')) {
+                    i += 2;
+                    while i < chars.len() && chars[i].is_ascii_hexdigit() {
+                        i += 1;
+                    }
+                } else {
+                    while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                        i += 1;
+                    }
+                    if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
+                        i += 1;
+                        if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
+                            i += 1;
+                        }
+                        while i < chars.len() && chars[i].is_ascii_digit() {
+                            i += 1;
+                        }
                     }
                 }
-                tokens.push(Token::Number(num));
+                if i < chars.len() && chars[i] == 'L' {
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == 'i' {
+                    return Err(formula_error(text, "complex numbers are not supported"));
+                }
+                tokens.push(Token::Number(chars[start..i].iter().collect()));
             }
             c if c.is_alphabetic() || c == '.' => {
-                let mut name = String::new();
-                while let Some(&d) = chars.peek() {
-                    if d.is_alphanumeric() || d == '.' || d == '_' {
-                        name.push(d);
-                        chars.next();
-                    } else {
-                        break;
-                    }
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '.' || chars[i] == '_') {
+                    i += 1;
                 }
-                tokens.push(Token::Name(name));
+                tokens.push(Token::Name(chars[start..i].iter().collect(), false));
             }
             '~' => return Err(formula_error(text, "a response (left-hand side) is not allowed; write '~ a + b'")),
             other => return Err(formula_error(text, format!("unexpected character '{}'", other))),
@@ -125,22 +189,91 @@ fn tokenize(text: &str) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
-/// Expression tree of the formula
-#[derive(Debug, Clone)]
-enum Expr {
-    Var(String),
-    Number(String),
-    Plus(Box<Expr>, Box<Expr>),
-    Minus(Option<Box<Expr>>, Box<Expr>),
-    Colon(Box<Expr>, Box<Expr>),
-    Star(Box<Expr>, Box<Expr>),
-    Slash(Box<Expr>, Box<Expr>),
-    In(Box<Expr>, Box<Expr>),
-    Power(Box<Expr>, Box<Expr>),
+/// An R expression (the parse tree of the formula)
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Ex {
+    Sym(String),
+    /// A number; `true` for an integer literal (`2L`)
+    Num(f64, bool),
+    Str(String),
+    Lgl(bool),
+    Null,
+    Na,
+    /// A call `f(args)`; `f` may be `pkg::f`
+    Call(String, Vec<(Option<String>, Ex)>),
+    Unary(&'static str, Box<Ex>),
+    /// A binary operator: `+ - * / ^ : == != < > <= >= & && | ||` or `%op%`
+    Binary(String, Box<Ex>, Box<Ex>),
+    Paren(Box<Ex>),
 }
 
-/// Recursive-descent parser with R's operator precedence (highest first):
-/// `^`, unary `-`/`+`, `:`, `%in%`, `*` `/`, binary `+` `-`
+/// Whether `name` is a syntactic R name (deparse() writes other names in backquotes)
+fn is_syntactic(name: &str) -> bool {
+    !name.is_empty() && make_names(name) == name && name != "..."
+}
+
+/// R's deparse() of an expression (width.cutoff = 500, backticks for non-syntactic
+/// names), which gives the names of model frame variables and model matrix columns
+/// R equivalent: deparse2() of model.frame() / the term labels of terms.formula()
+pub(crate) fn deparse(e: &Ex) -> String {
+    match e {
+        Ex::Sym(s) => {
+            if is_syntactic(s) {
+                s.clone()
+            } else {
+                format!("`{}`", s)
+            }
+        }
+        Ex::Num(v, integer) => {
+            let s = format_real15(*v);
+            if *integer { format!("{}L", s) } else { s }
+        }
+        Ex::Str(s) => {
+            let mut out = String::from("\"");
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\t' => out.push_str("\\t"),
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+            out
+        }
+        Ex::Lgl(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        Ex::Null => "NULL".to_string(),
+        Ex::Na => "NA".to_string(),
+        Ex::Call(f, args) => {
+            let parts: Vec<String> = args
+                .iter()
+                .map(|(name, a)| match name {
+                    Some(n) => {
+                        let n = if is_syntactic(n) { n.clone() } else { format!("`{}`", n) };
+                        format!("{} = {}", n, deparse(a))
+                    }
+                    None => deparse(a),
+                })
+                .collect();
+            format!("{}({})", f, parts.join(", "))
+        }
+        Ex::Unary(op, a) => format!("{}{}", op, deparse(a)),
+        Ex::Binary(op, a, b) => {
+            let spaced = !matches!(op.as_str(), "/" | "^" | ":" | "%%" | "%/%");
+            if spaced {
+                format!("{} {} {}", deparse(a), op, deparse(b))
+            } else {
+                format!("{}{}{}", deparse(a), op, deparse(b))
+            }
+        }
+        Ex::Paren(a) => format!("({})", deparse(a)),
+    }
+}
+
+/// Recursive-descent parser with R's operator precedence (highest first): `::`,
+/// function calls, `^` (right to left), unary `-`/`+`, `:`, `%op%`, `*` `/`,
+/// binary `+` `-`, comparisons, `!`, `&` `&&`, `|` `||`
 struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
@@ -152,109 +285,199 @@ impl Parser<'_> {
         self.tokens.get(self.pos)
     }
 
+    fn peek_op(&self) -> Option<&'static str> {
+        match self.peek() {
+            Some(Token::Op(op)) => Some(op),
+            _ => None,
+        }
+    }
+
     fn next(&mut self) -> Option<Token> {
         let t = self.tokens.get(self.pos).cloned();
         self.pos += 1;
         t
     }
 
-    fn sum(&mut self) -> Result<Expr> {
-        let mut left = self.product()?;
-        while let Some(op @ (Token::Plus | Token::Minus)) = self.peek().cloned() {
+    fn binary_left(&mut self, ops: &[&str], sub: fn(&mut Self) -> Result<Ex>) -> Result<Ex> {
+        let mut left = sub(self)?;
+        while let Some(op) = self.peek_op().filter(|op| ops.contains(op)) {
             self.pos += 1;
-            let right = self.product()?;
-            left = if op == Token::Plus {
-                Expr::Plus(Box::new(left), Box::new(right))
-            } else {
-                Expr::Minus(Some(Box::new(left)), Box::new(right))
-            };
+            let right = sub(self)?;
+            left = Ex::Binary(op.to_string(), Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
-    fn product(&mut self) -> Result<Expr> {
-        let mut left = self.in_op()?;
-        while let Some(op @ (Token::Star | Token::Slash)) = self.peek().cloned() {
-            self.pos += 1;
-            let right = self.in_op()?;
-            left = if op == Token::Star {
-                Expr::Star(Box::new(left), Box::new(right))
-            } else {
-                Expr::Slash(Box::new(left), Box::new(right))
-            };
-        }
-        Ok(left)
+    fn or(&mut self) -> Result<Ex> {
+        self.binary_left(&["|", "||"], Self::and)
     }
 
-    fn in_op(&mut self) -> Result<Expr> {
+    fn and(&mut self) -> Result<Ex> {
+        self.binary_left(&["&", "&&"], Self::not)
+    }
+
+    fn not(&mut self) -> Result<Ex> {
+        if self.peek_op() == Some("!") {
+            self.pos += 1;
+            return Ok(Ex::Unary("!", Box::new(self.not()?)));
+        }
+        self.comparison()
+    }
+
+    fn comparison(&mut self) -> Result<Ex> {
+        self.binary_left(&["==", "!=", "<", ">", "<=", ">="], Self::sum)
+    }
+
+    fn sum(&mut self) -> Result<Ex> {
+        self.binary_left(&["+", "-"], Self::product)
+    }
+
+    fn product(&mut self) -> Result<Ex> {
+        self.binary_left(&["*", "/"], Self::special)
+    }
+
+    fn special(&mut self) -> Result<Ex> {
         let mut left = self.colon()?;
-        while self.peek() == Some(&Token::In) {
+        while let Some(Token::Special(op)) = self.peek().cloned() {
             self.pos += 1;
             let right = self.colon()?;
-            left = Expr::In(Box::new(left), Box::new(right));
+            left = Ex::Binary(format!("%{}%", op), Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
-    fn colon(&mut self) -> Result<Expr> {
-        let mut left = self.unary()?;
-        while self.peek() == Some(&Token::Colon) {
-            self.pos += 1;
-            let right = self.unary()?;
-            left = Expr::Colon(Box::new(left), Box::new(right));
-        }
-        Ok(left)
+    fn colon(&mut self) -> Result<Ex> {
+        self.binary_left(&[":"], Self::unary)
     }
 
-    fn unary(&mut self) -> Result<Expr> {
-        match self.peek() {
-            Some(Token::Minus) => {
+    fn unary(&mut self) -> Result<Ex> {
+        match self.peek_op() {
+            Some("-") => {
                 self.pos += 1;
-                Ok(Expr::Minus(None, Box::new(self.unary()?)))
+                Ok(Ex::Unary("-", Box::new(self.unary()?)))
             }
-            Some(Token::Plus) => {
+            Some("+") => {
                 self.pos += 1;
-                self.unary()
+                Ok(Ex::Unary("+", Box::new(self.unary()?)))
             }
             _ => self.power(),
         }
     }
 
-    fn power(&mut self) -> Result<Expr> {
-        let base = self.atom()?;
-        if self.peek() == Some(&Token::Caret) {
+    fn power(&mut self) -> Result<Ex> {
+        let base = self.postfix()?;
+        if self.peek_op() == Some("^") {
             self.pos += 1;
             let exponent = self.unary()?;
-            return Ok(Expr::Power(Box::new(base), Box::new(exponent)));
+            return Ok(Ex::Binary("^".to_string(), Box::new(base), Box::new(exponent)));
         }
         Ok(base)
     }
 
-    fn atom(&mut self) -> Result<Expr> {
-        match self.next() {
-            Some(Token::Name(name)) => {
-                if self.peek() == Some(&Token::LParen) {
-                    return Err(formula_error(
-                        self.text,
-                        format!(
-                            "functions such as {}() are not supported; add the transformed variable to the metadata",
-                            name
-                        ),
-                    ));
-                }
-                Ok(Expr::Var(name))
+    fn postfix(&mut self) -> Result<Ex> {
+        let e = self.primary()?;
+        if self.peek_op() == Some("(") {
+            let name = match &e {
+                Ex::Sym(s) => s.clone(),
+                Ex::Call(f, args) if args.is_empty() && f.contains("::") => f.clone(),
+                _ => return Err(formula_error(self.text, format!("attempt to apply non-function '{}'", deparse(&e)))),
+            };
+            self.pos += 1;
+            let args = self.arguments()?;
+            return Ok(Ex::Call(name, args));
+        }
+        if let Ex::Call(f, args) = &e {
+            if args.is_empty() && f.contains("::") {
+                return Err(formula_error(self.text, format!("'{}' must be called", f)));
             }
-            Some(Token::Number(n)) => Ok(Expr::Number(n)),
-            Some(Token::LParen) => {
-                let inner = self.sum()?;
+        }
+        Ok(e)
+    }
+
+    fn arguments(&mut self) -> Result<Vec<(Option<String>, Ex)>> {
+        let mut args = Vec::new();
+        if self.peek_op() == Some(")") {
+            self.pos += 1;
+            return Ok(args);
+        }
+        loop {
+            // name = value
+            let named = match (self.tokens.get(self.pos), self.tokens.get(self.pos + 1)) {
+                (Some(Token::Name(n, _) | Token::Str(n)), Some(Token::Op("="))) => Some(n.clone()),
+                _ => None,
+            };
+            if named.is_some() {
+                self.pos += 2;
+            }
+            if matches!(self.peek_op(), Some(",") | Some(")")) {
+                return Err(formula_error(self.text, "empty function arguments are not supported"));
+            }
+            let value = self.or()?;
+            args.push((named, value));
+            match self.next() {
+                Some(Token::Op(",")) => continue,
+                Some(Token::Op(")")) => return Ok(args),
+                _ => return Err(formula_error(self.text, "missing ')' after function arguments")),
+            }
+        }
+    }
+
+    fn primary(&mut self) -> Result<Ex> {
+        match self.next() {
+            Some(Token::Name(name, quoted)) => {
+                if self.peek_op() == Some("::") {
+                    self.pos += 1;
+                    match self.next() {
+                        Some(Token::Name(f, _)) => return Ok(Ex::Call(format!("{}::{}", name, f), Vec::new())),
+                        _ => return Err(formula_error(self.text, "expected a name after '::'")),
+                    }
+                }
+                if !quoted {
+                    match name.as_str() {
+                        "TRUE" => return Ok(Ex::Lgl(true)),
+                        "FALSE" => return Ok(Ex::Lgl(false)),
+                        "NULL" => return Ok(Ex::Null),
+                        "NA" | "NA_real_" | "NA_integer_" | "NA_character_" => return Ok(Ex::Na),
+                        "Inf" => return Ok(Ex::Num(f64::INFINITY, false)),
+                        "NaN" => return Ok(Ex::Num(f64::NAN, false)),
+                        _ => {}
+                    }
+                }
+                Ok(Ex::Sym(name))
+            }
+            Some(Token::Number(n)) => {
+                let (body, integer) = match n.strip_suffix('L') {
+                    Some(b) => (b, true),
+                    None => (n.as_str(), false),
+                };
+                let v = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+                    u64::from_str_radix(h, 16).map(|v| v as f64).ok()
+                } else {
+                    crate::io::tximport::r_strtod(body)
+                };
+                v.map(|v| Ex::Num(v, integer)).ok_or_else(|| formula_error(self.text, format!("invalid number '{}'", n)))
+            }
+            Some(Token::Str(s)) => Ok(Ex::Str(s)),
+            Some(Token::Op("(")) => {
+                let inner = self.or()?;
                 match self.next() {
-                    Some(Token::RParen) => Ok(inner),
+                    Some(Token::Op(")")) => Ok(Ex::Paren(Box::new(inner))),
                     _ => Err(formula_error(self.text, "missing ')'")),
                 }
             }
-            Some(t) => Err(formula_error(self.text, format!("unexpected {:?}", t))),
+            Some(t) => Err(formula_error(self.text, format!("unexpected {}", token_text(&t)))),
             None => Err(formula_error(self.text, "unexpected end of formula")),
         }
+    }
+}
+
+fn token_text(t: &Token) -> String {
+    match t {
+        Token::Name(n, _) => format!("'{}'", n),
+        Token::Number(n) => format!("'{}'", n),
+        Token::Str(s) => format!("string \"{}\"", s),
+        Token::Op(op) => format!("'{}'", op),
+        Token::Special(s) => format!("'%{}%'", s),
     }
 }
 
@@ -263,6 +486,7 @@ impl Parser<'_> {
 /// InteractTerms, CrossTerms, InTerms, NestTerms, PowerTerms, TrimRepeats)
 struct Encoder<'a> {
     variables: Vec<String>,
+    exprs: Vec<Ex>,
     intercept: bool,
     /// false inside the right-hand side of `-` (R: parity)
     parity: bool,
@@ -292,11 +516,14 @@ fn interact(left: &[u64], right: &[u64]) -> Vec<u64> {
 }
 
 impl Encoder<'_> {
-    fn var_bit(&mut self, name: &str) -> Result<u64> {
-        let idx = match self.variables.iter().position(|v| v == name) {
+    /// R: InstallVar() -- variables are identified by their deparsed text
+    fn var_bit(&mut self, e: &Ex) -> Result<u64> {
+        let label = deparse(e);
+        let idx = match self.variables.iter().position(|v| *v == label) {
             Some(i) => i,
             None => {
-                self.variables.push(name.to_string());
+                self.variables.push(label);
+                self.exprs.push(e.clone());
                 self.variables.len() - 1
             }
         };
@@ -306,114 +533,147 @@ impl Encoder<'_> {
         Ok(1u64 << idx)
     }
 
-    fn encode(&mut self, e: &Expr) -> Result<Vec<u64>> {
+    fn encode(&mut self, e: &Ex) -> Result<Vec<u64>> {
         match e {
-            Expr::Var(name) => Ok(vec![self.var_bit(name)?]),
-            Expr::Number(n) => {
+            Ex::Num(v, _) => {
                 // R: isOne / isZero set the intercept (reversed under `-`)
-                match n.parse::<f64>() {
-                    Ok(v) if v == 1.0 => self.intercept = self.parity,
-                    Ok(v) if v == 0.0 => self.intercept = !self.parity,
-                    _ => return Err(formula_error(self.text, format!("invalid term '{}'", n))),
+                if *v == 1.0 {
+                    self.intercept = self.parity;
+                } else if *v == 0.0 {
+                    self.intercept = !self.parity;
+                } else {
+                    return Err(formula_error(self.text, format!("invalid term '{}'", deparse(e))));
                 }
                 Ok(Vec::new())
             }
-            Expr::Plus(a, b) => {
-                let mut left = self.encode(a)?;
-                left.extend(self.encode(b)?);
-                Ok(trim_repeats(left))
+            Ex::Str(_) | Ex::Lgl(_) | Ex::Null | Ex::Na => {
+                Err(formula_error(self.text, format!("invalid term '{}' (R: invalid model formula)", deparse(e))))
             }
-            Expr::Minus(a, b) => {
-                // R: DeleteTerms()
-                let left = match a {
-                    Some(a) => self.encode(a)?,
-                    None => Vec::new(),
-                };
-                self.parity = !self.parity;
-                let right = self.encode(b);
-                self.parity = !self.parity;
-                let right = right?;
-                Ok(left.into_iter().filter(|t| !right.contains(t)).collect())
-            }
-            Expr::Colon(a, b) => {
-                let left = self.encode(a)?;
-                let right = self.encode(b)?;
-                Ok(interact(&left, &right))
-            }
-            Expr::Star(a, b) => {
-                // R: CrossTerms() -- a + b + a:b
-                let left = self.encode(a)?;
-                let right = self.encode(b)?;
-                let mut out = left.clone();
-                out.extend(right.iter().copied());
-                out.extend(interact(&left, &right));
-                Ok(trim_repeats(out))
-            }
-            Expr::In(a, b) => {
-                // R: InTerms() -- every left term with all right variables
-                let left = self.encode(a)?;
-                let right = self.encode(b)?;
-                let all = right.iter().fold(0u64, |acc, &t| acc | t);
-                Ok(trim_repeats(left.iter().map(|&l| l | all).collect()))
-            }
-            Expr::Slash(a, b) => {
-                // R: NestTerms() -- a / b = a + b %in% a
-                let left = self.encode(a)?;
-                let right = self.encode(b)?;
-                let all = left.iter().fold(0u64, |acc, &t| acc | t);
-                let mut out = left.clone();
-                out.extend(right.iter().map(|&r| r | all));
-                Ok(trim_repeats(out))
-            }
-            Expr::Power(a, b) => {
-                // R: PowerTerms() -- all interactions up to the given order
-                let n = match &**b {
-                    Expr::Number(n) => n.parse::<f64>().ok().filter(|v| *v >= 1.0 && v.fract() == 0.0),
-                    _ => None,
+            Ex::Paren(a) => self.encode(a),
+            Ex::Unary("+", a) => self.encode(a),
+            Ex::Unary("-", b) => self.delete(Vec::new(), b),
+            Ex::Binary(op, a, b) => match op.as_str() {
+                "+" => {
+                    let mut left = self.encode(a)?;
+                    left.extend(self.encode(b)?);
+                    Ok(trim_repeats(left))
                 }
-                .ok_or_else(|| formula_error(self.text, "the exponent of '^' must be a positive integer"))?
-                    as usize;
-                let left = self.encode(a)?;
-                let mut out = left.clone();
-                for _ in 1..n {
-                    let mut next = out.clone();
-                    next.extend(interact(&out, &left));
-                    out = trim_repeats(next);
+                "-" => {
+                    let left = self.encode(a)?;
+                    self.delete(left, b)
                 }
-                Ok(out)
+                ":" => {
+                    let left = self.encode(a)?;
+                    let right = self.encode(b)?;
+                    Ok(interact(&left, &right))
+                }
+                "*" => {
+                    // R: CrossTerms() -- a + b + a:b
+                    let left = self.encode(a)?;
+                    let right = self.encode(b)?;
+                    let mut out = left.clone();
+                    out.extend(right.iter().copied());
+                    out.extend(interact(&left, &right));
+                    Ok(trim_repeats(out))
+                }
+                "%in%" => {
+                    // R: InTerms() -- every left term with all right variables
+                    let left = self.encode(a)?;
+                    let right = self.encode(b)?;
+                    let all = right.iter().fold(0u64, |acc, &t| acc | t);
+                    Ok(trim_repeats(left.iter().map(|&l| l | all).collect()))
+                }
+                "/" => {
+                    // R: NestTerms() -- a / b = a + b %in% a
+                    let left = self.encode(a)?;
+                    let right = self.encode(b)?;
+                    let all = left.iter().fold(0u64, |acc, &t| acc | t);
+                    let mut out = left.clone();
+                    out.extend(right.iter().map(|&r| r | all));
+                    Ok(trim_repeats(out))
+                }
+                "^" => {
+                    // R: PowerTerms() -- all interactions up to the given order; the power is
+                    // asInteger() of a number (truncated) and must be at least 2
+                    let n = match &**b {
+                        Ex::Num(n, _) if n.is_finite() && n.trunc() >= 2.0 => n.trunc() as usize,
+                        _ => return Err(formula_error(self.text, "invalid power in formula")),
+                    };
+                    let left = self.encode(a)?;
+                    let mut out = left.clone();
+                    for _ in 1..n {
+                        let mut next = out.clone();
+                        next.extend(interact(&out, &left));
+                        out = trim_repeats(next);
+                    }
+                    Ok(out)
+                }
+                _ => Ok(vec![self.var_bit(e)?]),
+            },
+            _ => Ok(vec![self.var_bit(e)?]),
+        }
+    }
+
+    /// R: DeleteTerms()
+    fn delete(&mut self, left: Vec<u64>, b: &Ex) -> Result<Vec<u64>> {
+        self.parity = !self.parity;
+        let right = self.encode(b);
+        self.parity = !self.parity;
+        let right = right?;
+        Ok(left.into_iter().filter(|t| !right.contains(t)).collect())
+    }
+}
+
+/// R's all.vars(): the names of an expression, in order of first appearance, without
+/// function names
+fn collect_vars(e: &Ex, out: &mut Vec<String>) {
+    match e {
+        Ex::Sym(s) => {
+            if !out.contains(s) {
+                out.push(s.clone());
             }
         }
+        Ex::Call(_, args) => args.iter().for_each(|(_, a)| collect_vars(a, out)),
+        Ex::Unary(_, a) | Ex::Paren(a) => collect_vars(a, out),
+        Ex::Binary(_, a, b) => {
+            collect_vars(a, out);
+            collect_vars(b, out);
+        }
+        _ => {}
     }
 }
 
 impl Formula {
     /// Parse the right-hand side of an R formula, e.g. `"~ batch + condition"`,
-    /// `"~ genotype * treatment"`, `"~ 0 + condition"`, `"~ (a + b + c)^2"`
+    /// `"~ genotype * treatment"`, `"~ 0 + condition"`, `"~ (a + b + c)^2"`,
+    /// `"~ batch + poly(age, 2)"`
     /// R equivalent: terms(as.formula(text))
     ///
     /// Supported: `+`, `-`, `:`, `*`, `/`, `%in%`, `^`, parentheses, `0`/`1`/`- 1`
-    /// for the intercept and backquoted names. Functions (`log(x)`, `I(x^2)`,
-    /// `factor(x)`, ...) and `.` are rejected.
+    /// for the intercept, backquoted names, `offset(...)` and the functions that
+    /// [`super::model_frame`] evaluates. `.` is kept as a name; it is not a metadata
+    /// column, so designs with it fail as DESeqDataSet() fails.
     pub fn parse(text: &str) -> Result<Formula> {
         let tokens = tokenize(text)?;
         if tokens.is_empty() {
             return Err(formula_error(text, "empty formula (use '~ 1' for an intercept-only model)"));
         }
         let mut parser = Parser { tokens, pos: 0, text };
-        let expr = parser.sum()?;
+        let expr = parser.or()?;
         if parser.pos != parser.tokens.len() {
-            return Err(formula_error(text, format!("unexpected {:?}", parser.tokens[parser.pos])));
+            return Err(formula_error(text, format!("unexpected {}", token_text(&parser.tokens[parser.pos]))));
         }
-        let mut enc = Encoder { variables: Vec::new(), intercept: true, parity: true, text };
+        let mut enc = Encoder { variables: Vec::new(), exprs: Vec::new(), intercept: true, parity: true, text };
         let terms = enc.encode(&expr)?;
-        if enc.variables.iter().any(|v| v == ".") {
-            return Err(formula_error(text, "'.' (all other columns) is not supported"));
-        }
         // R: terms.formula(keep.order = FALSE) sorts terms by degree, keeping the
-        // formula order within a degree
-        let mut terms = trim_repeats(terms);
+        // formula order within a degree; terms with an offset are removed
+        let offsets: Vec<usize> = (0..enc.variables.len()).filter(|&i| enc.variables[i].starts_with("offset(")).collect();
+        let offset_bits = offsets.iter().fold(0u64, |acc, &i| acc | 1u64 << i);
+        let mut terms: Vec<u64> = trim_repeats(terms).into_iter().filter(|t| t & offset_bits == 0).collect();
         terms.sort_by_key(|t| t.count_ones());
-        Ok(Formula { variables: enc.variables, terms, intercept: enc.intercept })
+        let mut all_vars = Vec::new();
+        collect_vars(&expr, &mut all_vars);
+        Ok(Formula { variables: enc.variables, exprs: enc.exprs, terms, intercept: enc.intercept, offsets, all_vars })
     }
 
     /// The variables of a term, in `variables` order
@@ -431,13 +691,14 @@ impl Formula {
         self.terms.iter().any(|t| t.count_ones() > 1)
     }
 
-    /// The formula as R prints it, e.g. `~ batch + condition + batch:condition`
+    /// The formula as R prints its terms, e.g. `~ batch + condition + batch:condition`
     pub fn display(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if !self.intercept {
             parts.push("0".to_string());
         }
         parts.extend(self.term_labels());
+        parts.extend(self.offsets.iter().map(|&i| self.variables[i].clone()));
         if parts.is_empty() {
             parts.push("1".to_string());
         }
@@ -475,90 +736,37 @@ fn is_dot_dot_number(s: &str) -> bool {
     s.len() > 2 && s.starts_with("..") && s[2..].chars().all(|c| c.is_ascii_digit())
 }
 
-/// The coding of the variables of a formula
-#[derive(Debug, Clone)]
-pub struct VariableCoding {
-    /// Levels of each factor variable, reference level first (R: levels(colData[[v]]))
-    pub levels: HashMap<String, Vec<String>>,
-}
-
-impl VariableCoding {
-    /// Levels of the factors of `formula`: sorted as R's factor() sorts them, with a
-    /// reference level from `reference_levels` moved to the front (R: relevel())
-    pub fn new(formula: &Formula, metadata: &SampleMetadata, reference_levels: &HashMap<String, String>) -> Result<Self> {
-        let mut levels = HashMap::new();
-        for v in &formula.variables {
-            if metadata.has_continuous(v) {
-                continue;
-            }
-            if !metadata.has_condition(v) {
-                return Err(DeseqError::InvalidDesignMatrix {
-                    reason: format!("all variables in the design formula must be columns in the metadata: '{}' is not", v),
-                });
-            }
-            let mut lv = metadata.get_levels(v)?;
-            if let Some(reference) = reference_levels.get(v) {
-                let pos = lv.iter().position(|l| l == reference).ok_or_else(|| DeseqError::InvalidInput {
-                    reason: format!("Reference level '{}' does not exist in factor '{}'. Available levels: {:?}", reference, v, lv),
-                })?;
-                let r = lv.remove(pos);
-                lv.insert(0, r);
-            }
-            levels.insert(v.clone(), lv);
-        }
-        Ok(Self { levels })
-    }
-
-    pub fn is_factor(&self, variable: &str) -> bool {
-        self.levels.contains_key(variable)
-    }
-}
-
 /// A model matrix with R's column names
 #[derive(Debug, Clone)]
 pub struct ModelMatrix {
     pub matrix: Array2<f64>,
-    /// R: colnames(model.matrix(...)), e.g. `(Intercept)`, `batchb2`, `batchb2:conditionB`
+    /// R: colnames(model.matrix(...)), e.g. `(Intercept)`, `batchb2`, `batchb2:conditionB`,
+    /// `poly(x, 2)1`
     pub column_names: Vec<String>,
     /// Index into `formula.terms` of each column; `None` for the intercept
     pub column_terms: Vec<Option<usize>>,
 }
 
 /// R's model matrix of a formula
-/// R equivalent: model.matrix(formula, colData) with treatment contrasts
+/// R equivalent: model.matrix(formula, colData) with treatment contrasts for factors and
+/// contr.poly for ordered factors (modelmatrix() in model.c)
 ///
 /// Columns: `(Intercept)` if present, then each term in `formula.terms` order. A factor
-/// in a term is coded by contrasts (non-reference levels) when the term without it is
-/// the empty term or is contained in a preceding term, and by indicators of all levels
-/// otherwise; without an intercept, the first factor of the first term containing one
-/// is coded by indicators (R: TermCode() and the no-intercept rule of modelmatrix() in
-/// model.c). Interaction columns are products, the first variable varying fastest,
-/// named `a1:b2`.
-pub fn model_matrix(formula: &Formula, metadata: &SampleMetadata, coding: &VariableCoding) -> Result<ModelMatrix> {
-    let n = metadata.n_samples();
-    for v in &formula.variables {
-        if let Some(lv) = coding.levels.get(v) {
-            if lv.len() < 2 {
-                return Err(DeseqError::InvalidDesignMatrix {
-                    reason: format!(
-                        "the factor '{}' in the design formula has a single level ('{}'); contrasts can be \
-                         applied only to factors with 2 or more levels",
-                        v,
-                        lv.first().map(|s| s.as_str()).unwrap_or("")
-                    ),
-                });
-            }
-        } else if !metadata.has_continuous(v) {
-            return Err(DeseqError::InvalidDesignMatrix {
-                reason: format!("all variables in the design formula must be columns in the metadata: '{}' is not", v),
-            });
-        }
-    }
-
+/// in a term is coded by contrasts when the term without it is the empty term or is
+/// contained in a preceding term, and by indicators of all levels otherwise; without an
+/// intercept, the first factor of the first term containing one is coded by indicators
+/// (R: TermCode() and the no-intercept rule of modelmatrix()). A numeric variable is one
+/// column named by the variable, a matrix variable (poly(), ns(), bs()) one column per
+/// matrix column, named variable + column name (a one-column matrix by the variable
+/// alone). Interaction columns are products, the first variable varying fastest, named
+/// `a1:b2`.
+pub fn model_matrix(formula: &Formula, frame: &ModelFrame) -> Result<ModelMatrix> {
+    let n = frame.n_samples;
+    let nvar = formula.variables.len();
     // R: TermCode() -- 1 = contrasts, 2 = indicators of every level
     let mut codes: Vec<Vec<u8>> = Vec::with_capacity(formula.terms.len());
     for (j, &term) in formula.terms.iter().enumerate() {
-        let mut term_codes = vec![0u8; formula.variables.len()];
+        let mut term_codes = vec![0u8; nvar];
         for (i, code) in term_codes.iter_mut().enumerate() {
             if term >> i & 1 == 0 {
                 continue;
@@ -570,8 +778,8 @@ pub fn model_matrix(formula: &Formula, metadata: &SampleMetadata, coding: &Varia
     }
     if !formula.intercept {
         'found: for (j, &term) in formula.terms.iter().enumerate() {
-            for (i, v) in formula.variables.iter().enumerate() {
-                if term >> i & 1 == 1 && coding.is_factor(v) {
+            for i in 0..nvar {
+                if term >> i & 1 == 1 && frame.values[i].n_levels() > 1 {
                     codes[j][i] = 2;
                     break 'found;
                 }
@@ -589,19 +797,35 @@ pub fn model_matrix(formula: &Formula, metadata: &SampleMetadata, coding: &Varia
     }
     for (j, &term) in formula.terms.iter().enumerate() {
         let mut term_cols: Vec<(String, Vec<f64>)> = vec![(String::new(), vec![1.0; n])];
-        for (i, v) in formula.variables.iter().enumerate() {
+        for i in 0..nvar {
             if term >> i & 1 == 0 {
                 continue;
             }
-            let pieces: Vec<(String, Vec<f64>)> = match coding.levels.get(v) {
-                None => vec![(v.clone(), (0..n).map(|s| metadata.get_continuous_value(v, s)).collect::<Result<Vec<f64>>>()?)],
-                Some(lv) => {
-                    let values = metadata.condition(v).expect("checked above");
-                    let skip = if codes[j][i] == 1 { 1 } else { 0 };
-                    lv[skip..]
-                        .iter()
-                        .map(|l| (format!("{}{}", v, l), values.iter().map(|x| if x == l { 1.0 } else { 0.0 }).collect()))
-                        .collect()
+            let label = &formula.variables[i];
+            let pieces: Vec<(String, Vec<f64>)> = match &frame.values[i] {
+                FrameValue::Numeric(v) => vec![(label.clone(), v.clone())],
+                FrameValue::Matrix { columns, names } => {
+                    if columns.len() == 1 {
+                        vec![(label.clone(), columns[0].clone())]
+                    } else {
+                        columns.iter().zip(names).map(|(c, nm)| (format!("{}{}", label, nm), c.clone())).collect()
+                    }
+                }
+                FrameValue::Factor { codes: fc, levels, ordered } => {
+                    if codes[j][i] == 1 && *ordered {
+                        let (contr, cnames) = super::rfuns::contr_poly(levels.len())
+                            .map_err(|e| DeseqError::InvalidDesignMatrix { reason: format!("{}: {}", label, e) })?;
+                        (0..contr.ncols())
+                            .map(|k| (format!("{}{}", label, cnames[k]), fc.iter().map(|&c| contr[[c, k]]).collect()))
+                            .collect()
+                    } else {
+                        let skip = if codes[j][i] == 1 { 1 } else { 0 };
+                        (skip..levels.len())
+                            .map(|l| {
+                                (format!("{}{}", label, levels[l]), fc.iter().map(|&c| if c == l { 1.0 } else { 0.0 }).collect())
+                            })
+                            .collect()
+                    }
                 }
             };
             let mut next = Vec::with_capacity(term_cols.len() * pieces.len());
@@ -634,8 +858,11 @@ pub fn model_matrix(formula: &Formula, metadata: &SampleMetadata, coding: &Varia
 /// DESeq2's coefficient names (resultsNames) for the columns of a model matrix
 /// R equivalent: fitNbinomGLMs(): `(Intercept)` -> `Intercept`, make.names(), and, for
 /// designs with an intercept (renameCols = hasIntercept), renameModelMatrixColumns():
-/// main-effect columns `<factor><level>` become `<factor>_<level>_vs_<reference>`
-pub fn deseq_coefficient_names(formula: &Formula, column_names: &[String], coding: &VariableCoding) -> Vec<String> {
+/// the columns `make.names(<factor><level>)` of the colData factors among
+/// all.vars(design) become `<factor>_<level>_vs_<reference>`. Columns of expressions
+/// (`factor(x)2`, `relevel(cond, "B")A`, ...) and of logical or numeric columns keep
+/// their make.names() names.
+pub fn deseq_coefficient_names(formula: &Formula, column_names: &[String], frame: &ModelFrame) -> Vec<String> {
     let mut names: Vec<String> = column_names
         .iter()
         .map(|n| if n == "(Intercept)" { "Intercept".to_string() } else { n.clone() })
@@ -644,8 +871,8 @@ pub fn deseq_coefficient_names(formula: &Formula, column_names: &[String], codin
     if formula.intercept {
         let original = names.clone();
         let mut renames: Vec<(usize, String)> = Vec::new();
-        for v in &formula.variables {
-            let Some(lv) = coding.levels.get(v) else { continue };
+        for v in &formula.all_vars {
+            let Some(Column::Factor { levels: lv, .. }) = frame.columns.get(v) else { continue };
             for l in &lv[1..] {
                 let from = make_names(&format!("{}{}", v, l));
                 if let Some(idx) = original.iter().position(|n| *n == from) {
@@ -660,48 +887,90 @@ pub fn deseq_coefficient_names(formula: &Formula, column_names: &[String], codin
     names
 }
 
+/// The checks DESeqDataSet() makes of the design formula's variables
+/// R equivalent: DESeqDataSet(): all.vars(design) must be colData columns; a design
+/// with a single variable needs two values; colData factors need two levels
+fn check_design_variables(formula: &Formula, frame: &ModelFrame) -> Result<()> {
+    if let [v] = formula.all_vars.as_slice() {
+        if frame.columns.get(v).is_some_and(|c| c.is_constant()) {
+            return Err(DeseqError::InvalidDesignMatrix {
+                reason: "design has a single variable, with all samples having the same value.\n  use instead a \
+                         design of '~ 1'. estimateSizeFactors, rlog and the VST can then be used"
+                    .to_string(),
+            });
+        }
+    }
+    let single: Vec<&str> = formula
+        .all_vars
+        .iter()
+        .filter(|v| matches!(frame.columns.get(*v), Some(c @ Column::Factor { .. }) if c.is_constant()))
+        .map(|v| v.as_str())
+        .collect();
+    if !single.is_empty() {
+        return Err(DeseqError::InvalidDesignMatrix {
+            reason: format!(
+                "design contains one or more variables with all samples having the same value,\n  remove these \
+                 variables from the design ({})",
+                single.join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Model matrix and design information of a formula
-/// R equivalent: getModelMatrix() / fitNbinomGLMs() column naming, with checkFullRank()
-/// and the checks of designAndArgChecker()
+/// R equivalent: DESeqDataSet(design = formula) (its checks of the design variables,
+/// model.matrix() and checkFullRank()) and the column naming of fitNbinomGLMs()
 pub fn formula_design(
     formula: &Formula,
     metadata: &SampleMetadata,
     reference_levels: &HashMap<String, String>,
 ) -> Result<(Array2<f64>, DesignInfo)> {
-    let coding = VariableCoding::new(formula, metadata, reference_levels)?;
-    let ModelMatrix { matrix, column_names, column_terms } = model_matrix(formula, metadata, &coding)?;
+    let frame = ModelFrame::new(formula, metadata, reference_levels)?;
+    check_design_variables(formula, &frame)?;
+    let frame = frame.evaluate(formula)?;
+    let ModelMatrix { matrix, column_names, column_terms } = model_matrix(formula, &frame)?;
     if matrix.ncols() == 0 {
         return Err(DeseqError::InvalidDesignMatrix {
             reason: format!("the design formula '{}' has no columns", formula.display()),
         });
     }
     check_full_rank(&matrix)?;
-    let coef_names = deseq_coefficient_names(formula, &column_names, &coding);
+    let coef_names = deseq_coefficient_names(formula, &column_names, &frame);
 
-    // R: the default contrast variable is the last variable of the design
-    let design_variable = formula
-        .variables
+    // The colData factors of the design (R: levels(colData(object)[[v]])): the
+    // contrasts of results() and R's default contrast use these
+    let factor_levels = |v: &str| match frame.columns.get(v) {
+        Some(Column::Factor { levels, .. }) => Some(levels.clone()),
+        _ => None,
+    };
+    // R: the default contrast variable is the last variable of the design if it is a
+    // factor; the dataset's main variable is the last factor
+    let design_variable = formula.all_vars.iter().rev().find(|v| factor_levels(v).is_some()).cloned().unwrap_or_default();
+    let levels = factor_levels(&design_variable).unwrap_or_default();
+    let reference_levels: HashMap<String, String> = formula
+        .all_vars
         .iter()
-        .rev()
-        .find(|v| coding.is_factor(v))
-        .cloned()
-        .unwrap_or_default();
-    let levels = coding.levels.get(&design_variable).cloned().unwrap_or_default();
-    let reference_levels: HashMap<String, String> =
-        coding.levels.iter().map(|(v, lv)| (v.clone(), lv[0].clone())).collect();
+        .filter_map(|v| factor_levels(v).map(|lv| (v.clone(), lv[0].clone())))
+        .collect();
 
-    // Main-effect columns of each variable
+    // Main-effect columns of each metadata column used as a plain variable
     let mut factor_columns: HashMap<String, Vec<usize>> = HashMap::new();
     let mut continuous_columns: HashMap<String, usize> = HashMap::new();
     for (col, term) in column_terms.iter().enumerate() {
         let Some(j) = *term else { continue };
-        let vars = formula.term_variables(formula.terms[j]);
-        if let [v] = vars.as_slice() {
-            if coding.is_factor(v) {
-                factor_columns.entry(v.to_string()).or_default().push(col);
-            } else {
-                continuous_columns.insert(v.to_string(), col);
+        let t = formula.terms[j];
+        if t.count_ones() != 1 {
+            continue;
+        }
+        let i = t.trailing_zeros() as usize;
+        let Ex::Sym(v) = &formula.exprs[i] else { continue };
+        match frame.columns.get(v) {
+            Some(Column::Factor { .. }) => factor_columns.entry(v.clone()).or_default().push(col),
+            Some(Column::Numeric(_)) => {
+                continuous_columns.insert(v.clone(), col);
             }
+            _ => {}
         }
     }
 
@@ -715,7 +984,7 @@ pub fn formula_design(
         continuous_columns,
         interaction_columns: HashMap::new(),
         has_intercept: formula.intercept,
-        design_vars: formula.variables.clone(),
+        design_vars: formula.all_vars.clone(),
         interaction_present: formula.has_interactions(),
     };
     Ok((matrix, info))
@@ -724,7 +993,9 @@ pub fn formula_design(
 /// The model matrix of a reduced formula for the LRT
 /// R equivalent: model.matrix(reduced, colData) in nbinomLRT(), after checkLRT():
 /// every variable of the reduced formula must be in the full formula, and the reduced
-/// model must have fewer columns ("less than one degree of freedom")
+/// model must have fewer columns ("less than one degree of freedom"). R does not
+/// check the rank of the reduced model matrix; a rank-deficient one is fitted from
+/// fitNbinomGLMs()'s start for that case (see [`crate::testing::likelihood_ratio_test_reduced`]).
 pub fn reduced_design(
     reduced: &Formula,
     full_variables: &[String],
@@ -732,7 +1003,7 @@ pub fn reduced_design(
     metadata: &SampleMetadata,
     reference_levels: &HashMap<String, String>,
 ) -> Result<Array2<f64>> {
-    let missing: Vec<&str> = reduced.variables.iter().filter(|v| !full_variables.contains(v)).map(|v| v.as_str()).collect();
+    let missing: Vec<&str> = reduced.all_vars.iter().filter(|v| !full_variables.contains(v)).map(|v| v.as_str()).collect();
     if !missing.is_empty() {
         return Err(DeseqError::InvalidDesignMatrix {
             reason: format!(
@@ -741,8 +1012,8 @@ pub fn reduced_design(
             ),
         });
     }
-    let coding = VariableCoding::new(reduced, metadata, reference_levels)?;
-    let matrix = model_matrix(reduced, metadata, &coding)?.matrix;
+    let frame = ModelFrame::new(reduced, metadata, reference_levels)?.evaluate(reduced)?;
+    let matrix = model_matrix(reduced, &frame)?.matrix;
     if matrix.ncols() == 0 {
         return Err(DeseqError::InvalidDesignMatrix {
             reason: format!("the reduced formula '{}' has no columns", reduced.display()),
@@ -754,187 +1025,18 @@ pub fn reduced_design(
                 .to_string(),
         });
     }
-    // R fits a rank-deficient reduced model anyway (with a different start), which is
-    // not a nested model test; it is an error here.
-    check_full_rank(&matrix).map_err(|e| DeseqError::InvalidDesignMatrix {
-        reason: format!("reduced formula '{}': {}", reduced.display(), e),
-    })?;
+    // R: stopifnot(all(colSums(abs(modelMatrix)) > 0)) in fitNbinomGLMs()
+    if (0..matrix.ncols()).any(|j| matrix.column(j).iter().all(|&v| v == 0.0)) {
+        return Err(DeseqError::InvalidDesignMatrix {
+            reason: format!(
+                "the reduced model matrix of '{}' has a column of zeros (R: all(colSums(abs(modelMatrix)) > 0) is not TRUE)",
+                reduced.display()
+            ),
+        });
+    }
     Ok(matrix)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The colData of the R check (validation notes): batch b1/b2 alternating,
-    /// condition A/B/C in blocks of 4, genotype WT/KO (WT reference), numeric x and z
-    fn metadata() -> SampleMetadata {
-        let ids: Vec<String> = (1..=12).map(|i| format!("s{}", i)).collect();
-        let mut m = SampleMetadata::new(ids);
-        m.add_condition("batch", (0..12).map(|i| if i % 2 == 0 { "b1" } else { "b2" }.to_string()).collect()).unwrap();
-        m.add_condition("condition", (0..12).map(|i| ["A", "B", "C"][i / 4].to_string()).collect()).unwrap();
-        m.add_condition("genotype", (0..12).map(|i| if i < 6 { "WT" } else { "KO" }.to_string()).collect()).unwrap();
-        let x = [-0.626, 0.184, -0.836, 1.595, 0.33, -0.82, 0.487, 0.738, 0.576, -0.305, 1.512, 0.39];
-        let z = [-0.621, -2.215, 1.125, -0.045, -0.016, 0.944, 0.821, 0.594, 0.919, 0.782, 0.075, -1.989];
-        for (name, v) in [("x", x), ("z", z)] {
-            m.add_condition(name, v.iter().map(|a| a.to_string()).collect()).unwrap();
-            m.add_continuous(name, v.to_vec()).unwrap();
-        }
-        m
-    }
-
-    /// resultsNames, rank and sum(mm * row index) as printed by R 4.5.3 / DESeq2 1.50.2
-    /// for model.matrix(f, colData) with the renaming of fitNbinomGLMs()
-    fn check(f: &str, expected_names: &str, rank: usize, weighted_sum: f64) {
-        let meta = metadata();
-        let refs = HashMap::from([("genotype".to_string(), "WT".to_string())]);
-        let formula = Formula::parse(f).unwrap();
-        let coding = VariableCoding::new(&formula, &meta, &refs).unwrap();
-        let ModelMatrix { matrix: mm, column_names, .. } = model_matrix(&formula, &meta, &coding).unwrap();
-        let names = deseq_coefficient_names(&formula, &column_names, &coding);
-        assert_eq!(names.join(","), expected_names, "names of {}", f);
-        assert_eq!(super::super::design::qr_rank(&mm), rank, "rank of {}", f);
-        let s: f64 = (0..mm.nrows()).map(|i| (i + 1) as f64 * mm.row(i).sum()).sum();
-        assert!((s - weighted_sum).abs() < 1e-9, "sum of {}: {} vs {}", f, s, weighted_sum);
-    }
-
-    #[test]
-    fn test_model_matrix_matches_r() {
-        check("~ batch + condition", "Intercept,batch_b2_vs_b1,condition_B_vs_A,condition_C_vs_A", 4, 188.0);
-        let inter = "Intercept,batch_b2_vs_b1,condition_B_vs_A,condition_C_vs_A,batchb2.conditionB,batchb2.conditionC";
-        check("~ batch + condition + batch:condition", inter, 6, 224.0);
-        check("~ batch * condition", inter, 6, 224.0);
-        check(
-            "~ condition:batch + batch + condition",
-            "Intercept,batch_b2_vs_b1,condition_B_vs_A,condition_C_vs_A,conditionB.batchb2,conditionC.batchb2",
-            6,
-            224.0,
-        );
-        let nested = "Intercept,condition_B_vs_A,condition_C_vs_A,conditionA.batchb2,conditionB.batchb2,conditionC.batchb2";
-        check("~ condition + batch:condition", nested, 6, 188.0);
-        check("~ condition / batch", nested, 6, 188.0);
-        check(
-            "~ batch:condition",
-            "Intercept,batchb1.conditionA,batchb2.conditionA,batchb1.conditionB,batchb2.conditionB,batchb1.conditionC,batchb2.conditionC",
-            6,
-            156.0,
-        );
-        for f in ["~ 0 + condition", "~ condition - 1", "~ condition + 0", "~ -1 + condition"] {
-            check(f, "conditionA,conditionB,conditionC", 3, 78.0);
-        }
-        check("~ 0 + batch + condition", "batchb1,batchb2,conditionB,conditionC", 4, 146.0);
-        check(
-            "~ 0 + batch:condition",
-            "batchb1.conditionA,batchb2.conditionA,batchb1.conditionB,batchb2.conditionB,batchb1.conditionC,batchb2.conditionC",
-            6,
-            78.0,
-        );
-        check("~ 0 + x + condition", "x,conditionA,conditionB,conditionC", 4, 111.103);
-        check("~ x + condition + x:condition", "Intercept,x,condition_B_vs_A,condition_C_vs_A,x.conditionB,x.conditionC", 6, 208.592);
-        check("~ condition + condition:x", "Intercept,condition_B_vs_A,condition_C_vs_A,conditionA.x,conditionB.x,conditionC.x", 6, 179.103);
-        check("~ x * z", "Intercept,x,z,x.z", 4, 110.795787);
-        check("~ x:z", "Intercept,x.z", 2, 70.417787);
-        check(
-            "~ batch * condition * genotype",
-            "Intercept,batch_b2_vs_b1,condition_B_vs_A,condition_C_vs_A,genotype_KO_vs_WT,batchb2.conditionB,batchb2.conditionC,\
-             batchb2.genotypeKO,conditionB.genotypeKO,conditionC.genotypeKO,batchb2.conditionB.genotypeKO,batchb2.conditionC.genotypeKO",
-            8,
-            398.0,
-        );
-        check(
-            "~ (batch + condition + genotype)^2",
-            "Intercept,batch_b2_vs_b1,condition_B_vs_A,condition_C_vs_A,genotype_KO_vs_WT,batchb2.conditionB,batchb2.conditionC,\
-             batchb2.genotypeKO,conditionB.genotypeKO,conditionC.genotypeKO",
-            8,
-            368.0,
-        );
-        check("~ batch * condition - batch", "Intercept,condition_B_vs_A,condition_C_vs_A,batchb2.conditionA,batchb2.conditionB,batchb2.conditionC", 6, 188.0);
-        check("~ 1", "Intercept", 1, 78.0);
-        check("~ 0 + condition:x", "conditionA.x,conditionB.x,conditionC.x", 3, 33.103);
-        check(
-            "~ genotype + condition %in% genotype",
-            "Intercept,genotype_KO_vs_WT,genotypeWT.conditionB,genotypeKO.conditionB,genotypeWT.conditionC,genotypeKO.conditionC",
-            4,
-            203.0,
-        );
-        check("~ x + batch:x", "Intercept,x,x.batchb2", 3, 120.465);
-        check(
-            "~ 0 + condition + condition:batch",
-            "conditionA,conditionB,conditionC,conditionA.batchb2,conditionB.batchb2,conditionC.batchb2",
-            6,
-            120.0,
-        );
-    }
-
-    #[test]
-    fn test_formula_terms() {
-        let f = Formula::parse("~ batch * condition * genotype").unwrap();
-        assert_eq!(f.variables, vec!["batch", "condition", "genotype"]);
-        assert_eq!(
-            f.term_labels(),
-            vec!["batch", "condition", "genotype", "batch:condition", "batch:genotype", "condition:genotype", "batch:condition:genotype"]
-        );
-        assert!(f.intercept && f.has_interactions());
-        let f = Formula::parse("condition:batch + batch").unwrap();
-        assert_eq!(f.term_labels(), vec!["batch", "condition:batch"]);
-        assert!(!Formula::parse("~ 0 + a").unwrap().intercept);
-        assert!(Formula::parse("~ a - 1 + 1").unwrap().intercept);
-        assert!(Formula::parse("~ log(x)").is_err());
-        assert!(Formula::parse("y ~ x").is_err());
-        assert!(Formula::parse("~ a +").is_err());
-        assert!(Formula::parse("~ (a + b").is_err());
-        assert_eq!(Formula::parse("~ `my var` + b").unwrap().variables, vec!["my var", "b"]);
-    }
-
-    #[test]
-    fn test_make_names() {
-        let cases = [
-            ("", "X"), ("1a", "X1a"), (".1a", "X.1a"), ("a b", "a.b"), ("if", "if."), ("a:b", "a.b"), ("_x", "X_x"),
-            (".x", ".x"), ("TRUE", "TRUE."), ("a-b", "a.b"), ("é", "é"),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(make_names(input), expected, "make.names({:?})", input);
-        }
-    }
-
-    /// R cleanContrast(): column choice for character contrasts with and without intercept
-    #[test]
-    fn test_contrast_vectors() {
-        use super::super::design::contrast_vector;
-        let meta = metadata();
-        let refs = HashMap::new();
-        let design = |f: &str| formula_design(&Formula::parse(f).unwrap(), &meta, &refs).unwrap().1;
-        // ~ 0 + batch + condition: batchb1, batchb2, conditionB, conditionC
-        let info = design("~ 0 + batch + condition");
-        assert_eq!(contrast_vector(&info, "condition", "C", "A").unwrap(), vec![0.0, 0.0, 0.0, 1.0]);
-        assert_eq!(contrast_vector(&info, "condition", "A", "C").unwrap(), vec![0.0, 0.0, 0.0, -1.0]);
-        assert_eq!(contrast_vector(&info, "condition", "C", "B").unwrap(), vec![0.0, 0.0, -1.0, 1.0]);
-        assert_eq!(contrast_vector(&info, "batch", "b2", "b1").unwrap(), vec![-1.0, 1.0, 0.0, 0.0]);
-        // ~ 0 + condition: the first variable uses both columns
-        let info = design("~ 0 + condition");
-        assert_eq!(contrast_vector(&info, "condition", "B", "A").unwrap(), vec![-1.0, 1.0, 0.0]);
-        // with an intercept: the renamed main-effect columns
-        let info = design("~ batch * condition");
-        assert_eq!(contrast_vector(&info, "condition", "C", "B").unwrap(), vec![0.0, 0.0, -1.0, 1.0, 0.0, 0.0]);
-        assert!(contrast_vector(&info, "condition", "D", "A").is_err());
-        assert!(contrast_vector(&info, "genotype", "KO", "WT").is_err());
-    }
-
-    #[test]
-    fn test_full_rank_and_reduced() {
-        let meta = metadata();
-        let refs = HashMap::new();
-        let err = formula_design(&Formula::parse("~ batch:condition").unwrap(), &meta, &refs).unwrap_err();
-        assert!(format!("{}", err).contains("not full rank"));
-        let (mm, info) = formula_design(&Formula::parse("~ batch * condition").unwrap(), &meta, &refs).unwrap();
-        assert_eq!(mm.ncols(), 6);
-        assert_eq!(info.factor_columns["batch"], vec![1]);
-        assert_eq!(info.factor_columns["condition"], vec![2, 3]);
-        assert!(info.interaction_present && info.has_intercept);
-        let full_vars = info.design_vars.clone();
-        let red = reduced_design(&Formula::parse("~ batch + condition").unwrap(), &full_vars, 6, &meta, &refs).unwrap();
-        assert_eq!(red.ncols(), 4);
-        assert!(reduced_design(&Formula::parse("~ genotype").unwrap(), &full_vars, 6, &meta, &refs).is_err());
-        assert!(reduced_design(&Formula::parse("~ batch * condition").unwrap(), &full_vars, 6, &meta, &refs).is_err());
-    }
-}
+#[path = "formula_tests.rs"]
+mod tests;

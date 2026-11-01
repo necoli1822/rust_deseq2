@@ -6,7 +6,7 @@ mod pvalue;
 mod wald;
 
 pub use fdr::{benjamini_hochberg, bonferroni};
-pub use lrt::likelihood_ratio_test;
+pub use lrt::{likelihood_ratio_test, likelihood_ratio_test_reduced};
 pub use pvalue::calculate_pvalue;
 pub use wald::{wald_test, wald_test_extended};
 

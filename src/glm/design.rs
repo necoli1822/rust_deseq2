@@ -315,11 +315,20 @@ pub fn contrast_vector(
         });
     }
     let base = info.reference_levels.get(variable).ok_or_else(|| DeseqError::InvalidContrast {
-        reason: format!(
-            "{} should be the name of a factor in the design (factors: {:?})",
-            variable,
-            info.reference_levels.keys().collect::<Vec<_>>()
-        ),
+        reason: if info.design_vars.iter().any(|v| v == variable) {
+            // R cleanContrast(): a numeric or logical colData column
+            format!(
+                "{} is not a factor, see ?results (factors of the design: {:?}; use --name with resultsNames)",
+                variable,
+                info.reference_levels.keys().collect::<Vec<_>>()
+            )
+        } else {
+            format!(
+                "{} should be the name of a factor in the design (factors: {:?})",
+                variable,
+                info.reference_levels.keys().collect::<Vec<_>>()
+            )
+        },
     })?;
     let names = &info.coef_names;
     let position = |name: &str| names.iter().position(|n| n == name);

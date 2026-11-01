@@ -213,6 +213,24 @@ pub fn fit_single_gene_weighted(
     params: &GlmFitParams,
     obs_weights: Option<&[f64]>,
 ) -> GlmFitResult {
+    fit_single_gene_from(counts, design, size_factors, alpha, params, obs_weights, None)
+}
+
+/// [`fit_single_gene_weighted`] from the starting coefficients `start` (natural log
+/// scale) instead of the least-squares fit of `log(normalized counts + 0.1)`
+/// R equivalent: fitNbinomGLMs() for a model matrix that is not full rank, which starts
+/// from `beta_mat` = log(rowMeans(counts(object, normalized = TRUE))) for the
+/// Intercept column and 0 otherwise, or 1 for every column without an intercept; the
+/// ridge penalty (lambda = 1e-6) makes the IRLS and optim() fits well defined
+pub fn fit_single_gene_from(
+    counts: ArrayView1<f64>,
+    design: &Array2<f64>,
+    size_factors: ArrayView1<f64>,
+    alpha: f64,
+    params: &GlmFitParams,
+    obs_weights: Option<&[f64]>,
+    start: Option<&[f64]>,
+) -> GlmFitResult {
     // IRLS weight of sample i: R `weights.row(i).t() % mu_hat/(1.0 + alpha_hat(i) * mu_hat)`
     let irls_weight = |i: usize, mu: f64| -> f64 {
         match obs_weights {
@@ -248,7 +266,10 @@ pub fn fit_single_gene_weighted(
             xty[j] += design[[i, j]] * log_counts[i];
         }
     }
-    let mut beta = solve_symmetric_system(&xtx, &xty, n_coefs);
+    let mut beta = match start {
+        Some(b) => b.to_vec(),
+        None => solve_symmetric_system(&xtx, &xty, n_coefs),
+    };
 
     if beta.iter().any(|&b| !b.is_finite()) {
         let mean_count: f64 = counts.iter().zip(size_factors.iter())
