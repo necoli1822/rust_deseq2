@@ -89,3 +89,5 @@ quant quant_rsem_genes --quant-type rsem
 quant quant_stringtie --quant-type stringtie --read-length 100 --tx2gene $D/quant_stringtie/tx2gene.csv
 quant quant_piscem --quant-type piscem --tx2gene $D/quant_piscem/tx2gene.csv
 quant quant_oarfish --quant-type oarfish --tx2gene $D/quant_oarfish/tx2gene.csv
+# gen10.R: kallisto abundance.h5 (HDF5)
+quant quant_kallisto_h5 --quant-type kallisto --tx2gene $D/quant_kallisto_h5/tx2gene.csv

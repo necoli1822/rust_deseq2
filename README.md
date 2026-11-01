@@ -38,6 +38,11 @@ cargo build --release
 # Binary will be at target/release/rust_deseq2
 ```
 
+Requires Rust 1.89 or newer. kallisto `abundance.h5` input uses the pure-Rust
+[`rust-hdf5`](https://crates.io/crates/rust-hdf5) crate (no libhdf5), enabled by the default
+`hdf5` feature; build with `--no-default-features` to leave it out (kallisto
+`abundance.tsv` still works).
+
 ## Quick Start
 
 ```bash
@@ -78,7 +83,7 @@ rust_deseq2 run --htseq sample_table.csv --htseq-dir counts/ -d condition \
 rust_deseq2 run --quant samples.csv --quant-dir quants/ --tx2gene tx2gene.csv \
   -d condition --numerator treated --denominator control
 
-# kallisto abundance.tsv (or --quant-type rsem / stringtie / sailfish / piscem / oarfish)
+# kallisto abundance.h5 or abundance.tsv (or --quant-type rsem / stringtie / sailfish / piscem / oarfish)
 rust_deseq2 run --quant samples.csv --quant-dir kallisto/ --quant-type kallisto \
   --tx2gene tx2gene.csv -d condition --numerator treated --denominator control
 
@@ -226,7 +231,8 @@ position; a header row is optional and further columns are ignored. As in tximpo
   | `--quant-type` | File | ID, abundance, counts, length columns |
   |---|---|---|
   | `salmon`, `sailfish` | `quant.sf` | `Name`, `TPM`, `NumReads`, `EffectiveLength` |
-  | `kallisto` | `abundance.tsv` (`abundance.h5` is not read) | `target_id`, `tpm`, `est_counts`, `eff_length` |
+  | `kallisto` | `abundance.tsv` | `target_id`, `tpm`, `est_counts`, `eff_length` |
+  | `kallisto` | `abundance.h5`: when the first file is named `abundance.h5`, every file is read as HDF5, as tximport does (needs the `hdf5` feature) | `aux/ids`, `est_counts`, `aux/eff_lengths`; the TPM is computed as tximport's `read_kallisto_h5` does, `1e6 / sum(est_counts / eff_length) × est_counts / eff_length`, not read from the file |
   | `rsem` | `*.isoforms.results` | `transcript_id`, `TPM`, `expected_count`, `effective_length` (lengths below 1 set to 1) |
   | `rsem` | `*.genes.results`: when the first file's path contains `genes`, read at gene level without tx2gene, as tximport does | `gene_id`, `TPM`, `expected_count`, `effective_length` |
   | `stringtie` | `t_data.ctab` | `t_name`, `FPKM`, `cov`, `length`; counts = `cov × length / --read-length` |
@@ -246,7 +252,7 @@ produces normalization factors, `estimateNormFactors(counts, normMatrix = avgTxL
 exp(rowMeans(log(avgTxLength))))`; `--sf-type iterate` ignores the lengths, as in R.
 
 ### tximport matrices (`--avg-tx-length`, `--tximport`)
-For a tximport run in R (e.g. `kallisto` `abundance.h5`, or custom columns), write `txi$counts` as the `-c` count
+For a tximport run in R (e.g. alevin, or custom columns), write `txi$counts` as the `-c` count
 matrix and `txi$length` as a matrix of the same layout for `--avg-tx-length`. With
 `countsFromAbundance = "scaledTPM"` or `"lengthScaledTPM"`, R's `DESeqDataSetFromTximport()`
 uses just the counts: pass `-c` with `--tximport`.
@@ -336,6 +342,7 @@ release 0.1.0; "sig." counts genes called significant (padj < 0.1) by only one o
 | `--quant` salmon input (tximport, Wald, VST `parametric` / `local` / `--nsub`, rlog, normalize) | not supported | 5e-7 | 0 |
 | `--quant-type` `rsem` (isoforms, genes) / `stringtie` / `oarfish` | not supported | 5e-7 / 6e-7 / 1.3e-6 / 5e-7 | 0 |
 | `--quant-type` `kallisto` / `piscem` | not supported | 1.2e-5 ⁴ | 0 |
+| `--quant-type kallisto` with `abundance.h5` (rhdf5-written files; real kallisto 0.52 output: 5e-7) | not supported | 3.4e-6 ⁴ | 0 |
 | `-c --avg-tx-length` (`ratio`, `poscounts`), `-c --tximport` (`lengthScaledTPM`) | not supported | 5e-7 | 0 |
 | `--norm-factors`, 7 vs 7 with outlier replacement (Wald, LRT, `local`, `--weights`, `~batch + condition`, VST, rlog) | not used in the fits | 5e-7 | 0 |
 | shrinkage `normal` / `apeglm` after outlier replacement | fitted the replaced counts (ΔLFC up to 4.4) | 5e-7 / 8e-7 | 0 |
@@ -384,15 +391,16 @@ determinant cutoff, `lgamma` is R's, and size factors are computed bit-identical
 ⁴ One gene with 3 of 8 samples zero and dispersion 9.2 (lfcSE 3.1). The imported txi is identical
 to R's (the run equals `-c --avg-tx-length` with R's `txi` written exactly), and R itself moves
 that gene's LFC by up to 4.7e-6 when the normalization factors are scaled by 1 ± 1e-12: the IRLS
-stopping point on this flat likelihood is a rounding-level knife edge.
+stopping point on this flat likelihood is a rounding-level knife edge. The `abundance.h5` row is
+the same case (one gene, dispersion 8.9; the imported txi is again identical to R's).
 
 ### Known differences from R
 
 - Shrinkage with `--weights`: `normal` and `apeglm` stop with an error (weighted `lfcShrink` is
   not ported); `ashr` is allowed. VST and rlog do not take weights.
 - `betaPrior = TRUE`, expanded model matrices and interaction terms in the CLI are not supported.
-- tximport: kallisto's `abundance.h5` (HDF5), alevin and custom importer columns are not read
-  directly (use the `abundance.tsv` kallisto also writes, or `-c --avg-tx-length`); files are read
+- tximport: alevin and custom importer columns are not read directly (use
+  `-c --avg-tx-length`); files are read
   with `countsFromAbundance = "no"`; inferential replicates are not read (they do not change the
   counts, abundances or lengths). Numbers are parsed as `read.delim()` does (R's `R_strtod`), which is what tximport
   uses without the readr package; with readr installed tximport parses with `readr::read_tsv`,

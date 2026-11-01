@@ -87,6 +87,11 @@ names the R function it now follows.
   rejects them unless they are tximport counts (`--tximport`, `--avg-tx-length`).
 
 ### Added
+- kallisto `abundance.h5` input for `--quant-type kallisto`, as tximport's
+  `read_kallisto_h5()`: chosen when the first file is named `abundance.h5`; reads `aux/ids`,
+  `est_counts` and `aux/eff_lengths` and computes the TPM from them. Uses the pure-Rust
+  `rust-hdf5` crate (with its parallel chunk decompression; chosen by `validation/h5bench`)
+  behind the default `hdf5` feature.
 - tximport input from other quantifiers: `--quant <SAMPLE_TABLE> --quant-type <TYPE>` (`--salmon`
   and `--salmon-dir` remain as aliases of `--quant`, `--quant-dir`) reads kallisto
   `abundance.tsv`, RSEM `isoforms.results` (lengths below 1 set to 1) and `genes.results` (gene
@@ -120,6 +125,7 @@ names the R function it now follows.
   Weighted `lfcShrink` (normal, apeglm) is not ported and is rejected.
 
 ### Changed
+- Minimum supported Rust version is now 1.89 (was 1.70), required by `rust-hdf5`.
 - `--replace-outliers` now takes a value: `--replace-outliers false`.
 - apeglm's prior-scale message is logged at info level instead of printed to stderr.
 

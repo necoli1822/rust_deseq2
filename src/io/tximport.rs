@@ -40,7 +40,7 @@ pub enum QuantType {
     Salmon,
     /// sailfish `quant.sf` (same layout as salmon)
     Sailfish,
-    /// kallisto `abundance.tsv` (abundance.h5 is not read)
+    /// kallisto `abundance.tsv`, or `abundance.h5` (with the `hdf5` feature)
     Kallisto,
     /// RSEM `*.isoforms.results`, or `*.genes.results` (gene level, no tx2gene)
     Rsem,
@@ -464,12 +464,74 @@ pub fn is_rsem_gene_level<P: AsRef<Path>>(quant_type: QuantType, files: &[P]) ->
     quant_type == QuantType::Rsem && files.first().map_or(false, |f| f.as_ref().to_string_lossy().contains("genes"))
 }
 
+/// Whether tximport reads kallisto files from HDF5
+/// R equivalent: `kallisto.h5 <- basename(files[1]) == "abundance.h5"`; the importer
+/// is then read_kallisto_h5 for every file
+pub fn is_kallisto_h5<P: AsRef<Path>>(quant_type: QuantType, files: &[P]) -> bool {
+    quant_type == QuantType::Kallisto
+        && files.first().and_then(|f| f.as_ref().file_name()).map_or(false, |n| n == "abundance.h5")
+}
+
+/// Read a kallisto `abundance.h5`
+/// R equivalent: tximport's read_kallisto_h5(): est_counts, aux/ids and
+/// aux/eff_lengths, with the TPM computed from them as
+/// normfac * est_counts / eff_length, normfac = 1e6 / sum(est_counts / eff_length)
+/// (not read from the file; R's sum() accumulates in long double)
+#[cfg(feature = "hdf5")]
+pub fn read_kallisto_h5<P: AsRef<Path>>(path: P) -> Result<QuantFile> {
+    let path = path.as_ref();
+    let err = |what: &str, e: rust_hdf5::Hdf5Error| DeseqError::InvalidInput {
+        reason: format!("{}: cannot read {} from kallisto HDF5 file: {}", path.display(), what, e),
+    };
+    let f = rust_hdf5::H5File::open(path).map_err(|e| err("the file", e))?;
+    let f64s = |name: &str| -> Result<Vec<f64>> {
+        f.dataset(name).and_then(|d: rust_hdf5::H5Dataset| d.read_raw::<f64>()).map_err(|e| err(name, e))
+    };
+    let counts = f64s("est_counts")?;
+    let names = f.dataset("aux/ids").and_then(|d: rust_hdf5::H5Dataset| d.read_strings()).map_err(|e| err("aux/ids", e))?;
+    let effective_length = f64s("aux/eff_lengths")?;
+    // stopifnot(length(counts) == length(ids)); stopifnot(length(efflens) == length(ids))
+    if counts.len() != names.len() || effective_length.len() != names.len() {
+        return Err(DeseqError::InvalidInput {
+            reason: format!(
+                "{}: est_counts ({}), aux/ids ({}) and aux/eff_lengths ({}) differ in length",
+                path.display(),
+                counts.len(),
+                names.len(),
+                effective_length.len()
+            ),
+        });
+    }
+    let rate: Vec<f64> = counts.iter().zip(&effective_length).map(|(&c, &l)| c / l).collect();
+    let normfac = 1e6 / crate::optim::nmath::r_sum(rate.iter().copied());
+    let tpm = rate.iter().map(|&r| normfac * r).collect();
+    Ok(QuantFile { names, effective_length, tpm, num_reads: counts })
+}
+
+/// Without the `hdf5` feature kallisto HDF5 files cannot be read
+#[cfg(not(feature = "hdf5"))]
+pub fn read_kallisto_h5<P: AsRef<Path>>(path: P) -> Result<QuantFile> {
+    Err(DeseqError::InvalidInput {
+        reason: format!(
+            "{}: reading kallisto abundance.h5 needs the `hdf5` feature (or use abundance.tsv)",
+            path.as_ref().display()
+        ),
+    })
+}
+
 /// Read the files into feature x sample matrices (abundance, counts, length)
-fn read_quant_matrices<P: AsRef<Path>>(files: &[P], cols: QuantColumns) -> Result<(Vec<String>, [Array2<f64>; 3])> {
+fn read_quant_matrices<P: AsRef<Path>>(
+    files: &[P],
+    cols: QuantColumns,
+    kallisto_h5: bool,
+) -> Result<(Vec<String>, [Array2<f64>; 3])> {
     if files.is_empty() {
         return Err(DeseqError::EmptyData { reason: "no quantification files".to_string() });
     }
-    let quants: Vec<QuantFile> = files.iter().map(|f| read_quant_file(f, cols)).collect::<Result<_>>()?;
+    let quants: Vec<QuantFile> = files
+        .iter()
+        .map(|f| if kallisto_h5 { read_kallisto_h5(f) } else { read_quant_file(f, cols) })
+        .collect::<Result<_>>()?;
     let ids = quants[0].names.clone();
     for (q, f) in quants.iter().zip(files) {
         // R: stopifnot(all(txId == raw[[txIdCol]])); for RSEM genes.results R does not
@@ -497,7 +559,9 @@ fn read_quant_matrices<P: AsRef<Path>>(files: &[P], cols: QuantColumns) -> Resul
 ///   `genes.results` (gene_id, TPM, expected_count, effective_length) and are used
 ///   as they are, without tx2gene (computeRsemGeneLevel); otherwise transcript
 ///   lengths below 1 are set to 1 before summarizing;
-/// - StringTie: counts are cov * length / readLength (R's default readLength 75).
+/// - StringTie: counts are cov * length / readLength (R's default readLength 75);
+/// - kallisto: if the first file is named `abundance.h5`, every file is read as
+///   kallisto HDF5 ([`read_kallisto_h5`]).
 pub fn tximport<P: AsRef<Path>>(
     files: &[P],
     sample_ids: Vec<String>,
@@ -508,14 +572,18 @@ pub fn tximport<P: AsRef<Path>>(
     if is_rsem_gene_level(quant_type, files) {
         // computeRsemGeneLevel()
         let cols = QuantColumns { id: "gene_id", abundance: "TPM", counts: "expected_count", length: "effective_length" };
-        let (ids, [abundance, counts, length]) = read_quant_matrices(files, cols)?;
+        let (ids, [abundance, counts, length]) = read_quant_matrices(files, cols, false)?;
         log::info!("RSEM genes.results files: read at gene level (tx2gene not used)");
         return Ok(Txi { gene_ids: ids, sample_ids, abundance, counts, length });
     }
     let tx2gene = tx2gene.ok_or_else(|| DeseqError::InvalidInput {
         reason: "transcript-level quantifications need a tx2gene table (--tx2gene)".to_string(),
     })?;
-    let (tx_ids, [abundance, mut counts, mut length]) = read_quant_matrices(files, quant_type.columns())?;
+    let kallisto_h5 = is_kallisto_h5(quant_type, files);
+    if kallisto_h5 {
+        log::info!("kallisto abundance.h5 files: reading HDF5 (TPM computed as tximport does)");
+    }
+    let (tx_ids, [abundance, mut counts, mut length]) = read_quant_matrices(files, quant_type.columns(), kallisto_h5)?;
     match quant_type {
         // txi$counts <- txi$counts * txi$length / readLength
         QuantType::Stringtie => counts.zip_mut_with(&length, |c, &l| *c = *c * l / read_length),
@@ -657,6 +725,15 @@ mod tests {
         assert!(tximport(&[p("t_data.ctab")], s.clone(), QuantType::Stringtie, None, 75.0).is_err());
         assert!(tximport(&[p("t_data.ctab")], s, QuantType::Kallisto, Some(&t2g), 75.0).is_err());
         assert!(QuantType::parse("Kallisto").is_ok() && QuantType::parse("alevin").is_err());
+    }
+
+    #[test]
+    fn test_kallisto_h5_detection() {
+        // tximport: basename(files[1]) == "abundance.h5" decides for every file
+        assert!(is_kallisto_h5(QuantType::Kallisto, &["S1/abundance.h5", "S2/abundance.tsv"]));
+        assert!(!is_kallisto_h5(QuantType::Kallisto, &["S1/abundance.tsv", "S2/abundance.h5"]));
+        assert!(!is_kallisto_h5(QuantType::Kallisto, &["S1/sample1.h5"]));
+        assert!(!is_kallisto_h5(QuantType::Salmon, &["S1/abundance.h5"]));
     }
 
     #[test]

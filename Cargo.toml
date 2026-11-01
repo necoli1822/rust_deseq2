@@ -9,7 +9,7 @@ repository = "https://github.com/necoli1822/rust_deseq2"
 homepage = "https://github.com/necoli1822/rust_deseq2"
 keywords = ["bioinformatics", "rna-seq", "differential-expression", "deseq2", "genomics"]
 categories = ["science", "command-line-utilities"]
-rust-version = "1.70"
+rust-version = "1.89"
 exclude = [
     "validation/",
     "reference/",
@@ -66,6 +66,16 @@ env_logger = "0.11"
 # Numerical
 num-traits = "0.2"
 approx = "0.5"
+
+# HDF5 input (kallisto abundance.h5): pure Rust, no libhdf5. Chosen over hdf5-pure by
+# validation/h5bench (built-in parallel chunk decompression); 0.x and released often,
+# so the minor version is pinned. Optional so builds without HDF5 input can skip it.
+rust-hdf5 = { version = "~0.7.9", optional = true, features = ["parallel"] }
+
+[features]
+default = ["hdf5"]
+# read kallisto abundance.h5 files (--quant-type kallisto)
+hdf5 = ["dep:rust-hdf5"]
 
 [dev-dependencies]
 tempfile = "3.24"

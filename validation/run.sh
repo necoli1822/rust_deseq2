@@ -16,7 +16,7 @@ DATA="$WORK/data"
 
 if [ ! -d "$DATA" ]; then
   mkdir -p "$DATA"
-  for g in gen.R gen2.R gen3.R gen4.R gen5.R gen6.R gen7.R gen8.R gen9.R; do
+  for g in gen.R gen2.R gen3.R gen4.R gen5.R gen6.R gen7.R gen8.R gen9.R gen10.R; do
     echo "generating R references: $g"
     $RSCRIPT "$HERE/$g" "$DATA"
   done
