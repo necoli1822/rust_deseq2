@@ -66,6 +66,10 @@ rust_deseq2 run -c counts.csv -m metadata.csv -d condition \
 rust_deseq2 run -c counts.csv -m metadata.csv -d condition \
   --numerator treated --denominator control --shrinkage --shrinkage-method apeglm
 
+# The slope of a continuous covariate, a numeric contrast (R: results(name = ), contrast = c(...))
+rust_deseq2 run -c counts.csv -m metadata.csv -d condition --continuous age --name age
+rust_deseq2 run -c counts.csv -m metadata.csv -d condition --contrast-vector 0,-1,1
+
 # Variance Stabilizing Transformation (for PCA, heatmaps)
 rust_deseq2 vst -c counts.csv -m metadata.csv -d condition -o vst.tsv --blind
 
@@ -119,8 +123,18 @@ rust_deseq2 run -c counts.csv -m metadata.csv --norm-factors nf.csv \
 | `--continuous` | Continuous covariate | — |
 | `--reference` | Reference level (format: factor=level) | alphabetical |
 | `--test` | Statistical test: `wald` or `lrt` | `wald` |
-| `--numerator` | Numerator level for Wald contrast | — |
-| `--denominator` | Denominator level for Wald contrast | — |
+| `--numerator` | Numerator level of the contrast, a level of `--design` or `--contrast-var` (R: `contrast = c(factor, num, den)`) | — |
+| `--denominator` | Denominator level of the contrast | — |
+| `--contrast-var <FACTOR>` | Factor of `--numerator`/`--denominator`, e.g. a `--covariate` | `--design` |
+| `--name <COEF>` | Report one coefficient by its `resultsNames` name, e.g. a continuous variable's slope (R: `results(name = )`); the names are logged | — |
+| `--contrast-vector <W1,W2,...>` | Numeric contrast, one weight per coefficient (R: `contrast = c(0, 1, -1)`) | — |
+| `--contrast-list <NUM;DEN>` | List contrast of coefficient names, `,` within and `;` between the two sides (R: `contrast = list(...)`) | — |
+| `--list-values <POS,NEG>` | Weights of the list contrast's two sides (R: `listValues`) | `1,-1` |
+
+Without a contrast option the Wald test reports the last coefficient, as R's `results(dds)` does.
+With `--test lrt` a contrast option chooses only the reported `log2FoldChange`/`lfcSE`; normal and
+apeglm shrinkage shrink the coefficient the contrast names (a single coefficient, as
+`lfcShrink(coef = )`).
 | `--reduced` | Reduced model formula for LRT (e.g., `~1`) | — |
 | `--fit-type` | Dispersion fit: `parametric`, `local`, `mean` | `parametric` |
 | `--use-t` | Use t-distribution for Wald test p-values | `false` |
@@ -338,6 +352,7 @@ release 0.1.0; "sig." counts genes called significant (padj < 0.1) by only one o
 | `--sf-type poscounts`, 30% zeros | 2 sig., 75 padj-NA differences | 1.6e-3 ¹ | 0 |
 | `--sf-type iterate`, 30% zeros | different algorithm | 8e-5 | 0 |
 | `--weights` (4 vs 4, `--use-t`, `~batch + condition`) | not supported | 5e-7 | 0 |
+| Contrasts on `~batch + age + condition`: `--name` (slope, covariate), `--contrast-var`, numeric, list (with `listValues`), default, `--use-t`, `--lfc-threshold`, LRT, normal/apeglm of a chosen coefficient | `--numerator`/`--denominator` of `-d` only | 5e-7 (numeric/list 1.2e-6, apeglm 2.7e-6) | 0 |
 | `--htseq` input (`~batch + condition`, VST, normalize) | not supported | 5e-7 | 0 |
 | `--quant` salmon input (tximport, Wald, VST `parametric` / `local` / `--nsub`, rlog, normalize) | not supported | 5e-7 | 0 |
 | `--quant-type` `rsem` (isoforms, genes) / `stringtie` / `oarfish` | not supported | 5e-7 / 6e-7 / 1.3e-6 / 5e-7 | 0 |

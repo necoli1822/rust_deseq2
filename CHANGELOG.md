@@ -12,6 +12,9 @@ RcppNumerical 0.7-0, R 4.5.3) on simulated data sets covering each code path. Ea
 names the R function it now follows.
 
 ### Fixed
+- List contrasts (library `ContrastSpec::List`) added the weights of a coefficient listed twice;
+  they are now assigned as in R, and R's checks (no coefficient on both sides, `listValues`
+  positive and negative, numeric contrast not all zero) are applied.
 - **Wrong coefficient for contrasts.** Coefficients were found by suffix match, so with
   levels WT/KO/DKO a `KO vs WT` contrast returned the DKO result, and a covariate sharing level
   names with the main factor could be picked instead. Contrasts now use exact coefficient
@@ -87,6 +90,13 @@ names the R function it now follows.
   rejects them unless they are tximport counts (`--tximport`, `--avg-tx-length`).
 
 ### Added
+- Contrast choices of R's `results()`: `--name <COEF>` (a coefficient by its `resultsNames` name,
+  e.g. a continuous variable's slope or a covariate), `--contrast-var` (a `--numerator`/
+  `--denominator` contrast of another factor), `--contrast-vector` (numeric contrast) and
+  `--contrast-list` with `--list-values` (list contrast). Without one, the Wald test reports
+  the last coefficient, as `results(dds)` does (`--numerator`/`--denominator` were required).
+  With LRT a contrast picks the reported LFC/SE; normal and apeglm shrinkage shrink the
+  coefficient the contrast names (`lfcShrink(coef = )`). The resultsNames are logged.
 - kallisto `abundance.h5` input for `--quant-type kallisto`, as tximport's
   `read_kallisto_h5()`: chosen when the first file is named `abundance.h5`; reads `aux/ids`,
   `est_counts` and `aux/eff_lengths` and computes the TPM from them. Uses the pure-Rust

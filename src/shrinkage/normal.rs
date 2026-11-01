@@ -38,6 +38,33 @@ pub fn shrink_lfc_normal_with_counts(
     results: &mut DESeqResults,
     upper_quantile: f64,
 ) {
+    // Determine which coefficient index corresponds to the contrast
+    let (coef_idx, contrast_sign) = match get_contrast_index(
+        design_info,
+        &results.contrast.numerator,
+        &results.contrast.denominator,
+    ) {
+        Ok(val) => val,
+        Err(e) => {
+            log::warn!("Could not determine contrast index for shrinkage: {}", e);
+            return;
+        }
+    };
+    shrink_lfc_normal_coef(dds, fit_counts, results, upper_quantile, coef_idx, contrast_sign)
+}
+
+/// [`shrink_lfc_normal_with_counts`] for an explicitly chosen coefficient: the
+/// results report `sign * beta[coef_idx]` of the refit with the normal prior and its SE
+/// R equivalent: lfcShrink(dds, coef = coef_idx + 1, type = "normal"); `sign = -1`
+/// reports the reversed contrast of a reference-level coefficient
+pub fn shrink_lfc_normal_coef(
+    dds: &DESeqDataSet,
+    fit_counts: Option<&ndarray::Array2<f64>>,
+    results: &mut DESeqResults,
+    upper_quantile: f64,
+    coef_idx: usize,
+    contrast_sign: f64,
+) {
     let n_genes = results.gene_ids.len();
     let n_samples = dds.n_samples();
 
@@ -78,18 +105,10 @@ pub fn shrink_lfc_normal_with_counts(
         }
     };
 
-    // Determine which coefficient index corresponds to the contrast
-    let (coef_idx, contrast_sign) = match get_contrast_index(
-        design_info,
-        &results.contrast.numerator,
-        &results.contrast.denominator,
-    ) {
-        Ok(val) => val,
-        Err(e) => {
-            log::warn!("Could not determine contrast index for shrinkage: {}", e);
-            return;
-        }
-    };
+    if coef_idx >= n_coefs {
+        log::warn!("Shrinkage coefficient {} out of range ({} coefficients)", coef_idx, n_coefs);
+        return;
+    }
 
     // Compute baseMean per gene
     let base_means: Vec<f64> = (0..n_genes)

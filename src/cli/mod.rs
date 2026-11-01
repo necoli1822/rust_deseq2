@@ -89,8 +89,10 @@ Examples:
         /// Statistical test [default: wald]
         #[arg(long, default_value = "wald",
             long_help = "Statistical test to use.\n\
-                wald: Wald test — tests individual coefficients, requires --numerator/--denominator\n\
-                lrt:  Likelihood Ratio Test — compares full vs reduced model, requires --reduced")]
+                wald: Wald test of the contrast (see --numerator, --name, --contrast-vector,\n\
+                      --contrast-list; without any, R's default contrast)\n\
+                lrt:  Likelihood Ratio Test — compares full vs reduced model, requires --reduced;\n\
+                      a contrast option then only chooses the reported log2FoldChange/lfcSE")]
         test: String,
 
         /// Reduced model formula for LRT
@@ -100,16 +102,19 @@ Examples:
         reduced: Option<String>,
 
         /// Numerator level for contrast
-        #[arg(long,
-            long_help = "Numerator level for the contrast (required for Wald test).\n\
-                This is the \"treatment\" or \"case\" condition.")]
+        #[arg(long, requires = "denominator",
+            long_help = "Numerator level of the contrast (the \"treatment\" or \"case\" condition),\n\
+                a level of --design or of --contrast-var.\n\
+                R equivalent: results(dds, contrast = c(factor, numerator, denominator))")]
         numerator: Option<String>,
 
         /// Denominator level for contrast
-        #[arg(long,
-            long_help = "Denominator level for the contrast (required for Wald test).\n\
-                This is the \"control\" or \"baseline\" condition.")]
+        #[arg(long, requires = "numerator",
+            long_help = "Denominator level of the contrast (the \"control\" or \"baseline\" condition).")]
         denominator: Option<String>,
+
+        #[command(flatten)]
+        contrast: ContrastArgs,
 
         /// Output file path [default: deseq2_results.csv]
         #[arg(short, long, default_value = "deseq2_results.csv")]
@@ -478,4 +483,49 @@ pub struct TximportArgs {
             (--sf-type is ignored). They are used as given: like R, no centering is applied.\n\
             R equivalent: normalizationFactors(dds) <- nf before DESeq()")]
     pub norm_factors: Option<String>,
+}
+
+/// Contrast choices besides --numerator/--denominator
+/// R equivalent: the name / contrast / listValues arguments of results()
+#[derive(Args, Clone, Debug, Default)]
+pub struct ContrastArgs {
+    /// Factor of the --numerator/--denominator contrast [default: --design]
+    #[arg(long, value_name = "FACTOR", requires = "numerator",
+        long_help = "Factor whose levels --numerator and --denominator name, e.g. a --covariate\n\
+            (default: the --design variable).\n\
+            R equivalent: results(dds, contrast = c(\"batch\", \"b2\", \"b1\"))")]
+    pub contrast_var: Option<String>,
+
+    /// Report one coefficient by its name (R: results(name = ...))
+    #[arg(long, value_name = "COEF",
+        conflicts_with_all = ["numerator", "contrast_vector", "contrast_list"],
+        long_help = "Report the coefficient with this name, as listed by resultsNames(dds):\n\
+            \"Intercept\", a continuous variable's name (its slope), or\n\
+            \"<factor>_<level>_vs_<reference>\". The names are logged at the start of the run.\n\
+            R equivalent: results(dds, name = COEF)")]
+    pub name: Option<String>,
+
+    /// Numeric contrast: one weight per coefficient, comma-separated
+    #[arg(long, value_name = "W1,W2,...", value_delimiter = ',', allow_hyphen_values = true,
+        conflicts_with_all = ["numerator", "contrast_list"],
+        long_help = "A weight for every coefficient, in resultsNames(dds) order, e.g. \"0,1,-1\".\n\
+            The log2 fold change is the weighted sum of coefficients and its SE comes from\n\
+            the coefficient covariance.\n\
+            R equivalent: results(dds, contrast = c(0, 1, -1))")]
+    pub contrast_vector: Option<Vec<f64>>,
+
+    /// List contrast: "NUM1,NUM2;DEN1,DEN2" of coefficient names
+    #[arg(long, value_name = "NUM;DEN", allow_hyphen_values = true,
+        conflicts_with_all = ["numerator"],
+        long_help = "Coefficient names for the numerator and the denominator, separated by ';'\n\
+            (names within each separated by ','); either side may be empty, e.g.\n\
+            \"condition_B_vs_A;condition_C_vs_A\" or \"genotype_KO_vs_WT\".\n\
+            Numerator coefficients get the first --list-values weight, denominator ones the second.\n\
+            R equivalent: results(dds, contrast = list(c(...), c(...)), listValues = c(1, -1))")]
+    pub contrast_list: Option<String>,
+
+    /// Weights of the --contrast-list numerator and denominator [default: 1,-1]
+    #[arg(long, value_name = "POS,NEG", value_delimiter = ',', allow_hyphen_values = true,
+        requires = "contrast_list")]
+    pub list_values: Option<Vec<f64>>,
 }

@@ -12,4 +12,4 @@ mod normal;
 
 pub use apeglm::{shrink_lfc_apeglm, shrink_lfc_apeglm_with_counts, ApeglmParams};
 pub use ashr::{apply_ashr_shrinkage, shrink_lfc_ashr, AshrFit, AshrParams};
-pub use normal::{shrink_lfc_normal, shrink_lfc_normal_with_counts};
+pub use normal::{shrink_lfc_normal, shrink_lfc_normal_coef, shrink_lfc_normal_with_counts};

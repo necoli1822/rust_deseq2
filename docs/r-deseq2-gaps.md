@@ -42,8 +42,8 @@ R 쪽 목록은 `getNamespaceExports("DESeq2")`와 주요 함수의 `formals()`�
 
 | R 기능 | 상태 | 비고 |
 |---|---|---|
-| `name =` (계수 이름으로 결과 추출) | 미지원 | 연속 변수 기울기, 공변량 계수, 상호작용 계수의 Wald 결과를 뽑을 수 없음. Wald는 `-d` 변수의 `--numerator`/`--denominator` 대비만 |
-| `contrast =` 숫자 벡터, `list(...)` + `listValues` | 미지원 | 수준 이름 대비(`c(factor, num, den)`)만 |
+| `name =` (계수 이름으로 결과 추출) | **구현됨** | `--name`. 연속 변수 기울기·공변량 계수. 대비 없이 실행하면 R처럼 마지막 계수. 공변량의 수준 대비는 `--contrast-var` |
+| `contrast =` 숫자 벡터, `list(...)` + `listValues` | **구현됨** | `--contrast-vector`, `--contrast-list` + `--list-values`. LRT에서는 보고할 LFC 열을 정함 |
 | `altHypothesis = "lessAbs"`, `"greater"`, `"less"`, `"greaterAbsUPSHOT"`, `"greaterAbs2014"` | 미지원 | `greaterAbs`(기본값)만 |
 | `pAdjustMethod` (BH 외) | 미노출 | BH 고정. 라이브러리에 Bonferroni 함수는 있음 |
 | `filter`, `filterFun`, `theta` (독립 필터링 사용자 지정) | 미지원 | R 기본 방식(baseMean 기준)만 |
@@ -58,7 +58,7 @@ R 쪽 목록은 `getNamespaceExports("DESeq2")`와 주요 함수의 `formals()`�
 | 관측 가중치가 있을 때 `type = "normal"`, `"apeglm"` | 미구현 | 오류로 중단. `ashr`는 가능 |
 | `svalue = TRUE` (s-value 출력) | 미구현 | ashr 내부에서 s-value를 계산하지만 출력하지 않음 |
 | `lfcShrink(lfcThreshold =)` | 미구현 | |
-| `coef =`로 공변량 등 다른 계수 수축 | 미지원(CLI) | `-d` 변수 대비만 수축 |
+| `coef =`로 공변량 등 다른 계수 수축 | **구현됨** | normal/apeglm이 `--name` 등 대비가 가리키는 계수를 수축 |
 | `apeAdapt`, `apeMethod` 변경 | 미노출 | R 기본값으로 동작 |
 
 ### 기타
@@ -130,8 +130,7 @@ DESeq2의 `DESeqDataSetFromMatrix`/`HTSeqCount`/`Tximport` 세 생성자는 모�
 
 사용 빈도와 작업량을 기준으로:
 
-1. **`results(name =)`와 숫자 대비**: 연속 변수 기울기·공변량 계수를 볼 수 없는 것이 실제 분석에서 가장 자주
-   부딪힐 제한이다. 계수와 공분산은 이미 계산하고 있어 작업량이 작다.
+1. ~~`results(name =)`와 숫자 대비~~: 구현됨 (`validation/gen11.R`, R과 5e-7~2.7e-6).
 2. **임의 설계식(상호작용 포함)**: 설계 행렬 코드는 있으므로 식 파서와 CLI 노출, R 대조 검증이 필요하다.
 3. **`altHypothesis`의 나머지와 `pAdjustMethod`**: 계산식이 단순하다.
 4. **VST/rlog 옵션 정리**: size factor 방식과 rlog `fitType` 노출, `blind` 기본값을 R과 맞출지 결정.

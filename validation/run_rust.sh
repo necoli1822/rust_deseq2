@@ -91,3 +91,17 @@ quant quant_piscem --quant-type piscem --tx2gene $D/quant_piscem/tx2gene.csv
 quant quant_oarfish --quant-type oarfish --tx2gene $D/quant_oarfish/tx2gene.csv
 # gen10.R: kallisto abundance.h5 (HDF5)
 quant quant_kallisto_h5 --quant-type kallisto --tx2gene $D/quant_kallisto_h5/tx2gene.csv
+# gen11.R: contrast choices (design ~ batch + age + condition)
+C="-d condition --covariate batch --continuous age"
+run name_age $C --name age
+run name_batch $C --name batch_b2_vs_b1
+run cvar_batch $C --contrast-var batch --numerator b1 --denominator b2
+run numeric_CvsB $C --contrast-vector 0,0,0,-1,1
+run list_CvsB $C --contrast-list "condition_C_vs_A;condition_B_vs_A"
+run list_avg $C --contrast-list "condition_B_vs_A,condition_C_vs_A" --list-values 0.5,-0.5
+run default $C
+run numeric_useT $C --use-t --contrast-vector 0,0,0,-1,1
+run name_lfcthr $C --name batch_b2_vs_b1 --lfc-threshold 0.5
+run lrt_list $C --test lrt --reduced "~batch + age" --contrast-list "condition_C_vs_A;condition_B_vs_A"
+run shrink_normal_batch $C --name batch_b2_vs_b1 --shrinkage --shrinkage-method normal
+run shrink_apeglm_age $C --name age --shrinkage --shrinkage-method apeglm

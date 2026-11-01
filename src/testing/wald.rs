@@ -87,7 +87,7 @@ pub fn wald_test_extended(
                 .position(|n| n == coef_name)
                 .ok_or_else(|| DeseqError::InvalidContrast {
                     reason: format!(
-                        "Coefficient '{}' not found. Available: {:?}",
+                        "Coefficient '{}' not found. Available (resultsNames): {:?}",
                         coef_name, design_info.coef_names
                     ),
                 })?;
@@ -106,6 +106,12 @@ pub fn wald_test_extended(
                     ),
                 });
             }
+            // R checkContrast(): "numeric contrast vector cannot have all elements equal to 0"
+            if weights.iter().all(|&w| w == 0.0) {
+                return Err(DeseqError::InvalidContrast {
+                    reason: "numeric contrast vector cannot have all elements equal to 0".to_string(),
+                });
+            }
             let desc = format!("numeric contrast: {:?}", weights);
             (weights.clone(), desc)
         }
@@ -115,32 +121,54 @@ pub fn wald_test_extended(
             denominator_coefs,
             list_values,
         } => {
-            let mut vec = vec![0.0; n_coefs];
-            let (num_weight, denom_weight) = list_values;
-
-            // Add numerator weight for numerator coefficients
-            for coef_name in numerator_coefs {
-                let idx = design_info
-                    .coef_names
-                    .iter()
-                    .position(|n| n == coef_name)
-                    .ok_or_else(|| DeseqError::InvalidContrast {
-                        reason: format!("Coefficient '{}' not found", coef_name),
-                    })?;
-                vec[idx] += num_weight;
+            // R checkContrast() / cleanContrast():
+            //   contrastNumeric[resNames %in% contrast[[1]]] <- listValues[1]
+            //   contrastNumeric[resNames %in% contrast[[2]]] <- listValues[2]
+            let (num_weight, denom_weight) = *list_values;
+            if !(num_weight > 0.0 && denom_weight < 0.0) {
+                return Err(DeseqError::InvalidContrast {
+                    reason: format!(
+                        "listValues must be a positive and a negative number, got {}, {}",
+                        num_weight, denom_weight
+                    ),
+                });
             }
-
-            // Add denominator weight for denominator coefficients
-            for coef_name in denominator_coefs {
-                let idx = design_info
-                    .coef_names
-                    .iter()
-                    .position(|n| n == coef_name)
-                    .ok_or_else(|| DeseqError::InvalidContrast {
-                        reason: format!("Coefficient '{}' not found", coef_name),
-                    })?;
-                vec[idx] += denom_weight;
+            if numerator_coefs.is_empty() && denominator_coefs.is_empty() {
+                return Err(DeseqError::InvalidContrast {
+                    reason: "one of the two elements in the contrast list should be non-empty".to_string(),
+                });
             }
+            if let Some(both) = numerator_coefs.iter().find(|c| denominator_coefs.contains(c)) {
+                return Err(DeseqError::InvalidContrast {
+                    reason: format!(
+                        "'{}' appears in both the numerator and the denominator of the contrast list",
+                        both
+                    ),
+                });
+            }
+            for coef_name in numerator_coefs.iter().chain(denominator_coefs) {
+                if !design_info.coef_names.contains(coef_name) {
+                    return Err(DeseqError::InvalidContrast {
+                        reason: format!(
+                            "Coefficient '{}' not found. Available (resultsNames): {:?}",
+                            coef_name, design_info.coef_names
+                        ),
+                    });
+                }
+            }
+            let vec: Vec<f64> = design_info
+                .coef_names
+                .iter()
+                .map(|n| {
+                    if numerator_coefs.contains(n) {
+                        num_weight
+                    } else if denominator_coefs.contains(n) {
+                        denom_weight
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
 
             let desc = format!(
                 "({}) - ({})",

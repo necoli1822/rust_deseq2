@@ -3,7 +3,8 @@
 use clap::Parser;
 use log::{info, LevelFilter};
 
-use rust_deseq2::cli::{Cli, Commands, InputArgs, TximportArgs};
+use rust_deseq2::cli::{Cli, Commands, ContrastArgs, InputArgs, TximportArgs};
+use rust_deseq2::testing::wald_test_extended;
 use rust_deseq2::filter::{calculate_cooks_distance, default_cooks_cutoff, filter_by_cooks_with_counts, n_or_more_in_cell, replace_outliers};
 use rust_deseq2::prelude::*;
 
@@ -66,6 +67,7 @@ fn main() {
             reduced,
             numerator,
             denominator,
+            contrast,
             output,
             alpha,
             shrinkage,
@@ -98,6 +100,7 @@ fn main() {
             reduced.as_deref(),
             numerator.as_deref(),
             denominator.as_deref(),
+            &contrast,
             &output,
             alpha,
             shrinkage,
@@ -353,6 +356,7 @@ fn run_analysis(
     reduced_formula: Option<&str>,
     numerator: Option<&str>,
     denominator: Option<&str>,
+    contrast_args: &ContrastArgs,
     output_path: &str,
     alpha: f64,
     shrinkage: bool,
@@ -391,15 +395,6 @@ fn run_analysis(
         return Err(DeseqError::InvalidInput {
             reason: format!("Unknown test type '{}'. Use 'wald' or 'lrt'.", test_type),
         });
-    }
-
-    // For Wald test, numerator and denominator are required
-    if test_type == "wald" {
-        if numerator.is_none() || denominator.is_none() {
-            return Err(DeseqError::InvalidInput {
-                reason: "--numerator and --denominator are required for Wald test".to_string(),
-            });
-        }
     }
 
     let (counts, mut metadata, avg_tx_length) = load_input(input)?;
@@ -544,6 +539,16 @@ fn run_analysis(
     };
     info!("Fitting GLM...");
     let design_info = fit_glm(&mut dds, &glm_params)?;
+    info!("resultsNames: {}", design_info.coef_names.join(", "));
+
+    // R results(): the contrast (character, name, numeric or list); without one,
+    // R's default. An explicit contrast also picks the LFC column of an LRT.
+    let explicit_contrast = numerator.is_some()
+        || contrast_args.name.is_some()
+        || contrast_args.contrast_vector.is_some()
+        || contrast_args.contrast_list.is_some();
+    let contrast_spec = resolve_contrast(&dds, &design_info, design, numerator, denominator, contrast_args)?;
+    info!("Contrast: {}", describe_contrast(&contrast_spec));
 
     // -----------------------------------------------------------------------
     // Step 3: Run Wald/LRT test FIRST (before Cook's replacement)
@@ -565,18 +570,14 @@ fn run_analysis(
             df_full - df_reduced
         );
 
-        likelihood_ratio_test(&dds, &design_full, &design_reduced)?
+        let mut lrt = likelihood_ratio_test(&dds, &design_full, &design_reduced)?;
+        if explicit_contrast {
+            lrt_contrast_columns(&dds, &design_info, &contrast_spec, &mut lrt)?;
+        }
+        lrt
     } else {
-        let num = numerator.unwrap();
-        let den = denominator.unwrap();
-        info!("Performing Wald test for {} vs {}...", num, den);
-        let contrast = Contrast {
-            variable: design.to_string(),
-            numerator: num.to_string(),
-            denominator: den.to_string(),
-        };
-
-        wald_test(&dds, &design_info, contrast, alpha, use_t, lfc_threshold)?
+        info!("Performing Wald test ({})...", describe_contrast(&contrast_spec));
+        wald_test_extended(&dds, &design_info, contrast_spec.clone(), alpha, use_t, lfc_threshold)?
     };
 
     // -----------------------------------------------------------------------
@@ -641,16 +642,13 @@ fn run_analysis(
                     reason: "Design matrix not available after refit".to_string(),
                 })?.clone();
                 let design_reduced = build_reduced_design(&dds, reduced_formula, covariates, continuous_vars)?;
-                likelihood_ratio_test(&dds, &design_full, &design_reduced)?
+                let mut lrt = likelihood_ratio_test(&dds, &design_full, &design_reduced)?;
+                if explicit_contrast {
+                    lrt_contrast_columns(&dds, &design_info, &contrast_spec, &mut lrt)?;
+                }
+                lrt
             } else {
-                let num = numerator.unwrap();
-                let den = denominator.unwrap();
-                let contrast = Contrast {
-                    variable: design.to_string(),
-                    numerator: num.to_string(),
-                    denominator: den.to_string(),
-                };
-                wald_test(&dds, &design_info, contrast, alpha, use_t, lfc_threshold)?
+                wald_test_extended(&dds, &design_info, contrast_spec.clone(), alpha, use_t, lfc_threshold)?
             };
 
         }
@@ -734,11 +732,7 @@ fn run_analysis(
                 // the coefficient the Wald contrast reported. A reversed contrast
                 // (numerator = reference) is that coefficient negated; the Cauchy prior
                 // is symmetric, so negating the shrunken estimate is exact.
-                let (coef_idx, sign) = rust_deseq2::glm::get_contrast_index(
-                    &design_info,
-                    numerator.unwrap(),
-                    denominator.unwrap(),
-                )?;
+                let (coef_idx, sign) = single_coefficient(&design_info, &contrast_spec)?;
                 shrink_lfc_apeglm_with_counts(&dds, shrink_counts, &mut results, coef_idx, &params)?;
                 if sign < 0.0 {
                     results.log2_fold_changes.iter_mut().for_each(|lfc| *lfc = -*lfc);
@@ -752,11 +746,11 @@ fn run_analysis(
             }
             _ => {
                 info!("Applying normal LFC shrinkage...");
-                // shrink_lfc_normal only logs a warning when the contrast is not a single
-                // coefficient and leaves the MLE in place, which would be written out as if
-                // it were shrunken. Fail here instead.
-                rust_deseq2::glm::get_contrast_index(&design_info, numerator.unwrap(), denominator.unwrap())?;
-                rust_deseq2::shrinkage::shrink_lfc_normal_with_counts(&dds, shrink_counts, &design_info, &mut results, upper_quantile);
+                // Normal shrinkage refits one coefficient (R: lfcShrink(coef = ...)); a
+                // contrast that is not a single coefficient is an error rather than an
+                // unshrunken MLE written out as if it were shrunken.
+                let (coef_idx, sign) = single_coefficient(&design_info, &contrast_spec)?;
+                rust_deseq2::shrinkage::shrink_lfc_normal_coef(&dds, shrink_counts, &mut results, upper_quantile, coef_idx, sign);
             }
         }
     }
@@ -768,6 +762,155 @@ fn run_analysis(
     let summary = results.summary(alpha);
     println!("\n{}", summary);
 
+    Ok(())
+}
+
+/// The contrast of results() from the CLI options, or R's default
+/// R equivalent: checkContrast() and the default in results(): without contrast and
+/// name, `name <- lastCoefName(object)`. (R uses
+/// `c(lastVarName, levels(lastVar)[nlvls], levels(lastVar)[1])` instead only for Wald tests
+/// of designs without an intercept or with expanded model matrices; CLI designs always
+/// have an intercept.)
+fn resolve_contrast(
+    dds: &DESeqDataSet,
+    info: &rust_deseq2::glm::DesignInfo,
+    design: &str,
+    numerator: Option<&str>,
+    denominator: Option<&str>,
+    c: &ContrastArgs,
+) -> Result<ContrastSpec> {
+    let names = &info.coef_names;
+    let unknown = |what: &str| DeseqError::InvalidContrast {
+        reason: format!("Coefficient '{}' not found. Available (resultsNames): {}", what, names.join(", ")),
+    };
+    if let Some(name) = &c.name {
+        if !names.contains(name) {
+            return Err(unknown(name));
+        }
+        return Ok(ContrastSpec::Name(name.clone()));
+    }
+    if let Some(w) = &c.contrast_vector {
+        // R checkContrast(): one element per resultsNames entry, not all zero
+        if w.len() != names.len() {
+            return Err(DeseqError::InvalidContrast {
+                reason: format!(
+                    "numeric contrast has {} elements but there are {} coefficients ({})",
+                    w.len(),
+                    names.len(),
+                    names.join(", ")
+                ),
+            });
+        }
+        return Ok(ContrastSpec::Numeric(w.clone()));
+    }
+    if let Some(list) = &c.contrast_list {
+        let (num, den) = list.split_once(';').unwrap_or((list.as_str(), ""));
+        let split = |s: &str| -> Vec<String> {
+            s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+        };
+        let lv = c.list_values.clone().unwrap_or_else(|| vec![1.0, -1.0]);
+        // R: stopifnot(length(listValues) == 2 & is.numeric(listValues))
+        if lv.len() != 2 {
+            return Err(DeseqError::InvalidContrast {
+                reason: format!("--list-values needs two numbers, got {}", lv.len()),
+            });
+        }
+        return Ok(ContrastSpec::List {
+            numerator_coefs: split(num),
+            denominator_coefs: split(den),
+            list_values: (lv[0], lv[1]),
+        });
+    }
+    if let (Some(num), Some(den)) = (numerator, denominator) {
+        let variable = c.contrast_var.as_deref().unwrap_or(design);
+        let meta = dds.sample_metadata();
+        if meta.has_continuous(variable) || !meta.has_condition(variable) {
+            return Err(DeseqError::InvalidContrast {
+                reason: format!("{} should be the name of a factor in the metadata (see --contrast-var)", variable),
+            });
+        }
+        // R checkContrast(): the two levels must differ
+        if num == den {
+            return Err(DeseqError::InvalidContrast {
+                reason: format!("{} and {} should be different level names", num, den),
+            });
+        }
+        return Ok(ContrastSpec::simple(variable, num, den));
+    }
+    // R's default: the last coefficient
+    let _ = (dds, design);
+    names.last().cloned().map(ContrastSpec::Name).ok_or_else(|| DeseqError::InvalidContrast {
+        reason: "the design has no coefficients".to_string(),
+    })
+}
+
+fn describe_contrast(spec: &ContrastSpec) -> String {
+    match spec {
+        ContrastSpec::Simple { variable, numerator, denominator } => format!("{} {} vs {}", variable, numerator, denominator),
+        ContrastSpec::Name(n) => format!("coefficient {}", n),
+        ContrastSpec::Numeric(w) => format!("numeric contrast {:?}", w),
+        ContrastSpec::List { numerator_coefs, denominator_coefs, list_values } => format!(
+            "list contrast {} vs {} (listValues {}, {})",
+            numerator_coefs.join("+"),
+            denominator_coefs.join("+"),
+            list_values.0,
+            list_values.1
+        ),
+    }
+}
+
+/// The single coefficient (index, sign) a contrast reports, for shrinkage
+/// R equivalent: lfcShrink(dds, coef = ...) needs one coefficient; a character contrast
+/// whose denominator is the reference level is that level's coefficient, and the
+/// reversed contrast is the coefficient negated
+fn single_coefficient(info: &rust_deseq2::glm::DesignInfo, spec: &ContrastSpec) -> Result<(usize, f64)> {
+    let vector = match spec {
+        ContrastSpec::Simple { variable, numerator, denominator } => {
+            rust_deseq2::glm::contrast_vector(info, variable, numerator, denominator)?
+        }
+        ContrastSpec::Name(n) => info.coef_names.iter().map(|c| if c == n { 1.0 } else { 0.0 }).collect(),
+        ContrastSpec::Numeric(w) => w.clone(),
+        ContrastSpec::List { numerator_coefs, denominator_coefs, list_values } => info
+            .coef_names
+            .iter()
+            .map(|c| {
+                if numerator_coefs.contains(c) {
+                    list_values.0
+                } else if denominator_coefs.contains(c) {
+                    list_values.1
+                } else {
+                    0.0
+                }
+            })
+            .collect(),
+    };
+    let nonzero: Vec<usize> = (0..vector.len()).filter(|&j| vector[j] != 0.0).collect();
+    match nonzero.as_slice() {
+        [j] if vector[*j].abs() == 1.0 => Ok((*j, vector[*j])),
+        _ => Err(DeseqError::InvalidContrast {
+            reason: format!(
+                "--shrinkage-method normal/apeglm shrinks a single coefficient (R: lfcShrink(coef = ...)), \
+                 but the contrast ({}) is not one; use --name, or a contrast against the reference level, or ashr",
+                describe_contrast(spec)
+            ),
+        }),
+    }
+}
+
+/// LRT results with the log2FoldChange/lfcSE of a contrast
+/// R equivalent: results(dds, test = "LRT", contrast/name = ...): cleanContrast() computes
+/// the contrast (with contrastAllZero setting LFC = 0) and then replaces stat and pvalue
+/// with the LRT's
+fn lrt_contrast_columns(
+    dds: &DESeqDataSet,
+    info: &rust_deseq2::glm::DesignInfo,
+    spec: &ContrastSpec,
+    lrt: &mut DESeqResults,
+) -> Result<()> {
+    let wald = wald_test_extended(dds, info, spec.clone(), 0.1, false, 0.0)?;
+    lrt.log2_fold_changes = wald.log2_fold_changes;
+    lrt.lfc_se = wald.lfc_se;
+    lrt.contrast = wald.contrast;
     Ok(())
 }
 
