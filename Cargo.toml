@@ -31,7 +31,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Array/matrix operations
-ndarray = { version = "0.16", features = ["rayon"] }
+ndarray = { version = "0.17", features = ["rayon"] }
 
 # Statistics
 statrs = { version = "0.19", default-features = false, features = ["std"] }
