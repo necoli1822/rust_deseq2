@@ -160,13 +160,13 @@ pub fn shrink_lfc_apeglm_with_counts(
     let nonzero_mle_lfc: Vec<f64> = mle_lfc
         .iter()
         .zip(nonzero.iter())
-        .filter(|(_, &nz)| nz)
+        .filter(|&(_, &nz)| nz)
         .map(|(&lfc, _)| lfc)
         .collect();
     let nonzero_mle_se: Vec<f64> = mle_se
         .iter()
         .zip(nonzero.iter())
-        .filter(|(_, &nz)| nz)
+        .filter(|&(_, &nz)| nz)
         .map(|(&se, _)| se)
         .collect();
     let prior_var = prior_var(&nonzero_mle_lfc, &nonzero_mle_se);

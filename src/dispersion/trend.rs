@@ -147,7 +147,7 @@ fn fit_parametric_trend(means: &[f64], dispersions: &[f64]) -> Result<(Array1<f6
     let valid: Vec<(f64, f64)> = means
         .iter()
         .zip(dispersions.iter())
-        .filter(|(&m, &d)| m > 0.0 && d > 1e-6 && d.is_finite())
+        .filter(|&(&m, &d)| m > 0.0 && d > 1e-6 && d.is_finite())
         .map(|(&m, &d)| (m, d))
         .collect();
 
@@ -358,7 +358,7 @@ fn fit_local_trend(means: &[f64], dispersions: &[f64]) -> Result<(Array1<f64>, D
     let valid: Vec<(f64, f64)> = means
         .iter()
         .zip(dispersions.iter())
-        .filter(|(&m, &d)| m > 0.0 && d > min_disp * 100.0 && d.is_finite())
+        .filter(|&(&m, &d)| m > 0.0 && d > min_disp * 100.0 && d.is_finite())
         .map(|(&m, &d)| (m, d))
         .collect();
 

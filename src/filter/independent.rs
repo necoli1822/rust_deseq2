@@ -95,7 +95,7 @@ pub fn independent_filtering(results: &mut DESeqResults, alpha: f64) {
         let residuals: Vec<f64> = num_rej
             .iter()
             .zip(lowess_fit.iter())
-            .filter(|(&n, _)| n > 0)
+            .filter(|&(&n, _)| n > 0)
             .map(|(&n, &f)| n as f64 - f)
             .collect();
 

@@ -128,7 +128,7 @@ fn estimate_size_factors_ratio(counts: ArrayView2<f64>) -> Result<Array1<f64>> {
         let mut log_ratios: Vec<f64> = valid_genes
             .iter()
             .zip(log_geo_means.iter())
-            .filter(|(&i, _)| counts[[i, j]] > 0.0)
+            .filter(|&(&i, _)| counts[[i, j]] > 0.0)
             .map(|(&i, &lg)| counts[[i, j]].ln() - lg)
             .collect();
 

@@ -195,7 +195,7 @@ pub fn estimate_prior_variance_with_var(
     let mut log_residuals: Vec<f64> = gene_dispersions
         .iter()
         .zip(trended_dispersions.iter())
-        .filter(|(&g, &t)| {
+        .filter(|&(&g, &t)| {
             g >= MIN_DISP_THRESHOLD && t > 0.0 && g.is_finite() && t.is_finite()
         })
         .map(|(&g, &t)| g.ln() - t.ln())

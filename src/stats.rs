@@ -48,7 +48,7 @@ pub fn weighted_quantile(x: &[f64], weights: &[f64], prob: f64) -> f64 {
     let mut pairs: Vec<(f64, f64)> = x
         .iter()
         .zip(weights.iter())
-        .filter(|(&xi, &wi)| wi > 0.0 && !xi.is_nan() && !wi.is_nan())
+        .filter(|&(&xi, &wi)| wi > 0.0 && !xi.is_nan() && !wi.is_nan())
         .map(|(&xi, &wi)| (xi, wi))
         .collect();
 

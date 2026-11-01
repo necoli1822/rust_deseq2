@@ -126,6 +126,10 @@ names the R function it now follows.
 
 ### Changed
 - Minimum supported Rust version is now 1.89 (was 1.70), required by `rust-hdf5`.
+- Rust edition 2024 (was 2021). Dependencies: statrs 0.19 (without its default nalgebra and
+  rand features), ndarray 0.17, and the lock file at the latest compatible versions (clap 4.6,
+  rayon 1.12, ...); the unused rand, rand_distr, ndarray-stats, anyhow, num-traits and approx
+  are removed. Results are unchanged: every validation output is byte identical.
 - `--replace-outliers` now takes a value: `--replace-outliers false`.
 - apeglm's prior-scale message is logged at info level instead of printed to stderr.
 

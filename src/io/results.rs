@@ -173,7 +173,7 @@ impl DESeqResults {
         self.gene_ids
             .iter()
             .zip(self.padj.iter())
-            .filter(|(_, &p)| p.is_finite() && p < alpha)
+            .filter(|&(_, &p)| p.is_finite() && p < alpha)
             .map(|(id, _)| id.as_str())
             .collect()
     }
@@ -183,7 +183,7 @@ impl DESeqResults {
         self.gene_ids
             .iter()
             .zip(self.padj.iter().zip(self.log2_fold_changes.iter()))
-            .filter(|(_, (&p, &lfc))| p.is_finite() && p < alpha && lfc >= min_lfc)
+            .filter(|&(_, (&p, &lfc))| p.is_finite() && p < alpha && lfc >= min_lfc)
             .map(|(id, _)| id.as_str())
             .collect()
     }
@@ -193,7 +193,7 @@ impl DESeqResults {
         self.gene_ids
             .iter()
             .zip(self.padj.iter().zip(self.log2_fold_changes.iter()))
-            .filter(|(_, (&p, &lfc))| p.is_finite() && p < alpha && lfc <= -min_lfc)
+            .filter(|&(_, (&p, &lfc))| p.is_finite() && p < alpha && lfc <= -min_lfc)
             .map(|(id, _)| id.as_str())
             .collect()
     }
