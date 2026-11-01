@@ -32,17 +32,12 @@ path = "src/main.rs"
 [dependencies]
 # Array/matrix operations
 ndarray = { version = "0.16", features = ["rayon"] }
-ndarray-stats = "0.6"
 
 # Statistics
 statrs = "0.18"
 # Pure-Rust port of the fdlibm/musl math library, already in the tree through
 # statrs; used for the C-library lgamma that R's stirlerr() calls.
 libm = "0.2"
-rand = "0.8"
-rand_distr = "0.4"
-
-# Note: Custom optimization implemented, argmin not needed for now
 
 # Parallel processing
 rayon = "1.10"
@@ -57,15 +52,10 @@ clap = { version = "4.5", features = ["derive"] }
 
 # Error handling
 thiserror = "2.0"
-anyhow = "1.0"
 
 # Logging
 log = "0.4"
 env_logger = "0.11"
-
-# Numerical
-num-traits = "0.2"
-approx = "0.5"
 
 # HDF5 input (kallisto abundance.h5): pure Rust, no libhdf5. Chosen over hdf5-pure by
 # validation/h5bench (built-in parallel chunk decompression); 0.x and released often,
