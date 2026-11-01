@@ -19,7 +19,14 @@ use crate::error::{DeseqError, Result};
 ///     .metadata(sample_metadata)
 ///     .main_effect("treatment")
 ///     .covariate("batch")
-///     .interaction(&["treatment", "batch"])
+///     .interaction("treatment", "batch")
+///     .build()?;
+///
+/// // or any R design formula
+/// let dds = DESeqDataSetBuilder::new()
+///     .counts(count_matrix)
+///     .metadata(sample_metadata)
+///     .formula("~ batch + treatment + batch:treatment")
 ///     .build()?;
 /// ```
 #[derive(Default)]
@@ -31,6 +38,7 @@ pub struct DESeqDataSetBuilder {
     continuous: Vec<String>,
     interactions: Vec<(String, String)>,
     reference_levels: HashMap<String, String>,
+    formula: Option<String>,
 }
 
 impl DESeqDataSetBuilder {
@@ -80,7 +88,18 @@ impl DESeqDataSetBuilder {
         self
     }
 
-    /// Add an interaction term between two factors
+    /// Use an R design formula, e.g. `"~ genotype * treatment"` or `"~ 0 + condition"`
+    /// (R: DESeqDataSetFromMatrix(design = ...)). Variables are factors unless they
+    /// are continuous columns of the metadata (`SampleMetadata::add_continuous`).
+    /// The main effect, factors and continuous covariates are then not used for the
+    /// design; reference levels still apply.
+    pub fn formula(mut self, formula: &str) -> Self {
+        self.formula = Some(formula.to_string());
+        self
+    }
+
+    /// Add an interaction term between two factors: the design becomes the formula
+    /// `~ factors + continuous + main_effect + factor1:factor2`
     pub fn interaction(mut self, factor1: &str, factor2: &str) -> Self {
         let pair = (factor1.to_string(), factor2.to_string());
         if !self.interactions.contains(&pair) {
@@ -110,6 +129,10 @@ impl DESeqDataSetBuilder {
         let metadata = self.metadata.ok_or_else(|| DeseqError::InvalidInput {
             reason: "metadata is required".to_string(),
         })?;
+
+        if let Some(text) = &self.formula {
+            return build_with_formula(counts, metadata, text, self.main_effect.as_deref(), self.reference_levels);
+        }
 
         let main_effect = self.main_effect.ok_or_else(|| DeseqError::InvalidInput {
             reason: "main_effect is required".to_string(),
@@ -168,6 +191,15 @@ impl DESeqDataSetBuilder {
             }
         }
 
+        if !self.interactions.is_empty() {
+            // R: design = ~ factors + continuous + main_effect + f1:f2 + ...
+            let mut terms: Vec<String> = self.factors.iter().chain(&self.continuous).cloned().collect();
+            terms.push(main_effect.clone());
+            terms.extend(self.interactions.iter().map(|(a, b)| format!("{}:{}", a, b)));
+            let text = format!("~ {}", terms.iter().map(|t| quote_terms(t)).collect::<Vec<_>>().join(" + "));
+            return build_with_formula(counts, metadata, &text, Some(&main_effect), self.reference_levels);
+        }
+
         // Create base DESeqDataSet
         let mut dds = DESeqDataSet::new(counts, metadata, &main_effect)?;
 
@@ -179,6 +211,53 @@ impl DESeqDataSetBuilder {
 
         Ok(dds)
     }
+}
+
+/// Backquote the variable names of a `a:b` term that are not syntactic R names
+fn quote_terms(term: &str) -> String {
+    term.split(':')
+        .map(|v| if crate::glm::make_names(v) == v { v.to_string() } else { format!("`{}`", v) })
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// A dataset whose design is an R formula
+/// R equivalent: DESeqDataSetFromMatrix(countData, colData, design = formula); the
+/// model matrix is model.matrix(design, colData) (checked with checkFullRank())
+fn build_with_formula(
+    counts: CountMatrix,
+    mut metadata: SampleMetadata,
+    text: &str,
+    main_effect: Option<&str>,
+    reference_levels: HashMap<String, String>,
+) -> Result<DESeqDataSet> {
+    let formula = crate::glm::Formula::parse(text)?;
+    let (matrix, info) = crate::glm::formula_design(&formula, &metadata, &reference_levels)?;
+    for factor in reference_levels.keys() {
+        if !info.reference_levels.contains_key(factor) {
+            return Err(DeseqError::InvalidInput {
+                reason: format!("Reference level set for '{}', which is not a factor of the design formula", factor),
+            });
+        }
+    }
+    // The dataset's main variable: the given one, else the last factor of the formula
+    // (R's default contrast variable), else any variable; `~ 1` gets a constant column.
+    let main = match main_effect {
+        Some(m) => m.to_string(),
+        None if !info.design_variable.is_empty() => info.design_variable.clone(),
+        None => match formula.variables.first() {
+            Some(v) => v.clone(),
+            None => {
+                let n = metadata.n_samples();
+                metadata.add_condition("_intercept", vec!["1".to_string(); n])?;
+                "_intercept".to_string()
+            }
+        },
+    };
+    let mut dds = DESeqDataSet::new(counts, metadata, &main)?;
+    dds.set_reference_levels(reference_levels);
+    dds.set_formula_design(matrix, info)?;
+    Ok(dds)
 }
 
 /// Extended design matrix builder
@@ -454,5 +533,47 @@ mod tests {
         assert!(dds.is_ok());
         let dds = dds.unwrap();
         assert!(dds.factors().contains(&"batch".to_string()));
+    }
+
+    /// An interaction makes the design the formula ~ batch + treatment + batch:treatment,
+    /// with R's model matrix and resultsNames
+    #[test]
+    fn test_builder_interaction_and_formula() {
+        let ids: Vec<String> = (1..=8).map(|i| format!("s{}", i)).collect();
+        let counts = CountMatrix::new(
+            ndarray::Array2::from_shape_fn((2, 8), |(g, s)| (100 + 10 * g + 7 * s) as f64),
+            vec!["gene1".to_string(), "gene2".to_string()],
+            ids.clone(),
+        )
+        .unwrap();
+        let mut metadata = SampleMetadata::new(ids);
+        let treatment = (0..8).map(|i| if i < 4 { "control" } else { "treated" }.to_string()).collect();
+        metadata.add_condition("treatment", treatment).unwrap();
+        metadata.add_condition("batch", (0..8).map(|i| if i % 2 == 0 { "A" } else { "B" }.to_string()).collect()).unwrap();
+
+        let dds = DESeqDataSetBuilder::new()
+            .counts(counts.clone())
+            .metadata(metadata.clone())
+            .main_effect("treatment")
+            .factor("batch")
+            .interaction("batch", "treatment")
+            .build()
+            .unwrap();
+        let info = dds.formula_design_info().unwrap();
+        assert_eq!(info.coef_names, vec!["Intercept", "batch_B_vs_A", "treatment_treated_vs_control", "batchB.treatmenttreated"]);
+        let x = dds.design_matrix().unwrap();
+        // sample 8: batch B, treated
+        assert_eq!(x.row(7).to_vec(), vec![1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(x.row(6).to_vec(), vec![1.0, 0.0, 1.0, 0.0]);
+
+        let dds = DESeqDataSetBuilder::new()
+            .counts(counts)
+            .metadata(metadata)
+            .formula("~ 0 + treatment")
+            .reference_level("treatment", "treated")
+            .build()
+            .unwrap();
+        assert_eq!(dds.formula_design_info().unwrap().coef_names, vec!["treatmenttreated", "treatmentcontrol"]);
+        assert_eq!(dds.design_variable(), "treatment");
     }
 }

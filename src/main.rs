@@ -60,6 +60,7 @@ fn main() {
         Some(Commands::Run {
             input,
             design,
+            formula,
             covariate,
             continuous,
             reference,
@@ -92,7 +93,8 @@ fn main() {
             cooks_cutoff,
         }) => run_analysis(
             &input,
-            &design,
+            design.as_deref(),
+            formula.as_deref(),
             &covariate,
             &continuous,
             &reference,
@@ -135,17 +137,21 @@ fn main() {
         Some(Commands::Vst {
             input,
             design,
+            formula,
+            continuous,
             output,
             method,
             blind,
             nsub,
-        }) => run_vst(&input, &design, &output, &method, blind, nsub),
+        }) => run_vst(&input, design.as_deref(), formula.as_deref(), &continuous, &output, &method, blind, nsub),
         Some(Commands::Rlog {
             input,
             design,
+            formula,
+            continuous,
             output,
             blind,
-        }) => run_rlog(&input, &design, &output, blind),
+        }) => run_rlog(&input, design.as_deref(), formula.as_deref(), &continuous, &output, blind),
         None => {
             // Should not reach here (handled above), but just in case
             print_no_args();
@@ -193,7 +199,7 @@ fn print_long_help() {
     println!("               - Wald test or Likelihood Ratio Test (LRT)");
     println!("               - LFC shrinkage (normal, apeglm, ashr)");
     println!("               - Cook's distance outlier detection and replacement");
-    println!("               - Multi-factor designs with covariates");
+    println!("               - Multi-factor designs with covariates, or any R design formula");
     println!("               - Dispersion fit types: parametric, local, mean");
     println!("               - t-distribution p-values for small sample sizes");
     println!("  normalize  Normalize count data using median-of-ratios method");
@@ -215,6 +221,9 @@ fn print_long_help() {
     println!();
     println!("  rust_deseq2 run -c counts.csv -m metadata.csv -d condition \\");
     println!("    --numerator treated --denominator control --fit-type local --use-t");
+    println!();
+    println!("  rust_deseq2 run -c counts.csv -m metadata.csv --formula \"~ genotype * treatment\" \\");
+    println!("    --name genotypeKO.treatmenttrt");
     println!();
     println!("  rust_deseq2 vst -c counts.csv -m metadata.csv -d condition --blind");
 }
@@ -346,9 +355,85 @@ fn load_htseq(table: &str, directory: &str) -> Result<(CountMatrix, SampleMetada
     Ok((counts, metadata))
 }
 
+/// Register the --continuous columns of the metadata as numeric
+/// read_metadata keeps every column as a categorical factor; the columns named by
+/// --continuous are numeric covariates (R: a numeric colData column), so register them
+/// as such or the design cannot find them.
+fn register_continuous(metadata: &mut SampleMetadata, continuous_vars: &[String]) -> Result<()> {
+    for name in continuous_vars {
+        let raw = metadata.condition(name).cloned().ok_or_else(|| DeseqError::InvalidMetadata {
+            reason: format!("Continuous variable '{}' not found in metadata", name),
+        })?;
+        let values = raw
+            .iter()
+            .map(|v| {
+                v.trim().parse::<f64>().ok().filter(|x| x.is_finite()).ok_or_else(|| DeseqError::InvalidMetadata {
+                    reason: format!("Continuous variable '{}' has non-numeric value '{}'", name, v),
+                })
+            })
+            .collect::<Result<Vec<f64>>>()?;
+        metadata.add_continuous(name, values)?;
+    }
+    Ok(())
+}
+
+/// A dataset whose design is the formula `text`
+/// R equivalent: DESeqDataSetFromMatrix(countData, colData, design = formula), with the
+/// messages DESeqDataSet() gives for numeric design variables
+fn formula_dataset(
+    counts: CountMatrix,
+    metadata: SampleMetadata,
+    text: &str,
+    continuous_vars: &[String],
+    reference_levels: &[String],
+) -> Result<DESeqDataSet> {
+    let formula = rust_deseq2::glm::Formula::parse(text)?;
+    info!("Creating DESeqDataSet with design: {}", formula.display());
+    for name in continuous_vars {
+        if !formula.variables.contains(name) {
+            return Err(DeseqError::InvalidInput {
+                reason: format!("--continuous {} is not a variable of the formula {}", name, formula.display()),
+            });
+        }
+    }
+    let numeric: Vec<&String> = formula.variables.iter().filter(|v| metadata.has_continuous(v)).collect();
+    let values = |v: &str| (0..metadata.n_samples()).map(|i| metadata.get_continuous_value(v, i).unwrap()).collect::<Vec<f64>>();
+    if numeric.iter().any(|v| values(v).iter().all(|x| *x == x.round())) {
+        log::warn!(
+            "the design formula contains one or more numeric variables with integer values, specifying a model \
+             with increasing fold change for higher values. did you mean for this to be a factor? if so, leave \
+             it out of --continuous"
+        );
+    }
+    let large = numeric.iter().any(|v| {
+        let x = values(v);
+        let n = x.len() as f64;
+        let mean = x.iter().sum::<f64>() / n;
+        let sd = (x.iter().map(|a| (a - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+        mean.abs() > 5.0 || sd > 5.0
+    });
+    if large {
+        log::warn!(
+            "the design formula contains one or more numeric variables that have mean or standard deviation \
+             larger than 5 (an arbitrary threshold to trigger this message). Including numeric variables with \
+             large mean can induce collinearity with the intercept. Users should center and scale numeric \
+             variables in the design to improve GLM convergence."
+        );
+    }
+    let mut builder = DESeqDataSet::builder().counts(counts).metadata(metadata).formula(text);
+    for ref_spec in reference_levels {
+        let (factor, level) = ref_spec.split_once('=').ok_or_else(|| DeseqError::InvalidInput {
+            reason: format!("Invalid reference format '{}'. Use: factor=level", ref_spec),
+        })?;
+        builder = builder.reference_level(factor, level);
+    }
+    builder.build()
+}
+
 fn run_analysis(
     input: &InputArgs,
-    design: &str,
+    design: Option<&str>,
+    formula: Option<&str>,
     covariates: &[String],
     continuous_vars: &[String],
     reference_levels: &[String],
@@ -398,24 +483,7 @@ fn run_analysis(
     }
 
     let (counts, mut metadata, avg_tx_length) = load_input(input)?;
-
-    // read_metadata keeps every column as a categorical factor. Columns named by
-    // --continuous are numeric covariates (R: a numeric colData column), so
-    // register them as such or the design builder cannot find them.
-    for name in continuous_vars {
-        let raw = metadata.condition(name).cloned().ok_or_else(|| DeseqError::InvalidMetadata {
-            reason: format!("Continuous variable '{}' not found in metadata", name),
-        })?;
-        let values = raw
-            .iter()
-            .map(|v| {
-                v.trim().parse::<f64>().ok().filter(|x| x.is_finite()).ok_or_else(|| DeseqError::InvalidMetadata {
-                    reason: format!("Continuous variable '{}' has non-numeric value '{}'", name, v),
-                })
-            })
-            .collect::<Result<Vec<f64>>>()?;
-        metadata.add_continuous(name, values)?;
-    }
+    register_continuous(&mut metadata, continuous_vars)?;
 
     // Cross-validate sample IDs between counts and metadata
     {
@@ -450,11 +518,15 @@ fn run_analysis(
     }
 
     // Build DESeqDataSet with multi-factor design support
-    let mut dds = if covariates.is_empty() && continuous_vars.is_empty() && reference_levels.is_empty() {
+    let mut dds = if let Some(text) = formula {
+        formula_dataset(counts, metadata, text, continuous_vars, reference_levels)?
+    } else if covariates.is_empty() && continuous_vars.is_empty() && reference_levels.is_empty() {
+        let design = design.expect("clap requires --design without --formula");
         // Simple design: ~ design_variable (alphabetical reference)
         info!("Creating DESeqDataSet with design: ~ {}", design);
         DESeqDataSet::new(counts, metadata, design)?
     } else {
+        let design = design.expect("clap requires --design without --formula");
         // Multi-factor design: ~ covariate1 + covariate2 + ... + design_variable
         let formula_parts: Vec<&str> = covariates
             .iter()
@@ -547,7 +619,7 @@ fn run_analysis(
         || contrast_args.name.is_some()
         || contrast_args.contrast_vector.is_some()
         || contrast_args.contrast_list.is_some();
-    let contrast_spec = resolve_contrast(&dds, &design_info, design, numerator, denominator, contrast_args)?;
+    let contrast_spec = resolve_contrast(&dds, &design_info, design, test_type, numerator, denominator, contrast_args)?;
     info!("Contrast: {}", describe_contrast(&contrast_spec));
 
     // -----------------------------------------------------------------------
@@ -559,7 +631,7 @@ fn run_analysis(
             reason: "Design matrix not available after GLM fit".to_string(),
         })?.clone();
 
-        let design_reduced = build_reduced_design(&dds, reduced_formula, covariates, continuous_vars)?;
+        let design_reduced = build_reduced_design(&dds, &design_info, reduced_formula)?;
 
         let df_full = design_full.ncols();
         let df_reduced = design_reduced.ncols();
@@ -641,7 +713,7 @@ fn run_analysis(
                 let design_full = dds.design_matrix().ok_or_else(|| DeseqError::InvalidInput {
                     reason: "Design matrix not available after refit".to_string(),
                 })?.clone();
-                let design_reduced = build_reduced_design(&dds, reduced_formula, covariates, continuous_vars)?;
+                let design_reduced = build_reduced_design(&dds, &design_info, reduced_formula)?;
                 let mut lrt = likelihood_ratio_test(&dds, &design_full, &design_reduced)?;
                 if explicit_contrast {
                     lrt_contrast_columns(&dds, &design_info, &contrast_spec, &mut lrt)?;
@@ -681,10 +753,12 @@ fn run_analysis(
         let n_coefs = dds.design_matrix().map(|m| m.ncols()).unwrap_or(2);
         let cooks_cutoff = cooks_cutoff_override.unwrap_or_else(|| default_cooks_cutoff(dds.n_samples(), n_coefs));
 
-        let n_levels = dds.sample_metadata().levels(design)
-            .map(|levels| levels.len())
-            .unwrap_or(0);
-        let is_two_level_design = covariates.is_empty() && continuous_vars.is_empty() && n_levels == 2;
+        // R results(): the low-count heuristic applies when the design has a single
+        // variable, a factor with two levels (all.vars(design) has length 1)
+        let is_two_level_design = match design_info.design_vars.as_slice() {
+            [v] => design_info.reference_levels.contains_key(v) && *v == design_info.design_variable && design_info.levels.len() == 2,
+            _ => false,
+        };
         let counts = original_counts.clone().unwrap_or_else(|| dds.counts().counts().to_owned());
         filter_by_cooks_with_counts(
             &mut results,
@@ -746,6 +820,22 @@ fn run_analysis(
             }
             _ => {
                 info!("Applying normal LFC shrinkage...");
+                // R lfcShrink(type = "normal") refits with betaPrior = TRUE, which
+                // needs an intercept and no interactions
+                if design_info.interaction_present {
+                    return Err(DeseqError::InvalidInput {
+                        reason: "LFC shrinkage type='normal' not implemented for designs with interactions \
+                                 (use --shrinkage-method apeglm or ashr)"
+                            .to_string(),
+                    });
+                }
+                if !design_info.has_intercept {
+                    return Err(DeseqError::InvalidInput {
+                        reason: "LFC shrinkage type='normal' (betaPrior=TRUE) can only be used if the design has an \
+                                 intercept (use --shrinkage-method apeglm or ashr)"
+                            .to_string(),
+                    });
+                }
                 // Normal shrinkage refits one coefficient (R: lfcShrink(coef = ...)); a
                 // contrast that is not a single coefficient is an error rather than an
                 // unshrunken MLE written out as if it were shrunken.
@@ -767,14 +857,15 @@ fn run_analysis(
 
 /// The contrast of results() from the CLI options, or R's default
 /// R equivalent: checkContrast() and the default in results(): without contrast and
-/// name, `name <- lastCoefName(object)`. (R uses
-/// `c(lastVarName, levels(lastVar)[nlvls], levels(lastVar)[1])` instead only for Wald tests
-/// of designs without an intercept or with expanded model matrices; CLI designs always
-/// have an intercept.)
+/// name, `name <- lastCoefName(object)`, except for Wald tests of designs without an
+/// intercept and without interactions, where R uses
+/// `contrast = c(lastVarName, levels(lastVar)[nlvls], levels(lastVar)[1])` when the last
+/// variable of the design is a factor
 fn resolve_contrast(
     dds: &DESeqDataSet,
     info: &rust_deseq2::glm::DesignInfo,
-    design: &str,
+    design: Option<&str>,
+    test_type: &str,
     numerator: Option<&str>,
     denominator: Option<&str>,
     c: &ContrastArgs,
@@ -822,7 +913,11 @@ fn resolve_contrast(
         });
     }
     if let (Some(num), Some(den)) = (numerator, denominator) {
-        let variable = c.contrast_var.as_deref().unwrap_or(design);
+        let variable = c.contrast_var.as_deref().or(design).ok_or_else(|| DeseqError::InvalidContrast {
+            reason: "with --formula, --numerator/--denominator need --contrast-var FACTOR \
+                     (R: contrast = c(factor, numerator, denominator))"
+                .to_string(),
+        })?;
         let meta = dds.sample_metadata();
         if meta.has_continuous(variable) || !meta.has_condition(variable) {
             return Err(DeseqError::InvalidContrast {
@@ -837,8 +932,18 @@ fn resolve_contrast(
         }
         return Ok(ContrastSpec::simple(variable, num, den));
     }
+    // R's default without an intercept: the last level of the last variable against
+    // its first level
+    if test_type == "wald" && !info.has_intercept && !info.interaction_present {
+        if let Some(last) = info.design_vars.last() {
+            if *last == info.design_variable && info.levels.len() >= 2 {
+                let levels = &info.levels;
+                return Ok(ContrastSpec::simple(last, &levels[levels.len() - 1], &levels[0]));
+            }
+        }
+    }
     // R's default: the last coefficient
-    let _ = (dds, design);
+    let _ = dds;
     names.last().cloned().map(ContrastSpec::Name).ok_or_else(|| DeseqError::InvalidContrast {
         reason: "the design has no coefficients".to_string(),
     })
@@ -914,89 +1019,18 @@ fn lrt_contrast_columns(
     Ok(())
 }
 
-/// Build a reduced design matrix from the --reduced formula.
+/// The reduced model matrix of the LRT from the --reduced formula (default `~ 1`)
+/// R equivalent: nbinomLRT(): checkLRT(full, reduced), then
+/// model.matrix(reduced, colData) and df = ncol(full) - ncol(reduced) >= 1
 fn build_reduced_design(
     dds: &DESeqDataSet,
+    info: &rust_deseq2::glm::DesignInfo,
     reduced_formula: Option<&str>,
-    _covariates: &[String],
-    _continuous_vars: &[String],
 ) -> Result<ndarray::Array2<f64>> {
-    use ndarray::Array2;
-
-    let n_samples = dds.n_samples();
-    let metadata = dds.sample_metadata();
-
-    let formula = reduced_formula.unwrap_or("~1");
-    let formula_trimmed = formula.trim();
-
-    let formula_body = if formula_trimmed.starts_with('~') {
-        formula_trimmed[1..].trim()
-    } else {
-        formula_trimmed
-    };
-
-    if formula_body == "1" || formula_body.is_empty() {
-        info!("Reduced model: ~1 (intercept only)");
-        return Ok(Array2::from_elem((n_samples, 1), 1.0));
-    }
-
-    let variables: Vec<&str> = formula_body
-        .split('+')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if variables.is_empty() {
-        info!("Reduced model: ~1 (intercept only)");
-        return Ok(Array2::from_elem((n_samples, 1), 1.0));
-    }
-
-    info!("Reduced model: ~ {}", variables.join(" + "));
-
-    let mut n_cols = 1; // intercept
-    // None marks a continuous variable, which contributes its values as one column
-    let mut var_info: Vec<(&str, Option<Vec<String>>)> = Vec::new();
-
-    for &var in &variables {
-        if metadata.has_continuous(var) {
-            n_cols += 1;
-            var_info.push((var, None));
-            continue;
-        }
-        let levels = metadata.get_levels(var).map_err(|_| DeseqError::InvalidInput {
-            reason: format!(
-                "Variable '{}' in reduced formula not found in metadata",
-                var
-            ),
-        })?;
-        let non_ref_levels: Vec<String> = levels.into_iter().skip(1).collect();
-        n_cols += non_ref_levels.len();
-        var_info.push((var, Some(non_ref_levels)));
-    }
-
-    let mut design = Array2::zeros((n_samples, n_cols));
-    for i in 0..n_samples {
-        design[[i, 0]] = 1.0; // intercept
-
-        let mut col = 1;
-        for (var, non_ref_levels) in &var_info {
-            match non_ref_levels {
-                None => {
-                    design[[i, col]] = metadata.get_continuous_value(var, i)?;
-                    col += 1;
-                }
-                Some(levels) => {
-                    let sample_value = metadata.get_value(var, i)?;
-                    for level in levels {
-                        design[[i, col]] = if sample_value == *level { 1.0 } else { 0.0 };
-                        col += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(design)
+    let reduced = rust_deseq2::glm::Formula::parse(reduced_formula.unwrap_or("~1"))?;
+    info!("Reduced model: {}", reduced.display());
+    let full_columns = dds.design_matrix().map(|m| m.ncols()).unwrap_or(info.coef_names.len());
+    rust_deseq2::glm::reduced_design(&reduced, &info.design_vars, full_columns, dds.sample_metadata(), dds.reference_levels())
 }
 
 fn run_normalize(
@@ -1054,9 +1088,30 @@ fn run_normalize(
     Ok(())
 }
 
+/// The dataset of the vst and rlog commands: design ~ design, or a --formula
+fn transform_dataset(
+    counts: CountMatrix,
+    mut metadata: SampleMetadata,
+    design: Option<&str>,
+    formula: Option<&str>,
+    continuous_vars: &[String],
+) -> Result<DESeqDataSet> {
+    register_continuous(&mut metadata, continuous_vars)?;
+    match (formula, design) {
+        (Some(text), _) => formula_dataset(counts, metadata, text, continuous_vars, &[]),
+        (None, Some(design)) => {
+            info!("Creating DESeqDataSet with design: ~ {}", design);
+            DESeqDataSet::new(counts, metadata, design)
+        }
+        (None, None) => unreachable!("clap requires --design or --formula"),
+    }
+}
+
 fn run_vst(
     input: &InputArgs,
-    design: &str,
+    design: Option<&str>,
+    formula: Option<&str>,
+    continuous_vars: &[String],
     output_path: &str,
     method: &str,
     blind: bool,
@@ -1066,8 +1121,7 @@ fn run_vst(
 
     let (counts, metadata, avg_tx_length) = load_input(input)?;
 
-    info!("Creating DESeqDataSet with design: ~ {}", design);
-    let mut dds = DESeqDataSet::new(counts, metadata, design)?;
+    let mut dds = transform_dataset(counts, metadata, design, formula, continuous_vars)?;
 
     normalize_dataset(&mut dds, avg_tx_length, &input.tx, SizeFactorMethod::Ratio, "ratio")?;
 
@@ -1131,7 +1185,9 @@ fn run_vst(
 
 fn run_rlog(
     input: &InputArgs,
-    design: &str,
+    design: Option<&str>,
+    formula: Option<&str>,
+    continuous_vars: &[String],
     output_path: &str,
     blind: bool,
 ) -> Result<()> {
@@ -1146,8 +1202,7 @@ fn run_rlog(
         info!("Creating DESeqDataSet with blind design: ~1");
         DESeqDataSet::new(counts, blind_meta, "_blind_intercept")?
     } else {
-        info!("Creating DESeqDataSet with design: ~ {}", design);
-        DESeqDataSet::new(counts, metadata, design)?
+        transform_dataset(counts, metadata, design, formula, continuous_vars)?
     };
 
     normalize_dataset(&mut dds, avg_tx_length, &input.tx, SizeFactorMethod::Ratio, "ratio")?;

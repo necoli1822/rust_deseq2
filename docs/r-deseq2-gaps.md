@@ -11,7 +11,7 @@ R 쪽 목록은 `getNamespaceExports("DESeq2")`와 주요 함수의 `formals()`�
 | 구분 | 내용 |
 |---|---|
 | 구현되어 R과 일치 | 표준 DESeq2 파이프라인 전체(size factor 3종, dispersion 3종, Wald/LRT, Cook's 이상치 대체·필터, 독립 필터링, `lfcThreshold`, `useT`, 관측 가중치, normalizationFactors), 수축 3종, VST(전체·`nsub`), rlog, 입력(행렬, htseq-count, tximport 7종 + kallisto h5) |
-| 구현 안 된 분석 기능 | `betaPrior = TRUE`, `glmGamPoi`, 임의 설계식(상호작용 등), `results()`의 계수 이름·숫자 대비·다른 대립가설·다른 p 보정, 가중치 + normal/apeglm 수축 등 (2절) |
+| 구현 안 된 분석 기능 | `betaPrior = TRUE`, `glmGamPoi`, `results()`의 다른 대립가설·다른 p 보정, 가중치 + normal/apeglm 수축 등 (2절) |
 | CLI에서 고정되었거나 노출되지 않은 것 | VST/rlog의 size factor 방식, rlog의 추세 방식, `minmu`, `useCR`, `collapseReplicates`·`fpkm`·`fpm` 등 (3절) |
 | 없는 보조 함수 | 그림 5종(`plotPCA` 등), `normTransform`, `unmix`, `integrateWithSingleCell`, `makeExampleDESeqDataSet` 등 (5절) |
 | 구현됐지만 숫자가 미세하게 다른 곳 | poscounts·iterate size factor, 우도가 평평한 유전자, 수축 (6절). 모든 검증 시나리오에서 유의성·NA 판정 불일치는 0 |
@@ -34,8 +34,10 @@ R 쪽 목록은 `getNamespaceExports("DESeq2")`와 주요 함수의 `formals()`�
 
 | R 기능 | 상태 | 비고 |
 |---|---|---|
-| 임의 formula (`~ a + b + a:b`, `~ a * b`, `~ 0 + a` 등) | 미지원 | CLI는 `-d`(관심 변수 1개) + `--covariate`(범주, 여러 개) + `--continuous`(연속, 여러 개)의 주효과 합만 |
-| 상호작용 항 | 부분 | 라이브러리 builder와 설계 행렬 코드에는 있으나 CLI 미노출, R 대조 검증 안 됨 |
+| 임의 formula (`~ a + b + a:b`, `~ a * b`, `~ 0 + a` 등) | **구현됨** | `--formula`(`run`, `vst`, `rlog`), 라이브러리 `builder().formula()`. 연산자 `+ : * - / %in% ^`, 괄호, `0 +`/`- 1`. R `model.matrix()`의 열 순서·코딩(주효과가 없는 상호작용의 marginality 규칙 포함)과 DESeq2의 `resultsNames`를 따른다. 숫자 변수는 `--continuous`로 지정(R은 colData 열의 형으로 정함). `log(x)`, `I()` 등 함수는 미지원. `validation/gen12.R` 22개 시나리오 |
+| 상호작용 항 | **구현됨** | `--formula`로. 계수 이름은 R과 같은 `batchb2.conditionB`. builder의 `.interaction()`도 같은 경로를 쓴다(예전 이름 `f1_l1_x_f2_l2`와 dispersion에서 상호작용 열을 빼던 문제 수정). 상호작용이 있으면 normal 수축은 R처럼 오류 |
+| 절편 없는 설계 (`~ 0 + a`) | **구현됨** | 열 이름을 바꾸지 않음(`conditionA`), `--numerator`/`--denominator`는 R `cleanContrast()`의 규칙(`noInterceptPullCoef` 포함), 기본 대비는 R처럼 `c(마지막 변수, 마지막 수준, 첫 수준)` |
+| LRT 축소 모형 | **구현됨** | `--reduced`가 같은 파서를 쓰고 R `checkLRT()`(축소식 변수는 전체식에 있어야 함)와 자유도 검사. full rank가 아닌 축소 모형은 오류(R은 그대로 적합) |
 | `DESeqDataSetFromMatrix(ignoreRank = TRUE)` | 미지원 | 계수 행렬이 full rank가 아니면 오류 |
 
 ### `results()`

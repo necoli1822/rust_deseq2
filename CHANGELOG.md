@@ -12,6 +12,12 @@ RcppNumerical 0.7-0, R 4.5.3) on simulated data sets covering each code path. Ea
 names the R function it now follows.
 
 ### Fixed
+- The library builder's `.interaction()` named its columns `f1_l1_x_f2_l2` and estimated the
+  dispersions without the interaction columns; it now builds the design formula
+  `~ factors + continuous + main + f1:f2`, with R's model matrix and names.
+- Coefficient names now go through `make.names()` as R's do (levels with spaces or `-`), and
+  `--reduced` honours `--reference` and rejects variables that are not in the full design
+  (R: `checkLRT()`).
 - List contrasts (library `ContrastSpec::List`) added the weights of a coefficient listed twice;
   they are now assigned as in R, and R's checks (no coefficient on both sides, `listValues`
   positive and negative, numeric contrast not all zero) are applied.
@@ -90,6 +96,20 @@ names the R function it now follows.
   rejects them unless they are tximport counts (`--tximport`, `--avg-tx-length`).
 
 ### Added
+- Design formulas: `run --formula "<R formula>"` (and `vst`/`rlog --formula` for their
+  dispersions), `DESeqDataSetBuilder::formula()`, `glm::Formula`, `glm::formula_design()`. Terms
+  `a + b`, `a:b`, `a*b`, `a*b*c`, `(a + b)^2`, `a/b`, `a %in% b`, `-` and `0 +`/`- 1`; the model
+  matrix is R's `model.matrix()` (term order by degree, treatment contrasts, R's marginality rule
+  for a factor whose main effect is absent, first variable varying fastest) and the coefficient
+  names are DESeq2's (`Intercept`, `<f>_<level>_vs_<ref>`, `batchb2.conditionB`, no renaming
+  without an intercept). Variables are factors unless listed with `--continuous`. The model matrix
+  is used by every step: dispersions, GLM, Cook's distances and cells, outlier replacement and
+  refit, LRT, shrinkage. `--numerator`/`--denominator` follow `cleanContrast()` (including the
+  `<factor><level>` columns of designs without an intercept), the default contrast of a design
+  without intercept is R's `c(lastVar, last level, first level)`, `checkFullRank()` messages, and
+  `normal` shrinkage stops for interactions or no intercept as `lfcShrink()` does. `--reduced` uses
+  the same parser and R's `checkLRT()`/degrees-of-freedom checks. Checked against R with
+  `validation/gen12.R` (22 scenarios, including a three-way interaction and outlier replacement).
 - Contrast choices of R's `results()`: `--name <COEF>` (a coefficient by its `resultsNames` name,
   e.g. a continuous variable's slope or a covariate), `--contrast-var` (a `--numerator`/
   `--denominator` contrast of another factor), `--contrast-vector` (numeric contrast) and

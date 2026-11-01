@@ -13,7 +13,9 @@ A pure Rust implementation of the [DESeq2](https://bioconductor.org/packages/rel
 - **Three dispersion fit types**: parametric (Gamma GLM), local (LOESS), mean
 - **LFC shrinkage**: normal, apeglm, ashr methods
 - **Outlier handling**: Cook's distance detection and replacement
-- **Multi-factor designs**: batch correction with categorical and continuous covariates
+- **Multi-factor designs**: batch correction with categorical and continuous covariates, or any
+  R design formula (`--formula "~ genotype * treatment"`): interactions, designs without an
+  intercept, nested factors, with R's model matrix and `resultsNames`
 - **t-distribution p-values**: more conservative testing for small samples (`--use-t`)
 - **Transformations**: VST (Variance Stabilizing Transformation), rlog (Regularized Log)
 - **Normalization**: median-of-ratios, positive counts, iterative methods; gene- and
@@ -118,24 +120,42 @@ rust_deseq2 run -c counts.csv -m metadata.csv --norm-factors nf.csv \
 | `--avg-tx-length <FILE>` | tximport `txi$length`, a genes × samples matrix, for a `-c` matrix of `txi$counts`: counts are rounded and the lengths give normalization factors (implies `--tximport`) | — |
 | `--tximport` | The `-c` counts are tximport counts: round them (without lengths: `countsFromAbundance = "scaledTPM"`/`"lengthScaledTPM"`) | `false` |
 | `--norm-factors <FILE>` | Normalization factors, a genes × samples matrix in the count-matrix layout, used instead of size factors (R: `normalizationFactors(dds) <- nf`; `--sf-type` is then ignored) | — |
-| `-d, --design` | Design variable (column in metadata) | *required* |
-| `--covariate` | Categorical covariate for batch correction | — |
-| `--continuous` | Continuous covariate | — |
+| `-d, --design` | Design variable (column in metadata); the design is `~ covariates + continuous + design` | *required* unless `--formula` |
+| `--formula <FORMULA>` | R design formula instead of `-d`/`--covariate`, e.g. `"~ batch + condition + batch:condition"`, `"~ genotype * treatment"`, `"~ 0 + condition"` (see below) | — |
+| `--covariate` | Categorical covariate for batch correction (not with `--formula`) | — |
+| `--continuous` | Continuous covariate; with `--formula`, the formula variables that are numeric | — |
 | `--reference` | Reference level (format: factor=level) | alphabetical |
 | `--test` | Statistical test: `wald` or `lrt` | `wald` |
 | `--numerator` | Numerator level of the contrast, a level of `--design` or `--contrast-var` (R: `contrast = c(factor, num, den)`) | — |
 | `--denominator` | Denominator level of the contrast | — |
-| `--contrast-var <FACTOR>` | Factor of `--numerator`/`--denominator`, e.g. a `--covariate` | `--design` |
+| `--contrast-var <FACTOR>` | Factor of `--numerator`/`--denominator`, e.g. a `--covariate` (required with `--formula`) | `--design` |
 | `--name <COEF>` | Report one coefficient by its `resultsNames` name, e.g. a continuous variable's slope (R: `results(name = )`); the names are logged | — |
 | `--contrast-vector <W1,W2,...>` | Numeric contrast, one weight per coefficient (R: `contrast = c(0, 1, -1)`) | — |
 | `--contrast-list <NUM;DEN>` | List contrast of coefficient names, `,` within and `;` between the two sides (R: `contrast = list(...)`) | — |
 | `--list-values <POS,NEG>` | Weights of the list contrast's two sides (R: `listValues`) | `1,-1` |
 
-Without a contrast option the Wald test reports the last coefficient, as R's `results(dds)` does.
+Without a contrast option the Wald test reports the last coefficient, as R's `results(dds)` does;
+for a `--formula` without intercept and without interactions whose last variable is a factor it
+reports that factor's last level against its first, as R does (`c(lastVar, levels[n], levels[1])`).
 With `--test lrt` a contrast option chooses only the reported `log2FoldChange`/`lfcSE`; normal and
 apeglm shrinkage shrink the coefficient the contrast names (a single coefficient, as
-`lfcShrink(coef = )`).
-| `--reduced` | Reduced model formula for LRT (e.g., `~1`) | — |
+`lfcShrink(coef = )`). As in R, `normal` shrinkage is an error for designs with interactions or
+without an intercept (use `apeglm` or `ashr`).
+
+`--formula` takes the operators of R formulas: `+`, `:`, `*` (`a*b` = `a + b + a:b`), `-`, `/`,
+`%in%`, `^` (`(a + b + c)^2`), parentheses, and `0 +` / `+ 0` / `- 1` for no intercept. Variables
+are factors with treatment contrasts (levels sorted as R sorts them; `--reference` sets the
+reference level) unless listed with `--continuous` — R makes numeric metadata columns numeric, here
+`--continuous` says which ones are. The model matrix is R's `model.matrix()`: terms ordered by
+degree, factor columns coded by contrasts or by all levels by R's marginality rule (e.g.
+`~ condition + condition:batch` gives `conditionA.batchb2`, `conditionB.batchb2`, ...), interaction
+columns with the first factor varying fastest. Coefficient names are DESeq2's `resultsNames`:
+`Intercept`, `<factor>_<level>_vs_<reference>` for main effects and `make.names()` of the model
+matrix column otherwise (`batchb2.conditionB`, `x.conditionB`); without an intercept columns keep
+their model matrix names (`conditionA`, `conditionB`), and `--numerator`/`--denominator` use them
+as R's `results()` does. A model matrix that is not full rank is an error, with R's
+`checkFullRank()` messages.
+| `--reduced` | Reduced model formula for LRT (e.g., `~1`, `"~ genotype + treatment"`), in the `--formula` syntax; its variables must be in the full design and it must have fewer columns (R: `checkLRT()`) | `~1` |
 | `--fit-type` | Dispersion fit: `parametric`, `local`, `mean` | `parametric` |
 | `--use-t` | Use t-distribution for Wald test p-values | `false` |
 | `--shrinkage` | Apply LFC shrinkage | `false` |
@@ -173,7 +193,8 @@ in R's `DESeqDataSetFromMatrix()`, unless `--tximport` or `--avg-tx-length` is g
 |--------|-------------|---------|
 | `-c, --counts` | Count matrix CSV/TSV file | *required* |
 | `-m, --metadata` | Sample metadata CSV file | *required* |
-| `-d, --design` | Design variable | *required* |
+| `-d, --design` | Design variable | *required* unless `--formula` |
+| `--formula <FORMULA>`, `--continuous <VAR>` | Design formula for the dispersions (without `--blind`), as in `run` | — |
 | `-o, --output` | Output file path | `vst_transformed.tsv` |
 | `--method` | Dispersion fitType: `parametric`, `mean`, `local` | `parametric` |
 | `--blind` | Blind to experimental design | `false` |
@@ -189,7 +210,8 @@ R's default is `blind = TRUE` for both, while this subcommand needs `--blind`.
 |--------|-------------|---------|
 | `-c, --counts` | Count matrix CSV/TSV file | *required* |
 | `-m, --metadata` | Sample metadata CSV file | *required* |
-| `-d, --design` | Design variable | *required* |
+| `-d, --design` | Design variable | *required* unless `--formula` |
+| `--formula <FORMULA>`, `--continuous <VAR>` | Design formula for the dispersions (without `--blind`), as in `run` | — |
 | `-o, --output` | Output file path | `rlog_transformed.tsv` |
 | `--blind` | Blind to experimental design | `false` |
 
@@ -353,6 +375,7 @@ release 0.1.0; "sig." counts genes called significant (padj < 0.1) by only one o
 | `--sf-type iterate`, 30% zeros | different algorithm | 8e-5 | 0 |
 | `--weights` (4 vs 4, `--use-t`, `~batch + condition`) | not supported | 5e-7 | 0 |
 | Contrasts on `~batch + age + condition`: `--name` (slope, covariate), `--contrast-var`, numeric, list (with `listValues`), default, `--use-t`, `--lfc-threshold`, LRT, normal/apeglm of a chosen coefficient | `--numerator`/`--denominator` of `-d` only | 5e-7 (numeric/list 1.2e-6, apeglm 2.7e-6) | 0 |
+| `--formula`: `~batch + condition + batch:condition` (default, interaction `--name`, main-effect contrast, LRT `~batch + condition`, apeglm, VST and rlog not blind), `~condition + condition:batch`, `~genotype * treatment` 7 per cell with outlier replacement (list contrast main + interaction, genotype contrast, LRT), `~x + condition + x:condition` (`--continuous x`), `~0 + condition`, `~0 + batch + condition` (default and `--numerator`/`--denominator` on either factor), `~batch * condition * genotype` (Wald, LRT `~(batch + condition + genotype)^2`) | not supported | 5e-7 (apeglm 3.8e-6) | 0 |
 | `--htseq` input (`~batch + condition`, VST, normalize) | not supported | 5e-7 | 0 |
 | `--quant` salmon input (tximport, Wald, VST `parametric` / `local` / `--nsub`, rlog, normalize) | not supported | 5e-7 | 0 |
 | `--quant-type` `rsem` (isoforms, genes) / `stringtie` / `oarfish` | not supported | 5e-7 / 6e-7 / 1.3e-6 / 5e-7 | 0 |
@@ -413,7 +436,11 @@ the same case (one gene, dispersion 8.9; the imported txi is again identical to 
 
 - Shrinkage with `--weights`: `normal` and `apeglm` stop with an error (weighted `lfcShrink` is
   not ported); `ashr` is allowed. VST and rlog do not take weights.
-- `betaPrior = TRUE`, expanded model matrices and interaction terms in the CLI are not supported.
+- `betaPrior = TRUE` and expanded model matrices are not supported.
+- `--formula`: variables and formula operators only — no functions (`log(x)`, `I(x^2)`,
+  `factor(x)`, `offset()`), no `.`; numeric variables are those given with `--continuous` rather than
+  those stored as numbers. A reduced LRT model that is not full rank is an error (R fits it from a
+  different starting point).
 - tximport: alevin and custom importer columns are not read directly (use
   `-c --avg-tx-length`); files are read
   with `countsFromAbundance = "no"`; inferential replicates are not read (they do not change the
@@ -446,6 +473,7 @@ Key equivalences between R DESeq2 and RustDESeq2:
 | `nbinomLRT()` | `likelihood_ratio_test()` | LRT |
 | `results()` | `results()` / `results_extended()` | Extract results (BH adjustment only; Cook's and independent filtering are applied by the CLI, or via `filter_by_cooks_with_counts` / `independent_filtering`) |
 | `resultsNames()` | `results_names()` | Coefficient names |
+| `DESeqDataSetFromMatrix(design = ~ ...)`, `model.matrix()` | `DESeqDataSet::builder().formula()`, `glm::Formula`, `glm::formula_design()` / CLI `--formula` | Design formulas, model matrix and coefficient names |
 | `lfcShrink(type="normal")` | `shrink_lfc_normal()` | Normal shrinkage |
 | `lfcShrink(type="apeglm")` | `shrink_lfc_apeglm()` | Apeglm shrinkage |
 | `lfcShrink(type="ashr")` | `apply_ashr_shrinkage()` | Ashr shrinkage |

@@ -105,3 +105,35 @@ run name_lfcthr $C --name batch_b2_vs_b1 --lfc-threshold 0.5
 run lrt_list $C --test lrt --reduced "~batch + age" --contrast-list "condition_C_vs_A;condition_B_vs_A"
 run shrink_normal_batch $C --name batch_b2_vs_b1 --shrinkage --shrinkage-method normal
 run shrink_apeglm_age $C --name age --shrinkage --shrinkage-method apeglm
+# gen12.R: design formulas (--formula)
+if [ -d "$D/inter_default" ]; then
+  F="--formula ~batch+condition+batch:condition"
+  run inter_default $F
+  run inter_name $F --name batchb2.conditionB
+  run inter_cvar $F --contrast-var condition --numerator C --denominator B
+  run inter_lrt $F --test lrt --reduced "~ batch + condition"
+  run inter_apeglm $F --name batchb2.conditionB --shrinkage --shrinkage-method apeglm
+  ID=$D/inter_default
+  "$B" vst -c $ID/counts.csv -m $ID/metadata.csv $F -o $ID/rust_vst_$T.tsv > /dev/null 2>&1 || echo "inter vst: FAILED"
+  "$B" rlog -c $ID/counts.csv -m $ID/metadata.csv $F -o $ID/rust_rlog_$T.tsv > /dev/null 2>&1 || echo "inter rlog: FAILED"
+  run nested_name --formula "~ condition + condition:batch" --name conditionB.batchb2
+  G="--formula ~genotype*treatment --reference genotype=WT"
+  run gt_default $G
+  run gt_list $G --contrast-list "treatment_trt_vs_ctrl,genotypeKO.treatmenttrt"
+  run gt_cvar_genotype $G --contrast-var genotype --numerator KO --denominator WT
+  run gt_lrt $G --test lrt --reduced "~ genotype + treatment"
+  X="--formula ~x+condition+x:condition --continuous x"
+  run fxc_name $X --name x.conditionB
+  run fxc_slope $X --name x
+  run fxc_list $X --contrast-list "x,x.conditionB"
+  run noint_default --formula "~ 0 + condition"
+  run noint_BvsA --formula "~ 0 + condition" --contrast-var condition --numerator B --denominator A
+  run noint_name --formula "~ 0 + condition" --name conditionB
+  N="--formula ~0+batch+condition"
+  run noint2_default $N
+  run noint2_CvsB $N --contrast-var condition --numerator C --denominator B
+  run noint2_AvsC $N --contrast-var condition --numerator A --denominator C
+  run noint2_batch $N --contrast-var batch --numerator b2 --denominator b1
+  run threeway_default --formula "~ batch * condition * genotype"
+  run threeway_lrt --formula "~ batch * condition * genotype" --test lrt --reduced "~ (batch + condition + genotype)^2"
+fi

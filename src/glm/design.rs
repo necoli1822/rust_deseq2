@@ -3,6 +3,7 @@
 use ndarray::Array2;
 use std::collections::HashMap;
 
+use super::formula::make_names;
 use crate::data::{DESeqDataSet, SampleMetadata};
 use crate::error::{DeseqError, Result};
 
@@ -26,6 +27,12 @@ pub struct DesignInfo {
     pub continuous_columns: HashMap<String, usize>,
     /// Interaction to column indices mapping
     pub interaction_columns: HashMap<(String, String), Vec<usize>>,
+    /// Whether the design has an intercept (R: attr(terms(design), "intercept") == 1)
+    pub has_intercept: bool,
+    /// Variables of the design formula in order (R: all.vars(design(object)))
+    pub design_vars: Vec<String>,
+    /// Whether the design has interaction terms (R: any(attr(terms, "order") > 1))
+    pub interaction_present: bool,
 }
 
 /// Create a design matrix from sample metadata
@@ -72,6 +79,9 @@ pub fn create_design_matrix(
             factor_columns: HashMap::new(),
             continuous_columns: HashMap::new(),
             interaction_columns: HashMap::new(),
+            has_intercept: true,
+            design_vars: vec![design_variable.to_string()],
+            interaction_present: false,
         };
         return Ok((design, info));
     }
@@ -103,7 +113,7 @@ pub fn create_design_matrix(
     let mut col_indices = Vec::new();
 
     for (j, level) in levels.iter().enumerate().skip(1) {
-        coef_names.push(format!("{}_{}_vs_{}", design_variable, level, reference_level));
+        coef_names.push(make_names(&format!("{}_{}_vs_{}", design_variable, level, reference_level)));
         col_indices.push(j);
     }
     factor_columns.insert(design_variable.to_string(), col_indices);
@@ -117,20 +127,25 @@ pub fn create_design_matrix(
         factor_columns,
         continuous_columns: HashMap::new(),
         interaction_columns: HashMap::new(),
+        has_intercept: true,
+        design_vars: vec![design_variable.to_string()],
+        interaction_present: false,
     };
 
     check_full_rank(&design)?;
     Ok((design, info))
 }
 
-/// Create an extended design matrix supporting multiple factors, continuous covariates, and interactions
+/// Create an extended design matrix for `~ covariates + continuous + design_variable`
 /// R equivalent: getModelMatrix() in core.R
+///
+/// Datasets with interactions or a formula carry their model matrix from
+/// [`crate::glm::formula_design`] instead (see `DESeqDataSet::formula_design_info`).
 pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>, DesignInfo)> {
     let metadata = dds.sample_metadata();
     let n_samples = dds.n_samples();
     let factors = dds.factors();
     let continuous = dds.continuous_vars();
-    let interactions = dds.interactions();
     let ref_levels = dds.reference_levels();
 
     // Calculate total number of columns
@@ -138,7 +153,6 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
     let mut coef_names = vec!["Intercept".to_string()];
     let mut factor_columns: HashMap<String, Vec<usize>> = HashMap::new();
     let mut continuous_columns: HashMap<String, usize> = HashMap::new();
-    let mut interaction_columns: HashMap<(String, String), Vec<usize>> = HashMap::new();
     let mut factor_levels: HashMap<String, Vec<String>> = HashMap::new();
 
     // Store reference levels for naming
@@ -166,8 +180,8 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
 
         let mut col_indices = Vec::new();
         for level in &non_ref_levels {
-            // Use DESeq2-style naming: factor_level_vs_reference
-            coef_names.push(format!("{}_{}_vs_{}", factor, level, ref_level));
+            // DESeq2 naming (renameModelMatrixColumns): factor_level_vs_reference
+            coef_names.push(make_names(&format!("{}_{}_vs_{}", factor, level, ref_level)));
             col_indices.push(n_cols);
             n_cols += 1;
         }
@@ -179,7 +193,7 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
     // the formula ~ covariates + continuous + design. The last column is what an
     // LRT reports as log2FoldChange (R: lastCoefName), so this order matters.
     for cont in continuous {
-        coef_names.push(cont.clone());
+        coef_names.push(make_names(cont));
         continuous_columns.insert(cont.clone(), n_cols);
         n_cols += 1;
     }
@@ -202,28 +216,12 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
 
         let mut col_indices = Vec::new();
         for level in &non_ref_levels {
-            coef_names.push(format!("{}_{}_vs_{}", main_var, level, ref_level));
+            coef_names.push(make_names(&format!("{}_{}_vs_{}", main_var, level, ref_level)));
             col_indices.push(n_cols);
             n_cols += 1;
         }
         factor_columns.insert(main_var.to_string(), col_indices);
         factor_levels.insert(main_var.to_string(), non_ref_levels);
-    }
-
-    // Process interactions
-    for (f1, f2) in interactions {
-        let levels1 = factor_levels.get(f1).cloned().unwrap_or_default();
-        let levels2 = factor_levels.get(f2).cloned().unwrap_or_default();
-
-        let mut col_indices = Vec::new();
-        for l1 in &levels1 {
-            for l2 in &levels2 {
-                coef_names.push(format!("{}_{}_x_{}_{}", f1, l1, f2, l2));
-                col_indices.push(n_cols);
-                n_cols += 1;
-            }
-        }
-        interaction_columns.insert((f1.clone(), f2.clone()), col_indices);
     }
 
     // Build the design matrix
@@ -263,22 +261,6 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
                 col += 1;
             }
         }
-
-        // Interaction columns
-        for (f1, f2) in interactions {
-            let val1 = metadata.get_value(f1, i)?;
-            let val2 = metadata.get_value(f2, i)?;
-            let levels1 = factor_levels.get(f1).unwrap();
-            let levels2 = factor_levels.get(f2).unwrap();
-
-            for l1 in levels1 {
-                for l2 in levels2 {
-                    let val = if val1 == *l1 && val2 == *l2 { 1.0 } else { 0.0 };
-                    design[[i, col]] = val;
-                    col += 1;
-                }
-            }
-        }
     }
 
     // Get reference level for main design variable (already computed above)
@@ -296,7 +278,11 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
         levels: main_levels,
         factor_columns,
         continuous_columns,
-        interaction_columns,
+        interaction_columns: HashMap::new(),
+        has_intercept: true,
+        // R: all.vars(~ covariates + continuous + design_variable)
+        design_vars: factors.iter().chain(continuous).cloned().chain(std::iter::once(main_var.to_string())).collect(),
+        interaction_present: false,
     };
 
     check_full_rank(&design)?;
@@ -304,14 +290,19 @@ pub fn create_extended_design_matrix(dds: &DESeqDataSet) -> Result<(Array2<f64>,
 }
 
 /// Build the coefficient-space contrast vector for `variable`: numerator vs denominator
-/// R equivalent: getContrast() / cleanContrast() in results.R for a character contrast
+/// R equivalent: cleanContrast() in results.R for a character contrast
 ///
-/// Coefficients are matched by their exact name `{variable}_{level}_vs_{reference}`.
-/// The reference level has no column, so:
-/// - denominator is the reference: `+1` on the numerator column
-/// - numerator is the reference: `-1` on the denominator column
-/// - neither is the reference: `+1` on the numerator and `-1` on the denominator column,
-///   whose standard error then requires the full coefficient covariance (as in R).
+/// With an intercept, the coefficients are `<variable>_<level>_vs_<reference>`; the
+/// reference level has no coefficient, so:
+/// - denominator is the reference: `+1` on the numerator coefficient
+/// - numerator is the reference: `-1` on the denominator coefficient
+/// - neither is the reference: `+1` and `-1`, whose standard error then requires the
+///   full coefficient covariance (as in R).
+///
+/// Without an intercept the columns are `<variable><level>` (R does not rename them):
+/// both levels' columns for the first variable of the design (`+1`/`-1`), and, for a
+/// later variable, the single non-reference column when one of the levels is the
+/// reference (R: noInterceptPullCoef).
 pub fn contrast_vector(
     info: &DesignInfo,
     variable: &str,
@@ -320,37 +311,83 @@ pub fn contrast_vector(
 ) -> Result<Vec<f64>> {
     if numerator == denominator {
         return Err(DeseqError::InvalidContrast {
-            reason: format!("Numerator and denominator are the same level '{}'", numerator),
+            reason: format!("{} and {} should be different level names", numerator, denominator),
         });
     }
-    let reference = info.reference_levels.get(variable).ok_or_else(|| DeseqError::InvalidContrast {
+    let base = info.reference_levels.get(variable).ok_or_else(|| DeseqError::InvalidContrast {
         reason: format!(
-            "Variable '{}' is not a factor in the design (factors: {:?})",
+            "{} should be the name of a factor in the design (factors: {:?})",
             variable,
             info.reference_levels.keys().collect::<Vec<_>>()
         ),
     })?;
+    let names = &info.coef_names;
+    let position = |name: &str| names.iter().position(|n| n == name);
+    let first_var = info.design_vars.first().is_some_and(|v| v == variable);
+    let pull_coef = !info.has_intercept && !first_var && (base == numerator || base == denominator);
 
-    let column = |level: &str| -> Result<Option<usize>> {
-        if level == reference {
-            return Ok(None);
+    let mut contrast = vec![0.0; names.len()];
+    if info.has_intercept || pull_coef {
+        let coef = |level: &str, reference: &str| {
+            if pull_coef {
+                make_names(&format!("{}{}", variable, level))
+            } else {
+                make_names(&format!("{}_{}_vs_{}", variable, level, reference))
+            }
+        };
+        if denominator == base {
+            let name = coef(numerator, denominator);
+            let j = position(&name).ok_or_else(|| DeseqError::InvalidContrast {
+                reason: format!(
+                    "as {} is the reference level, was expecting {} to be present in 'resultsNames(object)'",
+                    denominator, name
+                ),
+            })?;
+            contrast[j] = 1.0;
+        } else if numerator == base {
+            let name = coef(denominator, numerator);
+            let j = position(&name).ok_or_else(|| DeseqError::InvalidContrast {
+                reason: format!(
+                    "as {} is the reference level, was expecting {} to be present in 'resultsNames(object)'",
+                    numerator, name
+                ),
+            })?;
+            contrast[j] = -1.0;
+        } else {
+            let num = make_names(&format!("{}_{}_vs_{}", variable, numerator, base));
+            let den = make_names(&format!("{}_{}_vs_{}", variable, denominator, base));
+            match (position(&num), position(&den)) {
+                (Some(i), Some(j)) => {
+                    contrast[i] = 1.0;
+                    contrast[j] = -1.0;
+                }
+                _ => {
+                    return Err(DeseqError::InvalidContrast {
+                        reason: format!(
+                            "{} and {} should be levels of {} such that {} and {} are contained in 'resultsNames(object)'",
+                            numerator, denominator, variable, num, den
+                        ),
+                    });
+                }
+            }
         }
-        let name = format!("{}_{}_vs_{}", variable, level, reference);
-        info.coef_names
-            .iter()
-            .position(|n| *n == name)
-            .map(Some)
-            .ok_or_else(|| DeseqError::InvalidContrast {
-                reason: format!("Level '{}' not found for variable '{}'", level, variable),
-            })
-    };
-
-    let mut contrast = vec![0.0; info.coef_names.len()];
-    if let Some(i) = column(numerator)? {
-        contrast[i] += 1.0;
-    }
-    if let Some(j) = column(denominator)? {
-        contrast[j] -= 1.0;
+    } else {
+        let num = make_names(&format!("{}{}", variable, numerator));
+        let den = make_names(&format!("{}{}", variable, denominator));
+        match (position(&num), position(&den)) {
+            (Some(i), Some(j)) => {
+                contrast[i] = 1.0;
+                contrast[j] = -1.0;
+            }
+            _ => {
+                return Err(DeseqError::InvalidContrast {
+                    reason: format!(
+                        "{}{} and {}{} are expected to be in resultsNames(object)",
+                        variable, numerator, variable, denominator
+                    ),
+                });
+            }
+        }
     }
     Ok(contrast)
 }
@@ -433,7 +470,7 @@ pub fn check_full_rank(matrix: &Array2<f64>) -> Result<()> {
 ///
 /// Returns the number of diagonal elements of R whose absolute value exceeds
 /// `max(nrow, ncol) * f64::EPSILON * max(|diag(R)|)`.
-fn qr_rank(matrix: &Array2<f64>) -> usize {
+pub(crate) fn qr_rank(matrix: &Array2<f64>) -> usize {
     let nrow = matrix.nrows();
     let ncol = matrix.ncols();
     let k = nrow.min(ncol);

@@ -92,6 +92,9 @@ pub struct DESeqDataSet {
     /// Deviance for each gene: -2 * log_likelihood
     /// Used for downstream analysis (matches R's mcols(object)$deviance)
     deviance: Option<Array1<f64>>,
+    /// Design of a model formula (R: design(dds) <- ~ ...), whose model matrix is
+    /// `design_matrix`; `None` for `~ covariates + continuous + design_variable`
+    formula_design: Option<crate::glm::DesignInfo>,
 }
 
 impl DESeqDataSet {
@@ -164,6 +167,7 @@ impl DESeqDataSet {
             converged: None,
             design_column_names: None,
             deviance: None,
+            formula_design: None,
         })
     }
 
@@ -610,6 +614,25 @@ impl DESeqDataSet {
 
     pub fn set_dispersion_function(&mut self, asympt_disp: f64, extra_pois: f64) {
         self.dispersion_function = Some((asympt_disp, extra_pois));
+    }
+
+    /// Use the model matrix of a design formula for every fit
+    /// R equivalent: design(dds) <- formula; the model matrix is model.matrix(design, colData)
+    pub fn set_formula_design(&mut self, matrix: Array2<f64>, info: crate::glm::DesignInfo) -> Result<()> {
+        if matrix.ncols() != info.coef_names.len() {
+            return Err(DeseqError::DimensionMismatch {
+                expected: format!("{} design matrix columns", info.coef_names.len()),
+                got: format!("{}", matrix.ncols()),
+            });
+        }
+        self.set_design_matrix(matrix)?;
+        self.formula_design = Some(info);
+        Ok(())
+    }
+
+    /// The design of a formula set with [`Self::set_formula_design`]
+    pub fn formula_design_info(&self) -> Option<&crate::glm::DesignInfo> {
+        self.formula_design.as_ref()
     }
 
     pub fn set_design_matrix(&mut self, matrix: Array2<f64>) -> Result<()> {

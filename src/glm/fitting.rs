@@ -70,9 +70,15 @@ pub fn fit_glm(dds: &mut DESeqDataSet, params: &GlmFitParams) -> Result<DesignIn
         });
     }
 
-    // Create design matrix - use extended design if multi-factor model or custom reference levels
+    // Create design matrix - the model matrix of a design formula, or the extended
+    // design if multi-factor model or custom reference levels
     let has_custom_ref = !dds.reference_levels().is_empty();
-    let (design, info) = if dds.has_batch_effect() || dds.has_interactions() || dds.has_continuous() || has_custom_ref {
+    let (design, info) = if let Some(info) = dds.formula_design_info() {
+        let design = dds.design_matrix().cloned().ok_or_else(|| DeseqError::InvalidDesignMatrix {
+            reason: "the design formula has no model matrix".to_string(),
+        })?;
+        (design, info.clone())
+    } else if dds.has_batch_effect() || dds.has_continuous() || has_custom_ref {
         // Use extended design matrix for complex models or when reference levels are specified
         super::design::create_extended_design_matrix(dds)?
     } else {

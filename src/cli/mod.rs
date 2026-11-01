@@ -40,6 +40,14 @@ Examples:
   rust_deseq2 run -c counts.csv -m metadata.csv -d treatment \\
     --covariate batch --numerator drug --denominator placebo
 
+  # Any R design formula, e.g. an interaction (its coefficient by --name)
+  rust_deseq2 run -c counts.csv -m metadata.csv --formula \"~ genotype * treatment\" \\
+    --name genotypeKO.treatmenttrt
+
+  # LRT of the interaction
+  rust_deseq2 run -c counts.csv -m metadata.csv --formula \"~ genotype * treatment\" \\
+    --test lrt --reduced \"~ genotype + treatment\"
+
   # Likelihood Ratio Test
   rust_deseq2 run -c counts.csv -m metadata.csv -d treatment \\
     --test lrt --reduced \"~1\" -o lrt_results.csv
@@ -61,14 +69,31 @@ Examples:
         input: InputArgs,
 
         /// Design variable (variable of interest)
-        #[arg(short, long,
+        #[arg(short, long, required_unless_present = "formula", conflicts_with = "formula",
             long_help = "Main design variable for differential expression.\n\
-                Must match a column name in the metadata file.\n\
-                The reference level is chosen alphabetically (override with --reference).")]
-        design: String,
+                Must match a column name in the metadata file. The design is\n\
+                ~ <--covariate ...> + <--continuous ...> + <design>.\n\
+                The reference level is chosen alphabetically (override with --reference).\n\
+                Not used with --formula.")]
+        design: Option<String>,
+
+        /// R design formula, e.g. "~ batch + condition + batch:condition"
+        #[arg(long, value_name = "FORMULA",
+            long_help = "The design as an R formula (R: DESeqDataSetFromMatrix(design = ...)), instead of\n\
+                -d/--covariate: terms a + b, interactions a:b, a*b (= a + b + a:b), a*b*c,\n\
+                (a + b + c)^2, a/b, a %in% b, and 0 + / - 1 for no intercept. Variables are\n\
+                factors (treatment contrasts, levels sorted, --reference to change the\n\
+                reference) unless listed with --continuous; R makes numeric metadata\n\
+                columns numeric, here --continuous says which are. The model matrix,\n\
+                its column order and resultsNames follow R's model.matrix() and DESeq2:\n\
+                \"Intercept\", \"<factor>_<level>_vs_<ref>\", interaction columns as\n\
+                \"batchb2.conditionB\" (no renaming without an intercept: \"conditionB\").\n\
+                --numerator/--denominator then need --contrast-var.\n\
+                Example: --formula \"~ genotype * treatment\"")]
+        formula: Option<String>,
 
         /// Additional categorical covariate
-        #[arg(long, value_name = "VAR",
+        #[arg(long, value_name = "VAR", conflicts_with = "formula",
             long_help = "Additional categorical covariates for batch effect correction.\n\
                 Can be specified multiple times: --covariate batch --covariate experiment")]
         covariate: Vec<String>,
@@ -76,7 +101,9 @@ Examples:
         /// Continuous covariate
         #[arg(long, value_name = "VAR",
             long_help = "Continuous covariates.\n\
-                Can be specified multiple times: --continuous age --continuous weight")]
+                Can be specified multiple times: --continuous age --continuous weight\n\
+                With --formula: the formula variables that are numeric (all others are factors).\n\
+                Centre and scale them, as R recommends.")]
         continuous: Vec<String>,
 
         /// Reference level (format: factor=level)
@@ -97,14 +124,16 @@ Examples:
 
         /// Reduced model formula for LRT
         #[arg(long,
-            long_help = "Reduced model formula for LRT.\n\
-                Examples: \"~1\" (intercept only), \"~batch\" (keep batch, test treatment)")]
+            long_help = "Reduced model formula for LRT, in the syntax of --formula; its variables must\n\
+                be in the full design and it must have fewer columns (R: checkLRT()).\n\
+                Examples: \"~1\" (intercept only), \"~batch\" (keep batch, test treatment),\n\
+                \"~ genotype + treatment\" (test the genotype:treatment interaction)")]
         reduced: Option<String>,
 
         /// Numerator level for contrast
         #[arg(long, requires = "denominator",
             long_help = "Numerator level of the contrast (the \"treatment\" or \"case\" condition),\n\
-                a level of --design or of --contrast-var.\n\
+                a level of --design or of --contrast-var (needed with --formula).\n\
                 R equivalent: results(dds, contrast = c(factor, numerator, denominator))")]
         numerator: Option<String>,
 
@@ -309,8 +338,16 @@ Examples:
         input: InputArgs,
 
         /// Design variable
-        #[arg(short, long)]
-        design: String,
+        #[arg(short, long, required_unless_present = "formula", conflicts_with = "formula")]
+        design: Option<String>,
+
+        /// R design formula used for the dispersions unless --blind (see `run --formula`)
+        #[arg(long, value_name = "FORMULA")]
+        formula: Option<String>,
+
+        /// Numeric variables of --formula
+        #[arg(long, value_name = "VAR", requires = "formula")]
+        continuous: Vec<String>,
 
         /// Output file path [default: vst_transformed.tsv]
         #[arg(short, long, default_value = "vst_transformed.tsv")]
@@ -354,8 +391,16 @@ Examples:
         input: InputArgs,
 
         /// Design variable
-        #[arg(short, long)]
-        design: String,
+        #[arg(short, long, required_unless_present = "formula", conflicts_with = "formula")]
+        design: Option<String>,
+
+        /// R design formula used for the dispersions unless --blind (see `run --formula`)
+        #[arg(long, value_name = "FORMULA")]
+        formula: Option<String>,
+
+        /// Numeric variables of --formula
+        #[arg(long, value_name = "VAR", requires = "formula")]
+        continuous: Vec<String>,
 
         /// Output file path [default: rlog_transformed.tsv]
         #[arg(short, long, default_value = "rlog_transformed.tsv")]
@@ -492,7 +537,7 @@ pub struct ContrastArgs {
     /// Factor of the --numerator/--denominator contrast [default: --design]
     #[arg(long, value_name = "FACTOR", requires = "numerator",
         long_help = "Factor whose levels --numerator and --denominator name, e.g. a --covariate\n\
-            (default: the --design variable).\n\
+            (default: the --design variable; required with --formula).\n\
             R equivalent: results(dds, contrast = c(\"batch\", \"b2\", \"b1\"))")]
     pub contrast_var: Option<String>,
 
@@ -500,8 +545,9 @@ pub struct ContrastArgs {
     #[arg(long, value_name = "COEF",
         conflicts_with_all = ["numerator", "contrast_vector", "contrast_list"],
         long_help = "Report the coefficient with this name, as listed by resultsNames(dds):\n\
-            \"Intercept\", a continuous variable's name (its slope), or\n\
-            \"<factor>_<level>_vs_<reference>\". The names are logged at the start of the run.\n\
+            \"Intercept\", a continuous variable's name (its slope),\n\
+            \"<factor>_<level>_vs_<reference>\", or with --formula an interaction such as\n\
+            \"genotypeKO.treatmenttrt\". The names are logged at the start of the run.\n\
             R equivalent: results(dds, name = COEF)")]
     pub name: Option<String>,
 
