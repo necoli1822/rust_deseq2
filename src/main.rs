@@ -202,7 +202,7 @@ fn print_long_help() {
     println!("               - Multi-factor designs with covariates, or any R design formula");
     println!("               - Dispersion fit types: parametric, local, mean");
     println!("               - t-distribution p-values for small sample sizes");
-    println!("  normalize  Normalize count data using median-of-ratios method");
+    println!("  normalize  Normalize count data (size factors or normalization factors)");
     println!("  vst        Variance Stabilizing Transformation");
     println!("  rlog       Regularized Log Transformation");
     println!();
@@ -568,6 +568,12 @@ fn run_analysis(
 
         builder.build()?
     };
+
+    // Shrinkage is only run after the Wald test (see below); say so instead of
+    // silently writing unshrunken LFCs.
+    if shrinkage && test_type != "wald" {
+        log::warn!("--shrinkage is only applied with --test wald; the LRT results are written without shrinkage");
+    }
 
     // Observation weights (R: assays(dds)[["weights"]])
     if let Some(path) = weights_path {

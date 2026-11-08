@@ -73,7 +73,8 @@ Examples:
             long_help = "Main design variable for differential expression.\n\
                 Must match a column name in the metadata file. The design is\n\
                 ~ <--covariate ...> + <--continuous ...> + <design>.\n\
-                The reference level is chosen alphabetically (override with --reference).\n\
+                The reference level is the first level in R's sort order (ICU collation,\n\
+                so \"abaI\" comes before \"WT\"); override with --reference.\n\
                 Not used with --formula.")]
         design: Option<String>,
 
@@ -118,7 +119,8 @@ Examples:
         #[arg(long, value_name = "FACTOR=LEVEL",
             long_help = "Reference level for a factor.\n\
                 Format: factor=level (e.g., --reference condition=control)\n\
-                Without this, the alphabetically first level is used as reference.")]
+                Without this, the first level in R's sort order is the reference (ICU\n\
+                collation, as R's factor() sorts: \"abaI\" comes before \"WT\").")]
         reference: Vec<String>,
 
         /// Statistical test [default: wald]
@@ -154,7 +156,10 @@ Examples:
         contrast: ContrastArgs,
 
         /// Output file path [default: deseq2_results.csv]
-        #[arg(short, long, default_value = "deseq2_results.csv")]
+        #[arg(short, long, default_value = "deseq2_results.csv",
+            long_help = "Output file path. The file is tab-separated whatever its extension, with the\n\
+                columns gene_id, baseMean, baseVar, log2FoldChange, lfcSE, stat, pvalue, padj,\n\
+                dispersion, gene_wise_disp, trended_disp.")]
         output: String,
 
         /// Significance threshold [default: 0.1]
@@ -163,9 +168,10 @@ Examples:
 
         /// Apply LFC shrinkage
         #[arg(long,
-            long_help = "Apply log2 fold-change shrinkage after testing.\n\
+            long_help = "Apply log2 fold-change shrinkage after the Wald test.\n\
                 Reduces noisy LFC estimates for low-count genes.\n\
-                Use with --shrinkage-method to select the algorithm.")]
+                Use with --shrinkage-method to select the algorithm.\n\
+                Not applied with --test lrt (a warning is logged).")]
         shrinkage: bool,
 
         /// Shrinkage method [default: normal]
@@ -290,8 +296,12 @@ Examples:
 
     /// Normalize count data only
     #[command(
-        long_about = "Normalize count data using DESeq2's median-of-ratios method.\n\n\
-            Outputs a matrix of normalized counts (raw counts / size factors).",
+        long_about = "Normalize count data, as R's counts(dds, normalized = TRUE).\n\n\
+            Size factors come from --method (median of ratios by default); with\n\
+            --norm-factors, or the transcript lengths of --quant / --avg-tx-length\n\
+            (not with -m iterate, as in R), normalization factors are used instead.\n\
+            Outputs a tab-separated matrix of normalized counts (counts / size factors,\n\
+            or counts / normalization factors).",
         after_long_help = "\
 Examples:
   rust_deseq2 normalize -c counts.csv -o normalized.tsv
@@ -482,8 +492,9 @@ pub struct TximportArgs {
         value_parser = ["salmon", "sailfish", "kallisto", "rsem", "stringtie", "piscem", "oarfish"],
         long_help = "Quantifier that wrote the --quant files (R: tximport(type = ...)):\n\
             salmon, sailfish: quant.sf (Name, TPM, NumReads, EffectiveLength)\n\
-            kallisto:  abundance.tsv (target_id, tpm, est_counts, eff_length); abundance.h5\n\
-                       is not read\n\
+            kallisto:  abundance.tsv (target_id, tpm, est_counts, eff_length), or, if the\n\
+                       first file is named abundance.h5, abundance.h5 files (aux/ids,\n\
+                       est_counts, aux/eff_lengths; needs the hdf5 feature)\n\
             rsem:      *.isoforms.results (transcript_id, TPM, expected_count,\n\
                        effective_length; lengths below 1 set to 1), or, if the first\n\
                        file's path contains \"genes\", *.genes.results read at gene level\n\
