@@ -1,0 +1,16 @@
+[workspace]
+authors = ["Sunju Kim <n.e.coli.1822@gmail.com>"]
+channels = ["conda-forge", "bioconda"]
+name = "deseq2"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+r-base = ">=4.5.3,<4.6"
+bioconductor-deseq2 = ">=1.50.2,<2"
+bioconductor-apeglm = ">=1.32.0,<2"
+r-ashr = ">=2.2_63,<3"
+bioconductor-tximport = ">=1.38.2,<2"
+bioconductor-rhdf5 = ">=2.56.1,<3"

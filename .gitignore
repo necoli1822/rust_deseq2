@@ -6,4 +6,5 @@
 .idea/
 .vscode/
 *.iml
-.omc/
+# pixi environments under tool/<program>/ (the manifests and locks are tracked)
+tool/*/.pixi/

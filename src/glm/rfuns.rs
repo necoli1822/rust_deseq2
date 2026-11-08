@@ -1028,6 +1028,7 @@ mod tests {
 
     /// contr.poly(3) and the errors of contr.poly(), splineDesign() and poly() as R gives them
     #[test]
+    #[allow(clippy::approx_constant)] // R's printed contr.poly(3), not math constants
     fn test_contr_poly_and_errors() {
         let (c, names) = contr_poly(3).unwrap();
         assert_eq!(names, vec![".L", ".Q"]);

@@ -17,8 +17,9 @@ exclude = [
     "DESeq2/",
     "test_data/",
     "scripts/",
-    ".omc/",
     "python/",
+    "tool/",
+    ".github/",
 ]
 
 [lib]

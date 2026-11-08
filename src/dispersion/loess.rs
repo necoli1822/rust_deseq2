@@ -803,7 +803,7 @@ fn dsvdc(x: &mut [f64], n: usize, p: usize, s: &mut [f64], u: &mut [f64], v: &mu
             let mp1 = m + 1;
             let mut ls = l;
             for lls in lp1..=mp1 {
-                ls = m - lls + lp1;
+                ls = m + lp1 - lls;
                 if ls == l {
                     break;
                 }

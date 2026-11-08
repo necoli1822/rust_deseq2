@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# RUSTFLAGS is set per job, never globally: `-D warnings` also promotes every
+# clippy lint to an error, which would fail the clippy job on the known style
+# backlog rather than on real defects.
+jobs:
+  test:
+    name: test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    # beta is an early-warning signal, not a merge gate. `-D warnings` reaches
+    # dependency crates too, so a new lint in a future compiler can fail this
+    # leg through code we do not own.
+    continue-on-error: ${{ matrix.toolchain == 'beta' }}
+    env:
+      RUSTFLAGS: -D warnings
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, beta]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ${{ matrix.toolchain }}
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }} --profile minimal --no-self-update
+          rustup default ${{ matrix.toolchain }}
+      - name: Build all targets
+        run: cargo build --locked --all-targets
+      - name: Test (unit + doc)
+        run: cargo test --locked
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable + clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --no-self-update
+          rustup default stable
+      # Gate on the lint groups that indicate real defects. The style/complexity
+      # groups still have a known backlog, so they are reported but not enforced;
+      # tighten this once that backlog is cleared.
+      - name: Clippy (correctness + suspicious are errors)
+        run: cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious
+      - name: Clippy (full report, informational)
+        run: cargo clippy --locked --all-targets || true
+
+  msrv:
+    name: msrv (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # locked: the MSRV holds against the committed Cargo.lock.
+        # fresh:  the MSRV holds when dependencies are resolved from scratch,
+        #         which is what `cargo install` and library consumers do.
+        #         This is the job that catches a dependency silently raising
+        #         its own rust-version above ours.
+        #
+        # A failing `fresh` leg can appear on a PR that changed nothing: it means
+        # a dependency published a release requiring a newer rustc. The fix is to
+        # raise `rust-version` in Cargo.toml (and note it in CHANGELOG.md), not to
+        # disable this job. That silent drift is what shipped a false MSRV in
+        # 0.1.0, which claimed 1.70 while indexmap already required 1.82.
+        mode: [locked, fresh]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          version="$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)"
+          if [ -z "$version" ]; then
+            echo "::error::could not read rust-version from Cargo.toml"
+            exit 1
+          fi
+          echo "Declared MSRV: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        run: |
+          rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal --no-self-update
+          rustup default ${{ steps.msrv.outputs.version }}
+      - name: Drop Cargo.lock (fresh resolution)
+        if: matrix.mode == 'fresh'
+        run: rm -f Cargo.lock
+      - name: Build
+        run: cargo build ${{ matrix.mode == 'locked' && '--locked' || '' }} --all-targets
+      - name: Test
+        run: cargo test ${{ matrix.mode == 'locked' && '--locked' || '' }}
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      # Verifies the crate is publishable: packages the .crate file and builds
+      # it in isolation, catching files missing from the package via `exclude`.
+      - name: cargo package
+        run: cargo package --locked
