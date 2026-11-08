@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-08
+
 Fidelity fixes found by comparing against R DESeq2 1.50.2 (apeglm 1.32.0, ashr 2.2-63,
 RcppNumerical 0.7-0, R 4.5.3) on simulated data sets covering each code path. Each item
 names the R function it now follows.

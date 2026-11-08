@@ -1,6 +1,6 @@
 [package]
 name = "rust_deseq2"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Sunju Kim"]
 description = "A pure Rust implementation of DESeq2 for differential expression analysis of RNA-seq data"
