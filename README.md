@@ -10,7 +10,7 @@ A pure Rust implementation of the [DESeq2](https://bioconductor.org/packages/rel
 
 - **Complete DESeq2 pipeline**: size factor estimation → dispersion estimation → GLM fitting → statistical testing
 - **Statistical tests**: Wald test, Likelihood Ratio Test (LRT)
-- **Three dispersion fit types**: parametric (Gamma GLM), local (LOESS), mean
+- **Three dispersion fit types**: parametric (Gamma GLM), local (locfit), mean
 - **LFC shrinkage**: normal, apeglm, ashr methods
 - **Outlier handling**: Cook's distance detection and replacement
 - **Multi-factor designs**: batch correction with categorical and continuous covariates, or any
@@ -126,7 +126,7 @@ rust_deseq2 run -c counts.csv -m metadata.csv --norm-factors nf.csv \
 | `--formula <FORMULA>` | R design formula instead of `-d`/`--covariate`, e.g. `"~ batch + condition + batch:condition"`, `"~ genotype * treatment"`, `"~ 0 + condition"`, `"~ condition + poly(age, 2)"` (see below) | — |
 | `--covariate` | Categorical covariate for batch correction (not with `--formula`) | — |
 | `--continuous` | Continuous covariate; with `--formula`, the formula variables that are numeric | — |
-| `--reference` | Reference level (format: factor=level) | alphabetical |
+| `--reference` | Reference level (format: factor=level) | first level in R's sort order (ICU collation: `abaI` before `WT`) |
 | `--test` | Statistical test: `wald` or `lrt` | `wald` |
 | `--numerator` | Numerator level of the contrast, a level of `--design` or `--contrast-var` (R: `contrast = c(factor, num, den)`) | — |
 | `--denominator` | Denominator level of the contrast | — |
@@ -135,14 +135,38 @@ rust_deseq2 run -c counts.csv -m metadata.csv --norm-factors nf.csv \
 | `--contrast-vector <W1,W2,...>` | Numeric contrast, one weight per coefficient (R: `contrast = c(0, 1, -1)`) | — |
 | `--contrast-list <NUM;DEN>` | List contrast of coefficient names, `,` within and `;` between the two sides (R: `contrast = list(...)`) | — |
 | `--list-values <POS,NEG>` | Weights of the list contrast's two sides (R: `listValues`) | `1,-1` |
+| `--reduced` | Reduced model formula for LRT (e.g., `~1`, `"~ genotype + treatment"`), in the `--formula` syntax; its variables must be in the full design and it must have fewer columns (R: `checkLRT()`) | `~1` |
+| `--fit-type` | Dispersion fit: `parametric`, `local`, `mean` | `parametric` |
+| `--use-t` | Use t-distribution for Wald test p-values | `false` |
+| `--shrinkage` | Apply LFC shrinkage after the Wald test (not applied with `--test lrt`; a warning is logged) | `false` |
+| `--shrinkage-method` | Shrinkage: `normal`, `apeglm`, `ashr` | `normal` |
+| `--sf-type` | Size factors: `ratio` (median of ratios), `poscounts`, `iterate` (R: `estimateSizeFactors(type = )`) | `ratio` |
+| `--min-replicates <N>` | Minimum replicates in a model-matrix cell for outlier replacement (R: `minReplicatesForReplace`); a large value such as `9999` turns replacement off | `7` |
+| `--replace-outliers <BOOL>` | Replace Cook's distance outliers (`true`/`false`; a value is required) | `true` |
+| `--lfc-threshold <X>` | Test H0: \|LFC\| ≤ X with R's `altHypothesis = "greaterAbs"` (R: `results(lfcThreshold = )`) | `0` |
+| `--cooks-cutoff <X>` | Cook's distance cutoff above which a gene's p-value and padj are NA; `Inf` turns the filter off (R: `results(cooksCutoff = )`) | F(0.99, p, m − p) |
+| `--no-independent-filtering` | Adjust all p-values by BH without independent filtering (R: `results(independentFiltering = FALSE)`) | `false` |
+| `--weights <FILE>` | Observation weights, a genes × samples matrix in the count-matrix layout (R: `assays(dds)[["weights"]]`) | — |
+| `-o, --output` | Output file path; the file is tab-separated whatever its extension (see [Output](#output)) | `deseq2_results.csv` |
+| `-a, --alpha` | Significance threshold | `0.1` |
+| `--maxit` | Max IRLS iterations (GLM + dispersion) | `100` |
+| `--beta-tol` | Beta convergence tolerance for GLM | `1e-8` |
+| `--min-disp` | Minimum dispersion value | `1e-8` |
+| `--disp-tol` | Dispersion convergence tolerance | `1e-6` |
+| `--kappa-0` | Initial step size for dispersion line search | `1.0` |
+| `--outlier-sd` | Outlier SD threshold for MAP shrinkage | `2.0` |
+| `--trim` | Trim fraction for outlier replacement | `0.2` |
+| `--upper-quantile` | Upper quantile for beta prior variance | `0.05` |
+| `-t, --threads` | Number of threads (0 = auto) | `0` |
 
 Without a contrast option the Wald test reports the last coefficient, as R's `results(dds)` does;
 for a `--formula` without intercept and without interactions whose last variable is a factor it
 reports that factor's last level against its first, as R does (`c(lastVar, levels[n], levels[1])`).
-With `--test lrt` a contrast option chooses only the reported `log2FoldChange`/`lfcSE`; normal and
-apeglm shrinkage shrink the coefficient the contrast names (a single coefficient, as
-`lfcShrink(coef = )`). As in R, `normal` shrinkage is an error for designs with interactions or
-without an intercept (use `apeglm` or `ashr`).
+With `--test lrt` a contrast option chooses only the reported `log2FoldChange`/`lfcSE`, and
+`--shrinkage` is not applied. With the Wald test, normal and apeglm shrinkage shrink the
+coefficient the contrast names (a single coefficient, as `lfcShrink(coef = )`). As in R, `normal`
+shrinkage is an error for designs with interactions or without an intercept (use `apeglm` or
+`ashr`).
 
 `--formula` takes the operators of R formulas: `+`, `:`, `*` (`a*b` = `a + b + a:b`), `-`, `/`,
 `%in%`, `^` (`(a + b + c)^2`), parentheses, and `0 +` / `+ 0` / `- 1` for no intercept. Variables
@@ -183,24 +207,6 @@ NaN/Inf values. Other R functions, including user-defined ones, cannot be evalua
 does not run R code); the error lists the supported functions. An LRT reduced model that is not
 full rank is fitted as R fits it (no error; from `log(baseMean)` for the intercept and 0
 elsewhere, or 1 for every coefficient without an intercept, with DESeq2's ridge penalty).
-| `--reduced` | Reduced model formula for LRT (e.g., `~1`, `"~ genotype + treatment"`), in the `--formula` syntax; its variables must be in the full design and it must have fewer columns (R: `checkLRT()`) | `~1` |
-| `--fit-type` | Dispersion fit: `parametric`, `local`, `mean` | `parametric` |
-| `--use-t` | Use t-distribution for Wald test p-values | `false` |
-| `--shrinkage` | Apply LFC shrinkage | `false` |
-| `--shrinkage-method` | Shrinkage: `normal`, `apeglm`, `ashr` | `normal` |
-| `--replace-outliers <BOOL>` | Replace Cook's distance outliers (`true`/`false`) | `true` |
-| `--weights <FILE>` | Observation weights, a genes × samples matrix in the count-matrix layout (R: `assays(dds)[["weights"]]`) | — |
-| `-o, --output` | Output file path | `deseq2_results.csv` |
-| `-a, --alpha` | Significance threshold | `0.1` |
-| `--maxit` | Max IRLS iterations (GLM + dispersion) | `100` |
-| `--beta-tol` | Beta convergence tolerance for GLM | `1e-8` |
-| `--min-disp` | Minimum dispersion value | `1e-8` |
-| `--disp-tol` | Dispersion convergence tolerance | `1e-6` |
-| `--kappa-0` | Initial step size for dispersion line search | `1.0` |
-| `--outlier-sd` | Outlier SD threshold for MAP shrinkage | `2.0` |
-| `--trim` | Trim fraction for outlier replacement | `0.2` |
-| `--upper-quantile` | Upper quantile for beta prior variance | `0.05` |
-| `-t, --threads` | Number of threads (0 = auto) | `0` |
 
 ³ Unless `--htseq` or `--quant` is given. `vst` and `rlog` take the input options
 (`--htseq`, `--quant`, `--avg-tx-length`, `--tximport`, `--norm-factors`) the same way, and
@@ -219,8 +225,8 @@ in R's `DESeqDataSetFromMatrix()`, unless `--tximport` or `--avg-tx-length` is g
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-c, --counts` | Count matrix CSV/TSV file | *required* |
-| `-m, --metadata` | Sample metadata CSV file | *required* |
+| `-c, --counts` | Count matrix CSV/TSV file | *required* ³ |
+| `-m, --metadata` | Sample metadata CSV file | *required* ³ |
 | `-d, --design` | Design variable | *required* unless `--formula` |
 | `--formula <FORMULA>`, `--continuous <VAR>` | Design formula for the dispersions (without `--blind`), as in `run` | — |
 | `-o, --output` | Output file path | `vst_transformed.tsv` |
@@ -236,8 +242,8 @@ R's default is `blind = TRUE` for both, while this subcommand needs `--blind`.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-c, --counts` | Count matrix CSV/TSV file | *required* |
-| `-m, --metadata` | Sample metadata CSV file | *required* |
+| `-c, --counts` | Count matrix CSV/TSV file | *required* ³ |
+| `-m, --metadata` | Sample metadata CSV file | *required* ³ |
 | `-d, --design` | Design variable | *required* unless `--formula` |
 | `--formula <FORMULA>`, `--continuous <VAR>` | Design formula for the dispersions (without `--blind`), as in `run` | — |
 | `-o, --output` | Output file path | `rlog_transformed.tsv` |
@@ -330,6 +336,22 @@ in the normalized counts (`counts / nf`, so in baseMean, the VST and rlog), in
 (`trimBaseMean * nf`). They are used as given: like R's `normalizationFactors<-`, no centering is
 applied (R's vignette suggests dividing them by their row geometric means first).
 
+## Output
+
+Every output file is tab-separated, whatever its extension (the `run` default is
+`deseq2_results.csv`). `run` writes one row per gene with 11 columns:
+
+| Column | R equivalent |
+|---|---|
+| `gene_id` | row names |
+| `baseMean`, `baseVar` | `mcols(dds)$baseMean`, `baseVar` |
+| `log2FoldChange`, `lfcSE`, `stat`, `pvalue`, `padj` | `results(dds)`, or `lfcShrink()` with `--shrinkage` |
+| `dispersion` | `dispersions(dds)` |
+| `gene_wise_disp`, `trended_disp` | `mcols(dds)$dispGeneEst`, `dispFit` |
+
+NA values are written as `NaN`. `normalize`, `vst` and `rlog` write a genes × samples matrix with
+a `gene_id` column first.
+
 ## Benchmark
 
 ### Environment
@@ -400,9 +422,9 @@ release 0.1.0; "sig." counts genes called significant (padj < 0.1) by only one o
 | 2 vs 5 with outliers | 19 sig., 75 padj-NA differences | 5e-7 | 0 |
 | 2 vs 2, 2 vs 3 with dispersion scatter | 3 sig. / 116 padj-NA differences | 5e-7 / 7e-7 | 0 |
 | `--sf-type poscounts`, 30% zeros | 2 sig., 75 padj-NA differences | 1.6e-3 ¹ | 0 |
-| `--sf-type iterate`, 30% zeros | different algorithm | 8e-5 | 0 |
+| `--sf-type iterate`, 30% zeros | different algorithm | 1.75e-4 | 0 |
 | `--weights` (4 vs 4, `--use-t`, `~batch + condition`) | not supported | 5e-7 | 0 |
-| Contrasts on `~batch + age + condition`: `--name` (slope, covariate), `--contrast-var`, numeric, list (with `listValues`), default, `--use-t`, `--lfc-threshold`, LRT, normal/apeglm of a chosen coefficient | `--numerator`/`--denominator` of `-d` only | 5e-7 (numeric/list 1.2e-6, apeglm 2.7e-6) | 0 |
+| Contrasts on `~batch + age + condition`: `--name` (slope, covariate), `--contrast-var`, numeric, list (with `listValues`), default, `--use-t`, `--lfc-threshold`, LRT, normal/apeglm of a chosen coefficient | `--numerator`/`--denominator` of `-d` only | 5e-7 (default 8e-7, numeric/list 1.2e-6, apeglm 2.7e-6) | 0 |
 | `--formula`: `~batch + condition + batch:condition` (default, interaction `--name`, main-effect contrast, LRT `~batch + condition`, apeglm, VST and rlog not blind), `~condition + condition:batch`, `~genotype * treatment` 7 per cell with outlier replacement (list contrast main + interaction, genotype contrast, LRT), `~x + condition + x:condition` (`--continuous x`), `~0 + condition`, `~0 + batch + condition` (default and `--numerator`/`--denominator` on either factor), `~batch * condition * genotype` (Wald, LRT `~(batch + condition + genotype)^2`) | not supported | 5e-7 (apeglm 3.8e-6) | 0 |
 | `--formula` functions: `factor(dose)`, `relevel()`, `ordered()`, `log(conc)`, `scale(age)`, `I(x^2)`, `poly(x, 2)` (orthogonal and raw; Wald, LRT, apeglm), `ns(x, df = 3)` (Wald, LRT, VST), `bs(x, df = 4)`, `cond * poly(x, 2)`, `cond:ns(x, df = 2)`, LRTs with reduced models that are not full rank (with and without intercept), `offset()`, levels needing `make.names()`, a logical column, numeric-only and no-intercept designs, normal shrinkage on `~log(conc) + cond` | not supported | 7e-7 (apeglm 4.9e-6) ⁵ | 0 |
 | `--htseq` input (`~batch + condition`, VST, normalize) | not supported | 5e-7 | 0 |
@@ -413,11 +435,11 @@ release 0.1.0; "sig." counts genes called significant (padj < 0.1) by only one o
 | `-c --avg-tx-length` (`ratio`, `poscounts`), `-c --tximport` (`lengthScaledTPM`) | not supported | 5e-7 | 0 |
 | `--norm-factors`, 7 vs 7 with outlier replacement (Wald, LRT, `local`, `--weights`, `~batch + condition`, VST, rlog) | not used in the fits | 5e-7 | 0 |
 | shrinkage `normal` / `apeglm` after outlier replacement | fitted the replaced counts (ΔLFC up to 4.4) | 5e-7 / 8e-7 | 0 |
-| shrinkage `normal` / `apeglm` / `ashr` | 5e-7 / 4.2e-2 / 5.9e-2 | 5e-7 / 1.5e-6 / 1.8e-5 | 0 |
-| `apeglm` with `--covariate batch` | 5.84 (wrong coefficient) | 4e-6 | 0 |
+| shrinkage `normal` / `apeglm` / `ashr` | 5e-7 / 4.2e-2 / 5.9e-2 | 5e-7 / 2.4e-6 / 1.8e-5 | 0 |
+| `apeglm` with `--covariate batch` | 5.84 (wrong coefficient) | 4.3e-6 | 0 |
 | VST `parametric` / `mean` / `local` | 6e-7 / 2.4 / 1.8e8 | 6e-7 / 6e-7 / 5e-7 | — |
 | `vst --nsub 1000` `parametric` / `mean` / `local` | not available | 6e-7 / 6e-7 / 5e-7 | — |
-| rlog (blind and not) | matched | 7e-8 | — |
+| rlog (blind and not) | matched | 2.4e-10 | — |
 | `normalize` subcommand | failed to run | 5e-8 (relative) | — |
 
 ¹ Genes with a single non-zero count, whose likelihood is nearly flat in the LFC (|LFC| ≈ 27).
@@ -543,22 +565,18 @@ Already-implemented algorithms that just need CLI/API configurability.
 | Feature | R Parameter | Current State | Work Required |
 |---------|------------|---------------|---------------|
 | Configurable minmu | `DESeq(minmu=1e-6)` | Hardcoded `0.5` | Propagate through pipeline, add `--min-mu` CLI flag |
-| Disable outlier replacement | `minReplicatesForReplace=Inf` | Hardcoded `7` | Add `--min-replicates` CLI flag, support `Inf` |
-| Non-integer counts | `skipIntegerMode=TRUE` | Already uses f64 | Add optional integer validation toggle |
+| Disable outlier replacement | `minReplicatesForReplace=Inf` | `--min-replicates <N>` (default `7`; a large N turns replacement off) | Accept `Inf` |
+| Non-integer counts | `skipIntegerMode=TRUE` | Rejected unless `--tximport` / `--avg-tx-length`, as `DESeqDataSetFromMatrix()` | Add a flag that accepts them |
 | `--single-cell` preset | N/A | N/A | Convenience flag: sets `minmu=1e-6`, `minReplicatesForReplace=Inf`, `sfType=poscounts`, `useT=TRUE` |
 
-### Phase 2: Observation Weights (Medium)
+### Phase 2: Observation Weights (done)
 
-Per-gene-per-sample weight matrix for zero-inflation models (zinbwave integration).
-
-| Feature | R Function | Work Required |
-|---------|-----------|---------------|
-| Weight storage | `assays(dds)[["weights"]]` | Add `Option<Array2<f64>>` to DESeqDataSet |
-| Weighted base means | `getBaseMeansAndVariances()` | Multiply normalized counts by weights |
-| Weighted GLM fitting | C++ `fitBeta(weightsSEXP=)` | Modify IRLS to use `W_ij * w_ij` in weight matrix |
-| Weighted dispersion estimation | C++ `fitDisp(weightsSEXP=)` | Pass weights through dispersion IRLS |
-| Weight-aware df for useT | `rowSums(weights)` | df = sum(weights_per_gene) - n_coefs |
-| Degenerate design detection | `getAndCheckWeights()` | Flag genes where weights collapse design rank as allZero |
+Per-gene-per-sample weight matrices for zero-inflation models (zinbwave integration) are
+supported: `run --weights <FILE>` and `DESeqDataSet::set_weights` (R:
+`assays(dds)[["weights"]]`), in baseMean, the gene-wise and MAP dispersions, the GLM fits, the
+LRT, outlier refits and the `--use-t` degrees of freedom, following `getAndCheckWeights()` and
+R's C++ fitters. Remaining: weighted `lfcShrink` for `normal` and `apeglm` (rejected with
+`--weights`; `ashr` works), and weights in VST and rlog.
 
 ### Phase 3: glmGamPoi Equivalent (Hard)
 
@@ -577,7 +595,7 @@ Pure Rust reimplementation of the glmGamPoi algorithms, optimized for datasets w
 
 - All features will be implemented in pure Rust with no external R/Python dependencies
 - Phase 1 can be released independently as it only requires parameter plumbing
-- Phase 2 enables zinbwave-style workflows where weights are pre-computed externally
+- Phase 2 (done) enables zinbwave-style workflows where weights are pre-computed externally
 - Phase 3 is the most complex but provides the largest performance benefit for scRNA-seq
 - glmGamPoi and observation weights are mutually exclusive (same as R)
 

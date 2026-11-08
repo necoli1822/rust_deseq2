@@ -1,6 +1,6 @@
 # R DESeq2와 남은 차이
 
-기준: R DESeq2 1.50.2 (R 4.5.3), rust_deseq2 `fix/port-fidelity` 브랜치(커밋 `aec02e0` 시점), 2026-11-01.
+기준: R DESeq2 1.50.2 (R 4.5.3), rust_deseq2 `fix/port-fidelity` 브랜치(커밋 `c365464` 시점), 2026-11-01.
 
 R 쪽 목록은 `getNamespaceExports("DESeq2")`와 주요 함수의 `formals()`에서 뽑았고, Rust 쪽은 CLI 옵션
 (`run`/`vst`/`rlog`/`normalize --help`)과 라이브러리 공개 함수에서 하나씩 대조했다. "구현됨"이라고 적은 것은
@@ -134,7 +134,7 @@ DESeq2의 `DESeqDataSetFromMatrix`/`HTSeqCount`/`Tximport` 세 생성자는 모�
 사용 빈도와 작업량을 기준으로:
 
 1. ~~`results(name =)`와 숫자 대비~~: 구현됨 (`validation/gen11.R`, R과 5e-7~2.7e-6).
-2. **임의 설계식(상호작용 포함)**: 설계 행렬 코드는 있으므로 식 파서와 CLI 노출, R 대조 검증이 필요하다.
+2. ~~임의 설계식(상호작용 포함)~~: 구현됨 (`--formula`, `validation/gen12.R`·`gen13.R`, 3절 설계식 표).
 3. **`altHypothesis`의 나머지와 `pAdjustMethod`**: 계산식이 단순하다.
 4. **VST/rlog 옵션 정리**: size factor 방식과 rlog `fitType` 노출, `blind` 기본값을 R과 맞출지 결정.
 5. **가중치 + normal/apeglm 수축**: R C++ 코드 이식이 필요해 작업량이 크다.

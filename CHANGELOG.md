@@ -59,14 +59,12 @@ names the R function it now follows.
   LFC 0 / p 1 (`contrastAllZero`), as do genes that become all zero after replacement.
 - **CLI**: the `normalize` subcommand failed on every input; subcommand `--help`/`-h` was
   rejected; `--replace-outliers false` was rejected (the flag could not be turned off).
-
 - **GLM optim fallback** is now a port of R's `optim(method = "L-BFGS-B")` (lbfgsb.c and the
   optim.c driver, including its finite-difference gradient), replacing a hand-written L-BFGS
   that stopped elsewhere on genes that are zero in one group (e.g. LFC 30.0 vs R's 23.1). Used
   for Wald and LRT fits.
 - **`--sf-type iterate`** re-applied poscounts; it is now R's `estimateSizeFactorsIterate`
   (alternating mean-fit dispersions and an L-BFGS-B maximisation of the trimmed likelihood).
-
 - **Found on public GEO data** (see `validation/real/`): factor levels were sorted byte-wise
   (`WT` before `abaI`), making a different default reference than R's ICU collation; the
   gene-wise Cox-Reid term was cut off below det(X'WX) = 1e-10, stopping the dispersion search
@@ -74,12 +72,10 @@ names the R function it now follows.
   1/alpha ~ 1e8 for the dispersion grid search; size factors differed from R in the last bits,
   which flipped rounding-level line-search decisions; the ashr weight solver could stall on a
   suboptimal mixture, and genes ash excludes now get the prior instead of NaN.
-
 - **Local dispersion trend** (`fitType = "local"`) now ports locfit's fit exactly, including
   the global quadratic it subtracts before interpolating; the old version extrapolated the local
   fit itself and diverged below the smallest mean (e.g. 167231 vs R's 130832 at mean 0.001),
   which the VST evaluates (VST local off by up to 1.4e-2; now 5e-7).
-
 - **Normalization factors were not used in the fits.** `normalizationFactors` (a genes x samples
   matrix) only entered the normalized counts and rlog; the GLM, gene-wise/MAP dispersion,
   moments estimate, LRT, Cook's distances, outlier replacement and refit, apeglm and normal
@@ -142,22 +138,20 @@ names the R function it now follows.
   `est_counts` and `aux/eff_lengths` and computes the TPM from them. Uses the pure-Rust
   `rust-hdf5` crate (with its parallel chunk decompression; chosen by `validation/h5bench`)
   behind the default `hdf5` feature.
-- tximport input from other quantifiers: `--quant <SAMPLE_TABLE> --quant-type <TYPE>` (`--salmon`
-  and `--salmon-dir` remain as aliases of `--quant`, `--quant-dir`) reads kallisto
+- tximport input: `--quant <SAMPLE_TABLE> --quant-type <TYPE> --quant-dir <DIR> --tx2gene <FILE>`
+  (aliases `--salmon`, `--salmon-dir`) reads salmon and sailfish `quant.sf`, kallisto
   `abundance.tsv`, RSEM `isoforms.results` (lengths below 1 set to 1) and `genes.results` (gene
   level, no tx2gene, chosen as tximport does from the first file name), StringTie `t_data.ctab`
-  (counts = cov × length / `--read-length`), sailfish, piscem and oarfish files, with tximport's
-  column choices (`io::read_quant`, `io::tximport::tximport`, `QuantType`).
-- tximport input. `--salmon <SAMPLE_TABLE> --salmon-dir <DIR> --tx2gene <FILE>` reads salmon
-  `quant.sf` files and summarizes them to genes as `tximport(type = "salmon")` does
-  (`io::tximport`: sums, abundance-weighted lengths, `replaceMissingLength`, transcripts missing
-  from tx2gene dropped, R's `read.delim` number parsing), then builds the dataset as
-  `DESeqDataSetFromTximport()`: counts rounded halves to even, lengths stored as `avgTxLength`.
-  `-c` with `--avg-tx-length <FILE>` takes `txi$counts`/`txi$length` matrices, and `--tximport`
-  rounds `-c` counts without lengths (`countsFromAbundance` other than `"no"`). With
-  `avgTxLength`, `estimate_size_factors` sets normalization factors (`estimateNormFactors`,
-  `ratio` and `poscounts`; `iterate` ignores the lengths, as in R). For `run`, `vst`, `rlog` and
-  `normalize`.
+  (counts = cov × length / `--read-length`), piscem and oarfish files with tximport's column
+  choices, and summarizes them to genes as `tximport(type = ...)` does (`io::read_quant`,
+  `io::tximport::tximport`, `QuantType`: sums, abundance-weighted lengths,
+  `replaceMissingLength`, transcripts missing from tx2gene dropped, R's `read.delim` number
+  parsing), then builds the dataset as `DESeqDataSetFromTximport()`: counts rounded halves to
+  even, lengths stored as `avgTxLength`. `-c` with `--avg-tx-length <FILE>` takes
+  `txi$counts`/`txi$length` matrices, and `--tximport` rounds `-c` counts without lengths
+  (`countsFromAbundance` other than `"no"`). With `avgTxLength`, `estimate_size_factors` sets
+  normalization factors (`estimateNormFactors`, `ratio` and `poscounts`; `iterate` ignores the
+  lengths, as in R). For `run`, `vst`, `rlog` and `normalize`.
 - `--norm-factors <FILE>` (R: `normalizationFactors(dds) <- nf`) for `run`, `vst`, `rlog` and
   `normalize`; size factor estimation is then skipped, as in `DESeq()`. Works with `--weights`.
 - htseq-count input (R's `DESeqDataSetFromHTSeqCount`): `--htseq <SAMPLE_TABLE>` and
@@ -175,12 +169,22 @@ names the R function it now follows.
   Weighted `lfcShrink` (normal, apeglm) is not ported and is rejected.
 
 ### Changed
-- Minimum supported Rust version is now 1.89 (was 1.70), required by `rust-hdf5`.
+- Minimum supported Rust version is now 1.89 (was 1.70), required by statrs 0.19 and `rust-hdf5`,
+  so also without the `hdf5` feature. (0.1.0 declared 1.70, but its dependencies already needed
+  1.82.)
 - Rust edition 2024 (was 2021). Dependencies: statrs 0.19 (without its default nalgebra and
   rand features), ndarray 0.17, and the lock file at the latest compatible versions (clap 4.6,
   rayon 1.12, ...); the unused rand, rand_distr, ndarray-stats, anyhow, num-traits and approx
   are removed. Results are unchanged: every validation output is byte identical.
-- `--replace-outliers` now takes a value: `--replace-outliers false`.
+- **Breaking:** `--replace-outliers` now takes a value (`--replace-outliers true|false`). The bare
+  flag, which 0.1.0 accepted and ignored (replacement was always on), is now an error: drop it, or
+  write `--replace-outliers true`.
+- **Default reference level:** factor levels are sorted as R sorts them (ICU collation) instead of
+  by bytes, so with mixed-case levels the default reference can change (`abaI` now comes before
+  `WT`, as in R). Results now match R's for the same metadata; pass `--reference` to keep a
+  specific reference.
+- `--shrinkage` with `--test lrt` logs a warning that no shrinkage is applied (it was skipped
+  silently).
 - apeglm's prior-scale message is logged at info level instead of printed to stderr.
 
 ## [0.1.0] - 2025-01-31
